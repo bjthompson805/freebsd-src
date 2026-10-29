@@ -683,6 +683,13 @@ linux_pci_detach_device(struct pci_dev *pdev)
 	if (pdev->pdrv != NULL)
 		pdev->pdrv->remove(pdev);
 
+	/*
+	 * Like Linux, release managed resources once the driver is gone.
+	 * Waiting for the last reference would free dmam_alloc_coherent()
+	 * memory after linux_pdev_dma_uninit() freed the DMA state it needs.
+	 */
+	lkpi_devres_release_free_list(&pdev->dev);
+
 	if (pdev->root != NULL)
 		pci_dev_put(pdev->root);
 	free(pdev->bus, M_DEVBUF);
