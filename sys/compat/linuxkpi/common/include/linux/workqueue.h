@@ -238,6 +238,9 @@ extern struct workqueue_struct *system_unbound_wq;
 extern struct workqueue_struct *system_highpri_wq;
 extern struct workqueue_struct *system_power_efficient_wq;
 
+/* Linux v6.17 renamed system_wq; main has a variable, a macro will do here. */
+#define	system_percpu_wq	system_wq
+
 extern void linux_init_delayed_work(struct delayed_work *, work_func_t);
 extern void linux_work_fn(void *, int);
 extern void linux_delayed_work_fn(void *, int);

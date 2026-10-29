@@ -27,6 +27,7 @@ struct page_pool_params {
 };
 
 struct page_pool {
+	struct page_pool_params		p;
 };
 
 #define	PP_FLAG_DMA_MAP		BIT(0)

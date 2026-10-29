@@ -1138,8 +1138,7 @@ static inline struct sk_buff *
 napi_build_skb(void *data, size_t len)
 {
 
-	SKB_TODO();
-	return (NULL);
+	return (build_skb(data, len));
 }
 
 static inline uint32_t
@@ -1154,8 +1153,10 @@ static inline void
 skb_mark_for_recycle(struct sk_buff *skb)
 {
 	SKB_TRACE(skb);
-	/* page_pool */
-	SKB_TODO();
+	/*
+	 * Nothing to do: our page_pool does not recycle, and its pages are
+	 * freed like any other skb page.
+	 */
 }
 
 static inline int
