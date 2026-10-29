@@ -1170,7 +1170,13 @@ skb_cow_head(struct sk_buff *skb, unsigned int headroom)
 /* Misplaced here really but sock comes from skbuff. */
 #define	sk_pacing_shift_update(sock, n)
 
-#define	SKB_WITH_OVERHEAD(_s)						\
-	(_s) - ALIGN(sizeof(struct skb_shared_info), CACHE_LINE_SIZE)
+/*
+ * Linux keeps skb_shared_info at the end of the data buffer, so a buffer of
+ * _s bytes has less room for data.  We keep it next to the sk_buff instead
+ * (see linuxkpi_alloc_skb() and linuxkpi_build_skb()), so all of it is usable.
+ * Subtracting our (much larger) shinfo left mt76 448 of 2048 bytes and it
+ * dropped every larger frame, beacons included.
+ */
+#define	SKB_WITH_OVERHEAD(_s)	((_s))
 
 #endif	/* _LINUXKPI_LINUX_SKBUFF_H */
