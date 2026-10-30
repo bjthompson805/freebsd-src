@@ -182,6 +182,7 @@ struct sk_buff {
 	uint16_t		qmap;		/* queue mapping */
 	uint16_t		_flags;		/* Internal flags. */
 #define	_SKB_FLAGS_SKBEXTFRAG	0x0001
+#define	_SKB_FLAGS_DMA32ZONE	0x0002
 	uint16_t		l3hdroff;	/* network header offset from *head */
 	uint16_t		l4hdroff;	/* transport header offset from *head */
 	uint16_t		mac_header;	/* offset of mac_header */
