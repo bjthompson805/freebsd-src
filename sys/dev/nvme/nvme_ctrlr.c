@@ -794,6 +794,73 @@ nvme_ctrlr_configure_int_coalescing(struct nvme_controller *ctrlr)
 	    ctrlr->int_coal_threshold, NULL, NULL);
 }
 
+/*
+ * Autonomous Power State Transition: let the controller drop into its
+ * non-operational power states on its own once idle, as Linux does by
+ * default.  Each power state's table entry names the next deeper usable
+ * non-operational state and how long to idle before entering it: 100 ms
+ * for states that take at most 15 ms to enter and leave, 2 s otherwise.
+ * States slower than hw.nvme.apst_max_latency_us are skipped.  Controllers
+ * forget the setting on reset, so this runs on every start.
+ */
+#define	NVME_APST_ENTRIES		32
+#define	NVME_APST_PRIMARY_TOL_US	15000
+#define	NVME_APST_PRIMARY_MS		100
+#define	NVME_APST_SECONDARY_MS		2000
+
+static void
+nvme_ctrlr_configure_apst(struct nvme_controller *ctrlr)
+{
+	struct nvme_completion_poll_status	status;
+	const struct nvme_power_state *ps;
+	struct nvme_request *req;
+	uint64_t *table, target;
+	uint32_t lat, idle_ms;
+	int enable, max_lat_us, i;
+
+	enable = 1;
+	TUNABLE_INT_FETCH("hw.nvme.apst_enable", &enable);
+	max_lat_us = 100000;
+	TUNABLE_INT_FETCH("hw.nvme.apst_max_latency_us", &max_lat_us);
+	if (!enable || (ctrlr->cdata.apsta & 1) == 0 || ctrlr->cdata.npss == 0)
+		return;
+
+	table = malloc(NVME_APST_ENTRIES * sizeof(*table), M_NVME,
+	    M_WAITOK | M_ZERO);
+	target = 0;
+	for (i = MIN(ctrlr->cdata.npss, NVME_APST_ENTRIES - 1); i >= 0; i--) {
+		table[i] = htole64(target);
+		ps = &ctrlr->cdata.power_state[i];
+		if (NVMEV(NVME_PWR_ST_NOPS, ps->mps_nops) == 0)
+			continue;
+		lat = ps->enlat + ps->exlat;
+		if (lat > (uint32_t)max_lat_us)
+			continue;
+		idle_ms = lat <= NVME_APST_PRIMARY_TOL_US ?
+		    NVME_APST_PRIMARY_MS : NVME_APST_SECONDARY_MS;
+		target = (uint64_t)i << 3 | (uint64_t)idle_ms << 8;
+	}
+	if (target == 0) {
+		free(table, M_NVME);
+		return;
+	}
+
+	status.done = 0;
+	req = nvme_allocate_request_vaddr(table,
+	    NVME_APST_ENTRIES * sizeof(*table), M_WAITOK,
+	    nvme_completion_poll_cb, &status);
+	req->cmd.opc = NVME_OPC_SET_FEATURES;
+	req->cmd.cdw10 = htole32(NVME_FEAT_AUTONOMOUS_POWER_STATE_TRANSITION);
+	req->cmd.cdw11 = htole32(1);
+	nvme_ctrlr_submit_admin_request(ctrlr, req);
+	nvme_completion_poll(&status);
+	if (nvme_completion_is_error(&status.cpl))
+		nvme_printf(ctrlr, "enabling APST failed\n");
+	else if (bootverbose)
+		nvme_printf(ctrlr, "APST enabled\n");
+	free(table, M_NVME);
+}
+
 static void
 nvme_ctrlr_hmb_free(struct nvme_controller *ctrlr)
 {
@@ -1046,6 +1113,7 @@ nvme_ctrlr_start(void *ctrlr_arg, bool resetting)
 
 	nvme_ctrlr_configure_aer(ctrlr);
 	nvme_ctrlr_configure_int_coalescing(ctrlr);
+	nvme_ctrlr_configure_apst(ctrlr);
 
 	for (i = 0; i < ctrlr->num_io_queues; i++)
 		nvme_io_qpair_enable(&ctrlr->ioq[i]);
