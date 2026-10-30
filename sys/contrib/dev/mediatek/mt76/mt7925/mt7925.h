@@ -319,6 +319,9 @@ int mt7925e_mac_reset(struct mt792x_dev *dev);
 int mt7925e_mcu_init(struct mt792x_dev *dev);
 void mt7925_mac_add_txs(struct mt792x_dev *dev, void *data);
 void mt7925_set_runtime_pm(struct mt792x_dev *dev);
+#if defined(__FreeBSD__)
+extern bool mt7925_runtime_pm;
+#endif
 void mt7925_mcu_set_suspend_iter(void *priv, u8 *mac,
 				 struct ieee80211_vif *vif);
 void mt7925_connac_mcu_set_suspend_iter(void *priv, u8 *mac,

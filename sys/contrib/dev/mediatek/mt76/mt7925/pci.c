@@ -27,6 +27,20 @@ static bool mt7925_disable_aspm;
 module_param_named(disable_aspm, mt7925_disable_aspm, bool, 0644);
 MODULE_PARM_DESC(disable_aspm, "disable PCI ASPM support");
 
+#if defined(__FreeBSD__)
+/*
+ * Runtime PM and deep sleep save power, but every packet after ~80ms idle
+ * waits for the chip to wake: 20-60ms of extra latency.  Linux switches them
+ * in debugfs, which we do not build, and switching them on a live connection
+ * drops it under LinuxKPI.  So choose at load time, before any connection:
+ * compat.linuxkpi.mt7925_pci_runtime_pm=0 in loader.conf runs the chip awake,
+ * the way the USB variant always runs.
+ */
+bool mt7925_runtime_pm = true;
+module_param_named(runtime_pm, mt7925_runtime_pm, bool, 0444);
+MODULE_PARM_DESC(runtime_pm, "let the chip sleep when idle (saves power, adds latency)");
+#endif
+
 static int mt7925e_init_reset(struct mt792x_dev *dev)
 {
 	return mt792x_wpdma_reset(dev, true);
