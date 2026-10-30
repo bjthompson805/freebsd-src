@@ -356,6 +356,7 @@ static const struct {
 	{ 0xC4, KEY_KBDILLUMUP },
 	{ 0xC5, KEY_KBDILLUMDOWN },
 	{ 0xC6, NO_KEY },		/* Ambient Light Sensor notification */
+	{ 0xC7, KEY_KBDILLUMTOGGLE },
 	{ 0xFA, KEY_PROG2 },		/* Lid flip action */
 	{ 0xBD, KEY_PROG2 },	/* Lid flip action on ROG xflow laptops */
 };
@@ -846,15 +847,19 @@ acpi_asus_wmi_handle_event(struct acpi_asus_wmi_softc *sc, int code)
 	}
 	if (code && sc->handle_keys) {
 		/* Keyboard backlight control. */
-		if (code == 0xc4 || code == 0xc5) {
+		if (code == 0xc4 || code == 0xc5 || code == 0xc7) {
 			acpi_wpi_asus_get_devstate(sc,
 			    ASUS_WMI_DEVID_KBD_BACKLIGHT, &val);
 			val &= 0x3;
 			if (code == 0xc4) {
 				if (val < 0x3)
 					val++;
-			} else if (val > 0)
-				val--;
+			} else if (code == 0xc5) {
+				if (val > 0)
+					val--;
+			} else
+				/* Single key cycling 0-3. */
+				val = (val + 1) & 0x3;
 			if (val != 0)
 				val |= 0x80;
 			acpi_wpi_asus_set_devstate(sc,
@@ -930,7 +935,12 @@ static int
 acpi_asus_wmi_evaluate_method(device_t wmi_dev, int method,
     UINT32 arg0, UINT32 arg1, UINT32 arg2, UINT32 *retval)
 {
-	UINT32		params[3] = { arg0, arg1, arg2 };
+	/*
+	 * Some firmware (e.g. Zenbook S 16 UM5606) reads further argument
+	 * fields from the buffer and aborts if it is too short, so pad it
+	 * to five dwords like Linux asus-wmi does.
+	 */
+	UINT32		params[5] = { arg0, arg1, arg2, 0, 0 };
 	UINT32		result;
 	ACPI_OBJECT	*obj;
 	ACPI_BUFFER	in = { sizeof(params), &params };
