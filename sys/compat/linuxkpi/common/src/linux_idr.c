@@ -263,13 +263,13 @@ idr_remove_locked(struct idr *idr, int id)
 	}
 	idx = id & IDR_MASK;
 	/*
-	 * At this point we've set free space bitmaps up the whole tree.
-	 * We could make this non-fatal and unwind but linux dumps a stack
-	 * and a warning so I don't think it's necessary.
+	 * At this point we've set free space bitmaps up the whole tree,
+	 * which is harmless if the item turns out not to exist.  Linux
+	 * returns NULL for an id that is not allocated, and drivers rely on
+	 * it: mt76's TX status check removes packet ids that may be unused.
 	 */
 	if (il == NULL || (il->bitmap & (1 << idx)) != 0)
-		panic("idr_remove: Item %d not allocated (%p, %p)\n",
-		    id, idr, il);
+		return (NULL);
 	res = il->ary[idx];
 	il->ary[idx] = NULL;
 	il->bitmap |= 1 << idx;
