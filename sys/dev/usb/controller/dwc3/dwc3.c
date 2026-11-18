@@ -28,6 +28,7 @@
 
 #include "opt_platform.h"
 #include "opt_acpi.h"
+#include "opt_soc.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -66,6 +67,11 @@
 
 #include <dev/clk/clk.h>
 #include <dev/phy/phy_usb.h>
+
+#ifdef SOC_APPLE_T8103
+#include <arm64/apple/apple_dart.h>
+#include <arm64/apple/apple_pmgr.h>
+#endif
 #endif
 
 #ifdef DEV_ACPI
@@ -114,6 +120,7 @@ snps_dwc3_attach_xhci(device_t dev)
 {
 	struct snps_dwc3_softc *snps_sc = device_get_softc(dev);
 	struct xhci_softc *sc = &snps_sc->sc;
+	uint8_t dma32;
 	int err = 0, rid = 0;
 
 	sc->sc_io_res = snps_sc->mem_res;
@@ -149,7 +156,13 @@ snps_dwc3_attach_xhci(device_t dev)
 		}
 	}
 
-	err = xhci_init(sc, dev, IS_DMA_32B);
+	dma32 = IS_DMA_32B;
+#if defined(FDT) && defined(SOC_APPLE_T8103)
+	/* RAM starts at 0x10000000000: there is nothing below 4 GB. */
+	if (ofw_bus_is_compatible(dev, "apple,t8103-dwc3"))
+		dma32 = 0;
+#endif
+	err = xhci_init(sc, dev, dma32);
 	if (err != 0) {
 		device_printf(dev, "Failed to init XHCI, with error %d\n", err);
 		return (ENXIO);
@@ -522,6 +535,9 @@ skip_phys:
 #ifdef FDT
 static struct ofw_compat_data compat_data[] = {
 	{ "snps,dwc3",	1 },
+#ifdef SOC_APPLE_T8103
+	{ "apple,t8103-dwc3", 1 },
+#endif
 	{ NULL,		0 }
 };
 
@@ -541,6 +557,21 @@ snps_dwc3_fdt_probe(device_t dev)
 static int
 snps_dwc3_fdt_attach(device_t dev)
 {
+#ifdef SOC_APPLE_T8103
+	int error;
+
+	/* No DART driver yet: identity-map RAM for the controller's DMA. */
+	if (ofw_bus_is_compatible(dev, "apple,t8103-dwc3")) {
+		if ((error = apple_pmgr_power_on(dev)) != 0) {
+			device_printf(dev, "cannot power on: %d\n", error);
+			return (error);
+		}
+		if ((error = apple_dart_identity(dev)) != 0) {
+			device_printf(dev, "cannot set up DART: %d\n", error);
+			return (error);
+		}
+	}
+#endif
 
 	return (snps_dwc3_common_attach(dev, true));
 }

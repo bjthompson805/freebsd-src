@@ -8,3 +8,4 @@ options 	SOC_APPLE_T8103
 options 	FDT
 
 device	bge
+device	hms			# HID mouse (USB mice via usbhid)
