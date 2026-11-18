@@ -137,6 +137,11 @@ nvme_ctrlr_construct_admin_qpair(struct nvme_controller *ctrlr)
 	 * The admin queue's max xfer size is treated differently than the
 	 *  max I/O xfer size.  16KB is sufficient here - maybe even less?
 	 */
+	if (ctrlr->quirks & QUIRK_APPLE_ANS) {
+		qpair->cid_base = 0;
+		return (nvme_qpair_construct(qpair, NVME_APPLE_QUEUE_ENTRIES,
+		    NVME_APPLE_ADMIN_TRACKERS, ctrlr));
+	}
 	error = nvme_qpair_construct(qpair, num_entries, NVME_ADMIN_TRACKERS,
 	     ctrlr);
 	return (error);
@@ -182,6 +187,13 @@ nvme_ctrlr_construct_io_qpairs(struct nvme_controller *ctrlr)
 	 * outstanding, hence the "-1" here.
 	 */
 	num_trackers = min(num_trackers, (num_entries-1));
+
+	/* The I/O queue gets the tags the admin queue doesn't use. */
+	if (ctrlr->quirks & QUIRK_APPLE_ANS) {
+		num_entries = NVME_APPLE_QUEUE_ENTRIES;
+		num_trackers = NVME_APPLE_QUEUE_ENTRIES -
+		    NVME_APPLE_ADMIN_TRACKERS;
+	}
 
 	/*
 	 * Our best estimate for the maximum number of I/Os that we should
@@ -364,6 +376,23 @@ nvme_ctrlr_enable(struct nvme_controller *ctrlr)
 	if (err != 0)
 		return (err);
 
+	if (ctrlr->quirks & QUIRK_APPLE_ANS) {
+		/* Zero-based sizes, as AQA; then both queues' TCB arrays. */
+		qsize = NVME_APPLE_QUEUE_ENTRIES - 1;
+		bus_write_4(ctrlr->resource, NVME_APPLE_MAX_PEND,
+		    qsize | qsize << 16);
+		bus_write_4(ctrlr->apple_nvmmu, NVME_APPLE_NVMMU_NUM, qsize);
+		for (int i = 0; i < 2; i++) {
+			bus_size_t off = i == 0 ? NVME_APPLE_NVMMU_ASQ_TCB :
+			    NVME_APPLE_NVMMU_IOSQ_TCB;
+
+			bus_write_4(ctrlr->apple_nvmmu, off,
+			    (uint32_t)ctrlr->apple_tcb_bus[i]);
+			bus_write_4(ctrlr->apple_nvmmu, off + 4,
+			    ctrlr->apple_tcb_bus[i] >> 32);
+		}
+	}
+
 	nvme_mmio_write_8(ctrlr, asq, ctrlr->adminq.cmd_bus_addr);
 	nvme_mmio_write_8(ctrlr, acq, ctrlr->adminq.cpl_bus_addr);
 
@@ -490,6 +519,12 @@ nvme_ctrlr_set_num_qpairs(struct nvme_controller *ctrlr)
 	struct nvme_completion_poll_status	status;
 	int					cq_allocated, sq_allocated;
 
+	/* ANS has exactly one I/O queue and doesn't take this command. */
+	if (ctrlr->quirks & QUIRK_APPLE_ANS) {
+		ctrlr->num_io_queues = 1;
+		return (0);
+	}
+
 	status.done = 0;
 	nvme_ctrlr_cmd_set_num_queues(ctrlr, ctrlr->num_io_queues,
 	    nvme_completion_poll_cb, &status);
@@ -546,6 +581,18 @@ nvme_ctrlr_create_qpairs(struct nvme_controller *ctrlr)
 		if (nvme_completion_is_error(&status.cpl)) {
 			nvme_printf(ctrlr, "nvme_create_io_sq failed!\n");
 			return (ENXIO);
+		}
+
+		/* ANS also takes the I/O queue addresses by register. */
+		if (ctrlr->quirks & QUIRK_APPLE_ANS) {
+			bus_write_4(ctrlr->resource, NVME_APPLE_IOCQ,
+			    (uint32_t)qpair->cpl_bus_addr);
+			bus_write_4(ctrlr->resource, NVME_APPLE_IOCQ + 4,
+			    qpair->cpl_bus_addr >> 32);
+			bus_write_4(ctrlr->resource, NVME_APPLE_IOSQ,
+			    (uint32_t)qpair->cmd_bus_addr);
+			bus_write_4(ctrlr->resource, NVME_APPLE_IOSQ + 4,
+			    qpair->cmd_bus_addr >> 32);
 		}
 	}
 
@@ -746,6 +793,10 @@ nvme_ctrlr_configure_aer(struct nvme_controller *ctrlr)
 	struct nvme_completion_poll_status	status;
 	struct nvme_async_event_request		*aer;
 	uint32_t				i;
+
+	/* ANS: every admin tag is an NVMMU slot; don't park any in AERs. */
+	if (ctrlr->quirks & QUIRK_APPLE_ANS)
+		return;
 
 	ctrlr->async_event_config = NVME_CRIT_WARN_ST_AVAILABLE_SPARE |
 	    NVME_CRIT_WARN_ST_DEVICE_RELIABILITY |

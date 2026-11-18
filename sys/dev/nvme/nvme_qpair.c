@@ -335,6 +335,51 @@ nvme_qpair_manual_complete_request(struct nvme_qpair *qpair,
 }
 
 /* Locked version of completion processor */
+/*
+ * Apple ANS2: place the command in the slot named by its cid, describe its
+ * DMA in the NVMMU TCB of the same index and start it by writing the cid.
+ */
+static void
+nvme_qpair_apple_submit(struct nvme_qpair *qpair, struct nvme_tracker *tr)
+{
+	struct nvme_controller *ctrlr = qpair->ctrlr;
+	struct nvme_command *cmd = &tr->req->cmd;
+	struct nvme_apple_tcb *tcb;
+
+	tcb = &ctrlr->apple_tcb[qpair->id != 0][tr->cid];
+	memset(tcb, 0, sizeof(*tcb));
+	tcb->command_id = tr->cid;
+	tcb->length = htole16(le32toh(cmd->cdw12) & 0xffff);
+	tcb->prp1 = cmd->prp1;
+	tcb->prp2 = cmd->prp2;
+	if (cmd->prp1 == 0)
+		tcb->dma_flags = 0;
+	else if (cmd->opc & 1)
+		tcb->dma_flags = NVME_APPLE_TCB_DMA_TO_DEVICE;
+	else
+		tcb->dma_flags = NVME_APPLE_TCB_DMA_FROM_DEVICE;
+	memcpy(&qpair->cmd[tr->cid], cmd, sizeof(*cmd));
+
+	bus_dmamap_sync(qpair->dma_tag, qpair->queuemem_map,
+	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+	wmb();
+	bus_write_4(ctrlr->apple_nvmmu, qpair->id == 0 ?
+	    NVME_APPLE_LSQ_ASQ_DB : NVME_APPLE_LSQ_IOSQ_DB, tr->cid);
+	qpair->num_cmds++;
+}
+
+/* Apple ANS2: release a completed command's TCB (and its tag). */
+static void
+nvme_qpair_apple_inval(struct nvme_qpair *qpair, uint16_t cid)
+{
+	struct resource *nvmmu = qpair->ctrlr->apple_nvmmu;
+
+	bus_write_4(nvmmu, NVME_APPLE_NVMMU_TCB_INVAL, cid);
+	if (bus_read_4(nvmmu, NVME_APPLE_NVMMU_TCB_STAT) != 0)
+		nvme_printf(qpair->ctrlr,
+		    "NVMMU TCB %u invalidation failed\n", cid);
+}
+
 static bool
 _nvme_qpair_process_completions(struct nvme_qpair *qpair)
 {
@@ -433,10 +478,15 @@ _nvme_qpair_process_completions(struct nvme_qpair *qpair)
 		    NVME_STATUS_GET_P(status) == NVME_STATUS_GET_P(cpl.status),
 		    ("Phase unexpectedly inconsistent"));
 
-		if (cpl.cid < qpair->num_trackers)
+		if (cpl.cid >= qpair->cid_base &&
+		    cpl.cid < qpair->cid_base + qpair->num_trackers)
 			tr = qpair->act_tr[cpl.cid];
 		else
 			tr = NULL;
+
+		if (tr != NULL &&
+		    (qpair->ctrlr->quirks & QUIRK_APPLE_ANS) != 0)
+			nvme_qpair_apple_inval(qpair, cpl.cid);
 
 		done = true;
 		if (tr != NULL) {
@@ -639,7 +689,7 @@ nvme_qpair_construct(struct nvme_qpair *qpair,
 		    DOMAINSET_PREF(qpair->domain), M_ZERO | M_WAITOK);
 		bus_dmamap_create(qpair->dma_tag_payload, 0,
 		    &tr->payload_dma_map);
-		tr->cid = i;
+		tr->cid = qpair->cid_base + i;
 		tr->qpair = qpair;
 		tr->prp = (uint64_t *)prp_list;
 		tr->prp_bus_addr = list_phys;
@@ -1060,6 +1110,11 @@ nvme_qpair_submit_tracker(struct nvme_qpair *qpair, struct nvme_tracker *tr)
 	} else
 		tr->deadline = SBT_MAX;
 
+	if (ctrlr->quirks & QUIRK_APPLE_ANS) {
+		nvme_qpair_apple_submit(qpair, tr);
+		return;
+	}
+
 	/* Copy the command from the tracker to the submission queue. */
 	memcpy(&qpair->cmd[qpair->sq_tail], &req->cmd, sizeof(req->cmd));
 
@@ -1238,6 +1293,9 @@ nvme_qpair_reset(struct nvme_qpair *qpair)
 	    qpair->num_entries * sizeof(struct nvme_command));
 	memset(qpair->cpl, 0,
 	    qpair->num_entries * sizeof(struct nvme_completion));
+	if (qpair->ctrlr->quirks & QUIRK_APPLE_ANS)
+		memset(qpair->ctrlr->apple_tcb[qpair->id != 0], 0,
+		    NVME_APPLE_QUEUE_ENTRIES * sizeof(struct nvme_apple_tcb));
 }
 
 void

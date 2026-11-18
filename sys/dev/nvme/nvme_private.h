@@ -147,6 +147,42 @@ enum nvme_recovery {
 	RECOVERY_NONE = 0,		/* Normal operations */
 	RECOVERY_WAITING,		/* waiting for the reset to complete */
 };
+/*
+ * Apple ANS2: the submission queue is an array indexed by command tag (cid),
+ * started by writing the tag to a doorbell, and each command also needs a
+ * transfer control block in the NVMMU's per-queue TCB array. Tags are unique
+ * across the admin and I/O queue.
+ */
+#define	NVME_APPLE_QUEUE_ENTRIES	64
+#define	NVME_APPLE_ADMIN_TRACKERS	8
+#define	NVME_APPLE_IOSQ			0x1200	/* nvme: I/O SQ base */
+#define	NVME_APPLE_IOCQ			0x1208	/* nvme: I/O CQ base */
+#define	NVME_APPLE_MAX_PEND		0x1210	/* nvme: I/O queue sizes */
+#define	NVME_APPLE_LSQ_ASQ_DB		0x2490c	/* nvmmu */
+#define	NVME_APPLE_LSQ_IOSQ_DB		0x24910
+#define	NVME_APPLE_NVMMU_NUM		0x28100
+#define	NVME_APPLE_NVMMU_ASQ_TCB	0x28108
+#define	NVME_APPLE_NVMMU_IOSQ_TCB	0x28110
+#define	NVME_APPLE_NVMMU_TCB_INVAL	0x28118
+#define	NVME_APPLE_NVMMU_TCB_STAT	0x28120
+
+struct nvme_apple_tcb {
+	uint8_t		opcode;
+	uint8_t		dma_flags;
+#define	NVME_APPLE_TCB_DMA_FROM_DEVICE	0x1
+#define	NVME_APPLE_TCB_DMA_TO_DEVICE	0x2
+	uint8_t		command_id;
+	uint8_t		_unk0;
+	uint16_t	length;
+	uint8_t		_unk1[18];
+	uint64_t	prp1;
+	uint64_t	prp2;
+	uint8_t		_unk2[16];
+	uint8_t		aes_iv[8];
+	uint8_t		_aes_unk[64];
+} __packed;
+_Static_assert(sizeof(struct nvme_apple_tcb) == 128, "nvme_apple_tcb size");
+
 struct nvme_qpair {
 	struct nvme_controller	*ctrlr;
 	uint32_t		id;
@@ -164,6 +200,7 @@ struct nvme_qpair {
 
 	uint32_t		num_entries;
 	uint32_t		num_trackers;
+	uint32_t		cid_base;	/* first tracker cid */
 	uint32_t		sq_tdbl_off;
 	uint32_t		cq_hdbl_off;
 
@@ -224,6 +261,7 @@ struct nvme_controller {
 #define	QUIRK_DISABLE_TIMEOUT	2		/* Disable broken completion timeout feature */
 #define	QUIRK_INTEL_ALIGNMENT	4		/* Pre NVMe 1.3 performance alignment */
 #define QUIRK_AHCI		8		/* Attached via AHCI redirect */
+#define QUIRK_APPLE_ANS		16		/* Apple ANS2: linear SQ + NVMMU */
 
 	int			resource_id;
 	struct resource		*resource;
@@ -280,6 +318,11 @@ struct nvme_controller {
 
 	/** doorbell stride */
 	uint32_t		dstrd;
+
+	/* Apple ANS2 (QUIRK_APPLE_ANS), set up by the bus front-end. */
+	struct resource		*apple_nvmmu;	/* NVMMU + linear SQ doorbells */
+	struct nvme_apple_tcb	*apple_tcb[2];	/* admin, I/O: indexed by cid */
+	uint64_t		apple_tcb_bus[2];
 
 	struct nvme_qpair	adminq;
 	struct nvme_qpair	*ioq;
