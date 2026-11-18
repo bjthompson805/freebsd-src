@@ -241,8 +241,8 @@ exynos4210_init_common(struct exynos_uart_cfg *cfg, struct uart_bas *bas,
 	/* Enable UART. */
 	if (cfg->cfg_type == EXUART_S5L) {
 		uart_setreg(bas, SSCOM_UCON, uart_getreg(bas, SSCOM_UCON) |
-		    UCON_TOINT | UCON_S5L_RXTHRESH | UCON_S5L_RX_TIMEOUT |
-		    UCON_S5L_TXTHRESH);
+		    UCON_TXMODE_INT | UCON_RXMODE_INT | UCON_TOINT |
+		    UCON_S5L_RXTHRESH | UCON_S5L_RX_TIMEOUT);
 	} else {
 		uart_setreg(bas, SSCOM_UCON, uart_getreg(bas, SSCOM_UCON) |
 		    UCON_TXMODE_INT | UCON_RXMODE_INT | UCON_TOINT);
@@ -415,7 +415,13 @@ exynos4210_bus_transmit(struct uart_softc *sc)
 	}
 
 	if (cfg->cfg_type == EXUART_S5L) {
+		/*
+		 * TX threshold is level-triggered while the FIFO is below the
+		 * threshold, so only enable it while a transmit is pending.
+		 */
 		sc->sc_txbusy = 1;
+		uart_setreg(&sc->sc_bas, SSCOM_UCON,
+		    uart_getreg(&sc->sc_bas, SSCOM_UCON) | UCON_S5L_TXTHRESH);
 	} else {
 		/* unmask TX interrupt */
 		reg = bus_space_read_4(sc->sc_bas.bst, sc->sc_bas.bsh,
@@ -492,8 +498,13 @@ s5l_bus_ipend(struct uart_softc *sc)
         if (utrstat & (UTRSTAT_S5L_RXTHRESH | UTRSTAT_S5L_RX_TIMEOUT))
 		ipend |= SER_INT_RXREADY;
 
-        if (utrstat & UTRSTAT_S5L_TXTHRESH)
-		ipend |= SER_INT_TXIDLE;
+	if ((utrstat & UTRSTAT_S5L_TXTHRESH) != 0) {
+		bus_space_write_4(sc->sc_bas.bst, sc->sc_bas.bsh, SSCOM_UCON,
+		    bus_space_read_4(sc->sc_bas.bst, sc->sc_bas.bsh,
+		    SSCOM_UCON) & ~UCON_S5L_TXTHRESH);
+		if (sc->sc_txbusy != 0)
+			ipend |= SER_INT_TXIDLE;
+	}
 
 	uerstat = bus_space_read_4(sc->sc_bas.bst, sc->sc_bas.bsh,
 	    SSCOM_UERSTAT);
