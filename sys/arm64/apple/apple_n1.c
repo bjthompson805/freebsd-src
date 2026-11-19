@@ -186,6 +186,8 @@ n1_dart_errors(struct n1_softc *sc)
 
 static int n1_corrupt;
 TUNABLE_INT("hw.apple_n1.corrupt", &n1_corrupt);
+static int n1_desc_len;		/* XXX bring-up: override the scatter length */
+TUNABLE_INT("hw.apple_n1.desc_len", &n1_desc_len);
 
 static int
 n1_rom_boot(struct n1_softc *sc)
@@ -232,7 +234,8 @@ n1_rom_boot(struct n1_softc *sc)
 		memset((uint8_t *)sc->fw + 0x20, 0, 16);
 	/* Scatter entry: u64 address, u32 length (4K-aligned), u32 flags. */
 	le64enc(sc->desc, sc->fw_iova);
-	le32enc((uint8_t *)sc->desc + 8, roundup2(fw->datasize, 4096));
+	le32enc((uint8_t *)sc->desc + 8, n1_desc_len != 0 ? n1_desc_len :
+	    roundup2(fw->datasize, 4096));
 	desc_size = 0x20;
 	/* XXX bring-up experiment: the IMG4 ticket as a second scatter entry. */
 	tkt = firmware_get_flags("apple/j815-centauri.im4m", FIRMWARE_GET_NOWARN);
