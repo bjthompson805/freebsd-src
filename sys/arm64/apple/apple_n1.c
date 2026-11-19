@@ -695,7 +695,8 @@ n1_functions(struct n1_softc *sc)
  * Stage 1 → 2: hand the control function the secondary ftab ("2ftb" in the
  * image, seed of the memory it lays out) through config 0xf88/0xf8c/0xf90,
  * set up the control context, point the boot registers at the image again
- * with "2ftb" in 0x8074 and ring 0x9070; then the control IPC handshake.
+ * and ring 0x9070 (AirshipDK t2026-CentauriControl.plist "boot" stage);
+ * then the control IPC handshake.
  */
 static int
 n1_start_ipc(struct n1_softc *sc)
@@ -722,6 +723,20 @@ n1_start_ipc(struct n1_softc *sc)
 		end = le32dec(seed + 0x34 + 16 * i) + le32dec(seed + 0x38 + 16 * i);
 		need = MAX(need, end);
 	}
+	/* XXX bring-up: what the config mailboxes hold at stage 1 */
+	for (i = 0xf80; i < 0x1000; i += 0x20)
+		device_printf(sc->dev, "cfg %#x: %08x %08x %08x %08x %08x %08x "
+		    "%08x %08x\n", i, pci_read_config(sc->dev, i, 4),
+		    pci_read_config(sc->dev, i + 4, 4),
+		    pci_read_config(sc->dev, i + 8, 4),
+		    pci_read_config(sc->dev, i + 12, 4),
+		    pci_read_config(sc->dev, i + 16, 4),
+		    pci_read_config(sc->dev, i + 20, 4),
+		    pci_read_config(sc->dev, i + 24, 4),
+		    pci_read_config(sc->dev, i + 28, 4));
+	/* macOS (CentauriControl ClearConfigSpaceMailboxes): zero 0xf80-0xffc */
+	for (i = 0xf80; i < 0x1000; i += 4)
+		pci_write_config(sc->dev, i, 0, 4);
 	sc->secondary = n1_dma_alloc(sc, need, &sc->secondary_iova);
 	if (sc->secondary == NULL)
 		return (ENOMEM);
@@ -739,7 +754,6 @@ n1_start_ipc(struct n1_softc *sc)
 	N1_WR4(sc, N1_ROM_DESC_LO, (uint32_t)sc->desc_iova);
 	N1_WR4(sc, N1_ROM_DESC_HI, (uint32_t)(sc->desc_iova >> 32));
 	N1_WR4(sc, N1_ROM_DESC_SIZE, 0x20);
-	N1_WR4(sc, 0x8074, 0x62746632);		/* "2ftb" */
 	dsb(sy);
 	/*
 	 * The firmware doesn't answer BAR reads while it brings up the
@@ -748,15 +762,46 @@ n1_start_ipc(struct n1_softc *sc)
 	 */
 	le32enc(sc->mbox, 0);
 	cpu_dcache_wbinv_range(sc->mbox, N1_PAGE);
-	N1_WR4(sc, 0x9070, 1);
-	for (i = 0; i < 500; i++) {
-		pause("n1s2", hz / 100 + 1);
-		cpu_dcache_inv_range(sc->mbox, N1_PAGE);
-		if (le32dec(sc->mbox) != 0)
-			break;
+	{
+		/* XXX bring-up: timeline of safe state (no BAR access) */
+		device_t rp = device_get_parent(device_get_parent(sc->dev));
+		bus_addr_t dpa;
+		bus_size_t dsz;
+		vm_offset_t dva, pva;
+		uint32_t v[6], pv[6] = { ~0u, ~0u, ~0u, ~0u, ~0u, ~0u };
+		int k;
+
+		ofw_reg_to_paddr(sc->dart, 0, &dpa, &dsz, NULL);
+		dva = (vm_offset_t)pmap_mapdev(dpa, dsz);
+		pva = (vm_offset_t)pmap_mapdev(0x488028000, 0x4000);
+		N1_WR4(sc, 0x9070, 1);
+		for (i = 0; i < 500; i++) {
+			cpu_dcache_inv_range(sc->mbox, N1_PAGE);
+			v[0] = pci_read_config(rp, RC_LTSSM, 4) & 0x3f;
+			v[1] = pci_read_config(rp, 0x82, 2);
+			v[2] = *(volatile uint32_t *)(dva + 0x100);
+			v[3] = *(volatile uint32_t *)(dva + 0x170);
+			v[4] = *(volatile uint32_t *)(pva + 0x100);
+			v[5] = le32dec(sc->mbox);
+			for (k = 0; k < 6 && v[k] == pv[k]; k++)
+				;
+			if (k < 6) {
+				device_printf(sc->dev, "XXX t=%d ltssm %#x lnk %#x "
+				    "darterr %#x addr %#x intstat %#x mbox %#x\n",
+				    i * 10, v[0], v[1], v[2], v[3], v[4], v[5]);
+				memcpy(pv, v, sizeof(v));
+				DELAY(50000);
+			}
+			if (v[5] != 0)
+				break;
+			DELAY(10000);
+		}
+		pmap_unmapdev((void *)pva, 0x4000);
+		pmap_unmapdev((void *)dva, dsz);
 	}
 	device_printf(sc->dev, "exec-stage MSI %#x after ~%d ms\n",
 	    le32dec(sc->mbox), i * 10);
+	n1_dart_errors(sc);
 	if (le32dec(sc->mbox) == 0)
 		return (ETIMEDOUT);
 	stage = N1_RD4(sc, N1_STAGE);
