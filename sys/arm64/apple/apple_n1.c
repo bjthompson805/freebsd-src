@@ -96,6 +96,8 @@ static const struct n1_board n1_boards[] = {
 #define	PORT_LANES		0x820
 #define	PORT_PERST		0x82c
 #define	PORT_RID2SID		0x3000
+#define	PORT_RID2SID_VALID	(1u << 31)
+#define	PORT_RID2SID_SID_SHIFT	16
 #define	PORT_MSIMAP		0x3800
 #define	RC_LTSSM		0x728	/* root port config: LTSSM state in [5:0] */
 #define	LTSSM_L0		0x11
@@ -652,14 +654,48 @@ n1_handshake(struct resource *bar, struct n1_ctx *c, bus_size_t status,
 }
 
 /*
+ * After the port cycle macOS routes the three requester IDs to streams 1–3.
+ * Keep all three streams on the private table with the already mapped image.
+ */
+static int
+n1_route_functions(struct n1_softc *sc)
+{
+	volatile uint32_t *routes;
+	unsigned int sid;
+	int error, i;
+
+	for (i = 0; i < nitems(sc->fn); i++) {
+		sid = i + 1;
+		error = apple_dart_private_stream(sc->fn[i], sc->dart, sid);
+		if (error != 0)
+			return (error);
+	}
+	routes = pmap_mapdev(sc->board->port + PORT_RID2SID, 16 * sizeof(*routes));
+	for (i = 0; i < nitems(sc->fn); i++) {
+		sid = i + 1;
+		routes[sid] = PORT_RID2SID_VALID |
+		    (sid << PORT_RID2SID_SID_SHIFT) | pci_get_rid(sc->fn[i]);
+	}
+	dsb(sy);
+	pmap_unmapdev(__DEVOLATILE(void *, routes), 16 * sizeof(*routes));
+	sc->sid = 1;
+	return (0);
+}
+
+/*
  * Firmware personality: MSI to a DMA mailbox per function (polled until
  * we have an MSI controller for the port) and bus mastering.
  */
 static int
 n1_functions(struct n1_softc *sc)
 {
+	/* Control, Alpha, and Beta vector allocations in the macOS registry. */
+	static const uint16_t mme[] = {
+		PCIM_MSICTRL_MME_4, PCIM_MSICTRL_MME_16, PCIM_MSICTRL_MME_2,
+	};
 	uint64_t iova;
-	int cap, i;
+	uint16_t command;
+	int cap, error, i;
 
 	sc->fn[0] = sc->dev;
 	sc->fnbar[0] = sc->bar;
@@ -668,6 +704,10 @@ n1_functions(struct n1_softc *sc)
 			device_printf(sc->dev, "function %d missing\n", i);
 			return (ENXIO);
 		}
+	}
+	if ((error = n1_route_functions(sc)) != 0)
+		return (error);
+	for (i = 0; i < nitems(sc->fn); i++) {
 		if (pci_find_cap(sc->fn[i], PCIY_MSI, &cap) != 0)
 			return (ENXIO);
 		if (i == 0) {
@@ -684,9 +724,10 @@ n1_functions(struct n1_softc *sc)
 		    N1_MSI_DATA + 0x100 * i, 2);
 		pci_write_config(sc->fn[i], cap + PCIR_MSI_CTRL,
 		    (pci_read_config(sc->fn[i], cap + PCIR_MSI_CTRL, 2) &
-		    ~PCIM_MSICTRL_MME_MASK) | PCIM_MSICTRL_MME_32 |
-		    PCIM_MSICTRL_MSI_ENABLE, 2);
-		pci_enable_busmaster(sc->fn[i]);
+		    ~PCIM_MSICTRL_MME_MASK) | mme[i] | PCIM_MSICTRL_MSI_ENABLE, 2);
+		command = pci_read_config(sc->fn[i], PCIR_COMMAND, 2);
+		pci_write_config(sc->fn[i], PCIR_COMMAND,
+		    command | PCIM_CMD_BUSMASTEREN | PCIM_CMD_INTxDIS, 2);
 	}
 	return (0);
 }

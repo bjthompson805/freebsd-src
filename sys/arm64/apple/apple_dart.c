@@ -152,7 +152,7 @@ apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1)
 	bus_size_t size;
 	vm_offset_t va;
 	vm_paddr_t l1pa;
-	uint32_t tcr;
+	uint32_t tcr, streams;
 	int i, error;
 
 	if (!ofw_bus_node_is_compatible(dart, "apple,t8110-dart")) {
@@ -184,8 +184,8 @@ apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1)
 		DELAY(1);
 	DART_WR4(va, DART_T8110_TCR(sid),
 	    DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL);
-	DART_WR4(va, DART_T8110_ENABLE_STREAMS + 4 * (sid / 32),
-	    1u << (sid % 32));
+	streams = DART_T8110_ENABLE_STREAMS + 4 * (sid / 32);
+	DART_WR4(va, streams, DART_RD4(va, streams) | (1u << (sid % 32)));
 
 	tcr = DART_RD4(va, DART_T8110_TCR(sid));
 	if (bootverbose || (tcr & DART_T8110_TCR_TRANSLATE) == 0)
