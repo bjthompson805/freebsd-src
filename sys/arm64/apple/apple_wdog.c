@@ -29,6 +29,7 @@
 
 #include <sys/param.h>
 #include <sys/bus.h>
+#include <sys/callout.h>
 #include <sys/eventhandler.h>
 #include <sys/kernel.h>
 #include <sys/limits.h>
@@ -37,6 +38,7 @@
 #include <sys/mutex.h>
 #include <sys/reboot.h>
 #include <sys/rman.h>
+#include <sys/time.h>
 #include <sys/systm.h>
 #include <sys/watchdog.h>
 
@@ -77,15 +79,37 @@ struct apple_wdog_softc {
 	clk_t			clk;
 	uint64_t		clk_freq;
 	struct mtx		mtx;
+	struct callout		keepalive;
 };
+
+/*
+ * hw.apple_wdog.keepalive=<secs> (M5 bring-up dev loop): the host arms WD1
+ * with a short alarm before boot; keep that alarm armed and restart its count
+ * every second for <secs>, so a hung or frozen machine resets within the
+ * alarm and an abandoned one resets once the time is up.
+ */
+static int apple_wdog_keepalive;
+TUNABLE_INT("hw.apple_wdog.keepalive", &apple_wdog_keepalive);
 
 static struct ofw_compat_data compat_data[] = {
 	{"apple,wdt",		1},
+	{"apple,t8103-wdt",	1},
 	{NULL,			0}
 };
 
 static void apple_wdog_watchdog_fn(void *private, u_int cmd, int *error);
 static void apple_wdog_reboot_system(void *, int);
+
+static void
+apple_wdog_kick(void *arg)
+{
+	struct apple_wdog_softc *sc = arg;
+
+	if (time_uptime >= (time_t)apple_wdog_keepalive)
+		return;
+	WRITE(sc, APPLE_WDOG_WD1_TIMER, 0);
+	callout_reset(&sc->keepalive, hz, apple_wdog_kick, sc);
+}
 
 static int
 apple_wdog_probe(device_t dev)
@@ -144,7 +168,13 @@ apple_wdog_attach(device_t dev)
 
 	/* Reset the watchdog timers. */
 	WRITE(sc, APPLE_WDOG_WD0_CNTL, 0);
-	WRITE(sc, APPLE_WDOG_WD1_CNTL, 0);
+	if (apple_wdog_keepalive) {
+		callout_init(&sc->keepalive, 1);
+		apple_wdog_kick(sc);
+		device_printf(dev, "keepalive: WD1 alarm %u s\n",
+		    (u_int)(READ(sc, APPLE_WDOG_WD1_RESET) / sc->clk_freq));
+	} else
+		WRITE(sc, APPLE_WDOG_WD1_CNTL, 0);
 
 	return (0);
 

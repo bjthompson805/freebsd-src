@@ -8,5 +8,8 @@
 int	apple_dart_identity(device_t dev);
 int	apple_dart_map(device_t dev, uint64_t iova, vm_paddr_t pa,
 	    size_t size);
+int	apple_dart_identity_stream(device_t dev, phandle_t dart, u_int sid);
+int	apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid,
+	    uint64_t iova, vm_paddr_t pa, size_t size);
 
 #endif /* _ARM64_APPLE_APPLE_DART_H_ */

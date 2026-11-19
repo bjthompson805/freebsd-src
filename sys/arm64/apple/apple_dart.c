@@ -249,6 +249,51 @@ apple_dart_map(device_t dev, uint64_t iova, vm_paddr_t pa, size_t size)
 	return (0);
 }
 
+/*
+ * Stream-level variants for devices without an "iommus" property (PCI
+ * functions: their stream comes from the host bridge's "iommu-map").
+ */
+int
+apple_dart_identity_stream(device_t dev, phandle_t dart, u_int sid)
+{
+	int error;
+
+	sx_xlock(&apple_dart_lock);
+	if (apple_dart_l1 == NULL)
+		apple_dart_build_identity();
+	error = apple_dart_setup_one(dev, dart, sid);
+	sx_xunlock(&apple_dart_lock);
+	return (error);
+}
+
+int
+apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid, uint64_t iova,
+    vm_paddr_t pa, size_t size)
+{
+	uint64_t *l2, *l3, end;
+
+	if (((iova | pa | size) & (DART_PAGE_SIZE - 1)) != 0 ||
+	    iova + size > (1ul << DART_IOVA_BITS))
+		return (EINVAL);
+	sx_xlock(&apple_dart_lock);
+	if (apple_dart_l1 == NULL) {
+		sx_xunlock(&apple_dart_lock);
+		return (ENXIO);
+	}
+	for (end = iova + size; iova < end; iova += DART_PAGE_SIZE,
+	    pa += DART_PAGE_SIZE) {
+		l2 = apple_dart_next(apple_dart_l1, (iova >> 36) & 0x7ff);
+		l3 = apple_dart_next(l2, (iova >> 25) & 0x7ff);
+		l3[(iova >> 14) & 0x7ff] = DART_PTE_PA(pa) | DART_PTE_SP_END |
+		    DART_PTE_VALID;
+	}
+	apple_dart_flush_tables(apple_dart_l1, 1);
+	dsb(sy);
+	apple_dart_flush_sid(dev, dart, sid);
+	sx_xunlock(&apple_dart_lock);
+	return (0);
+}
+
 /* Map all RAM at IOVA == PA on every stream in dev's "iommus" (<&dart sid>). */
 int
 apple_dart_identity(device_t dev)
