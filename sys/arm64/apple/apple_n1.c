@@ -759,12 +759,85 @@ n1_functions(struct n1_softc *sc)
 }
 
 /*
+ * PCIe Precision Time Measurement. The secondary loader runs a PTM exchange
+ * before it validates the manifest (firmware "beforePTM"/"ptmDone" boot
+ * timestamps in the macOS registry), so the root port has to answer.
+ * Apple's sequence (macOS 26.4 kernelcache): AppleEmbeddedPCIE
+ * _enableGTBToPTM sets common register 0x50 bit 0 (global timebase feeds
+ * PTM); APCIECoreRCGen4Port::enablePortPTM turns the bridge PTM control
+ * (config 0x2b8 bit 0) off, gates port config register 0x2b0 off and on,
+ * loads the per-rate responder latencies (0x304 selects the rate, 0x2f4 and
+ * 0x2f8 take AppleT8142PCIePort::_getLatency) and turns PTM back on.
+ * IOPCIFamily then enables the requesters.
+ */
+#define	N1_COMMON		0x48c000000	/* apcie reg[1] */
+#define	N1_PORT_CONFIG		0x488028000	/* apcie reg[8 + 6 * port] */
+static const uint16_t n1_ptm_latency[4][2] = {
+	{ 0xcb, 0x1e2 }, { 0x66, 0xf0 }, { 0x46, 0xc9 }, { 0x24, 0x65 },
+};
+
+static void
+n1_enable_ptm(struct n1_softc *sc)
+{
+	device_t rp = device_get_parent(device_get_parent(sc->dev));
+	vm_offset_t common, pcfg;
+	uint32_t v;
+	int cap, i;
+
+	common = (vm_offset_t)pmap_mapdev(N1_COMMON, PAGE_SIZE);
+	pcfg = (vm_offset_t)pmap_mapdev(N1_PORT_CONFIG, 0x4000);
+	device_printf(sc->dev, "PTM: common 0x50 %#x, port cfg 0x2b0 %#x, "
+	    "bridge 0x2b0 %08x %08x %08x, 0x2f4 %#x 0x2f8 %#x 0x304 %#x\n",
+	    *(volatile uint32_t *)(common + 0x50),
+	    *(volatile uint32_t *)(pcfg + 0x2b0),
+	    pci_read_config(rp, 0x2b0, 4), pci_read_config(rp, 0x2b4, 4),
+	    pci_read_config(rp, 0x2b8, 4), pci_read_config(rp, 0x2f4, 4),
+	    pci_read_config(rp, 0x2f8, 4), pci_read_config(rp, 0x304, 4));
+
+	*(volatile uint32_t *)(common + 0x50) |= 1;
+	pci_write_config(rp, 0x2b8, pci_read_config(rp, 0x2b8, 4) & ~1u, 4);
+	*(volatile uint32_t *)(pcfg + 0x2b0) = 0;
+	*(volatile uint32_t *)(pcfg + 0x2b0) = 1;
+	for (i = 0; i < nitems(n1_ptm_latency); i++) {
+		v = pci_read_config(rp, 0x304, 4);
+		pci_write_config(rp, 0x304, (v & ~0xfu) | i, 4);
+		v = pci_read_config(rp, 0x2f4, 4);
+		pci_write_config(rp, 0x2f4, (v & ~0xfffu) | n1_ptm_latency[i][0], 4);
+		v = pci_read_config(rp, 0x2f8, 4);
+		pci_write_config(rp, 0x2f8, (v & ~0xfffu) | n1_ptm_latency[i][1], 4);
+	}
+	/* Enable, plus Root Select as IOPCIFamily sets on a root-capable port */
+	pci_write_config(rp, 0x2b8, pci_read_config(rp, 0x2b8, 4) | 3, 4);
+
+	/* Requesters: PTM Enable in each function's PTM capability. */
+	for (i = 0; i < nitems(sc->fn); i++) {
+		if (pci_find_extcap(sc->fn[i], PCIZ_PTM, &cap) != 0)
+			continue;
+		pci_write_config(sc->fn[i], cap + 8,
+		    pci_read_config(sc->fn[i], cap + 8, 4) | 1, 4);
+		device_printf(sc->dev, "PTM: function %d cap %#x %08x ctl %08x\n",
+		    i, cap, pci_read_config(sc->fn[i], cap + 4, 4),
+		    pci_read_config(sc->fn[i], cap + 8, 4));
+	}
+	device_printf(sc->dev, "PTM: common 0x50 %#x, port cfg 0x2b0 %#x, "
+	    "bridge ctl %#x\n", *(volatile uint32_t *)(common + 0x50),
+	    *(volatile uint32_t *)(pcfg + 0x2b0), pci_read_config(rp, 0x2b8, 4));
+	pmap_unmapdev((void *)pcfg, 0x4000);
+	pmap_unmapdev((void *)common, PAGE_SIZE);
+}
+
+/*
  * Stage 1 → 2: hand the control function the secondary ftab ("2ftb" in the
  * image, seed of the memory it lays out) through config 0xf88/0xf8c/0xf90,
  * set up the control context, point the boot registers at the image again
  * and ring 0x9070 (AirshipDK t2026-CentauriControl.plist "boot" stage);
  * then the control IPC handshake.
  */
+static const uint32_t n1_img_holes[][2] = {
+	/* HOLES */
+	{ 0, 0 },
+};
+
 static int
 n1_start_ipc(struct n1_softc *sc)
 {
@@ -774,6 +847,7 @@ n1_start_ipc(struct n1_softc *sc)
 
 	if ((error = n1_functions(sc)) != 0)
 		return (error);
+	n1_enable_ptm(sc);
 	if ((error = n1_ftab_entry(sc->fw, sc->fw_size, "2ftb", &off,
 	    &len)) != 0) {
 		device_printf(sc->dev, "no 2ftb in the image: %d\n", error);
@@ -805,6 +879,39 @@ n1_start_ipc(struct n1_softc *sc)
 
 	if ((error = n1_ctx_init(sc, &sc->control, 13, 1, 0, 0)) != 0)
 		return (error);
+	/*
+	 * XXX bring-up: resend the image page by page with unmapped holes; the
+	 * DART fault then names the firmware's first access inside a hole.
+	 */
+	if (n1_img_holes[0][1] != 0) {
+		uint64_t base, iova;
+		uint32_t pg;
+		void *p;
+		int h, hole;
+
+		base = sc->iova_next;
+		for (pg = 0; pg < sc->fw_size; pg += N1_PAGE) {
+			for (h = 0, hole = 0; n1_img_holes[h][1] != 0; h++)
+				if (pg >= n1_img_holes[h][0] &&
+				    pg < n1_img_holes[h][1])
+					hole = 1;
+			sc->iova_next = base + pg;
+			if (hole)
+				continue;
+			if ((p = n1_dma_alloc(sc, N1_PAGE, &iova)) == NULL)
+				break;
+			memcpy(p, (uint8_t *)sc->fw + pg,
+			    MIN(N1_PAGE, sc->fw_size - pg));
+			cpu_dcache_wb_range(p, N1_PAGE);
+		}
+		sc->iova_next = base + roundup2(sc->fw_size, N1_PAGE);
+		le64enc(sc->desc, base);
+		cpu_dcache_wb_range(sc->desc, N1_PAGE);
+		for (h = 0; n1_img_holes[h][1] != 0; h++)
+			device_printf(sc->dev, "secondary probe: image at %#lx, "
+			    "hole %#x-%#x\n", base, n1_img_holes[h][0],
+			    n1_img_holes[h][1]);
+	}
 	N1_WR4(sc, N1_ROM_DESC_LO, (uint32_t)sc->desc_iova);
 	N1_WR4(sc, N1_ROM_DESC_HI, (uint32_t)(sc->desc_iova >> 32));
 	N1_WR4(sc, N1_ROM_DESC_SIZE, 0x20);
