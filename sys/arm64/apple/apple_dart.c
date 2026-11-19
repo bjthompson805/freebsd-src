@@ -5,7 +5,10 @@
  * DART streams at one shared page table that maps every RAM page at
  * IOVA == PA, so its DMA works without a busdma/IOMMU backend. There is no
  * isolation. The USB DARTs on T8142 (DART 2.4) ignore the bypass bits, hence
- * the identity table instead.
+ * the identity table instead. apple_dart_map() adds pages at other IOVAs to
+ * the same table, for devices whose firmware wants addresses in a window of
+ * its own (MTP: "apple,dma-range"). RAM is above 4 GB on these SoCs, so low
+ * IOVAs never collide with the identity part.
  *
  * Table format (16 KiB granule, 42-bit IOVA, as Linux io-pgtable-dart):
  * three levels of 2048 8-byte entries indexed by IOVA[41:36], [35:25] and
@@ -183,6 +186,67 @@ apple_dart_setup_one(device_t dev, phandle_t dart, u_int sid)
 out:
 	pmap_unmapdev((void *)va, size);
 	return (error);
+}
+
+static void
+apple_dart_flush_sid(device_t dev, phandle_t dart, u_int sid)
+{
+	bus_addr_t pa;
+	bus_size_t size;
+	vm_offset_t va;
+	int i;
+
+	if (sid >= DART_T8110_MAX_SID ||
+	    ofw_reg_to_paddr(dart, 0, &pa, &size, NULL) != 0)
+		return;
+	va = (vm_offset_t)pmap_mapdev(pa, size);
+	DART_WR4(va, DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_FLUSH_SID | sid);
+	for (i = 0; i < 1000 &&
+	    (DART_RD4(va, DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY); i++)
+		DELAY(1);
+	pmap_unmapdev((void *)va, size);
+}
+
+/*
+ * Map [pa, pa + size) at iova for dev (after apple_dart_identity), then
+ * flush dev's streams. Page-aligned; never unmapped.
+ */
+int
+apple_dart_map(device_t dev, uint64_t iova, vm_paddr_t pa, size_t size)
+{
+	phandle_t node;
+	pcell_t *cells;
+	uint64_t *l2, *l3, end;
+	int i, n;
+
+	if (((iova | pa | size) & (DART_PAGE_SIZE - 1)) != 0 ||
+	    iova + size > (1ul << DART_IOVA_BITS))
+		return (EINVAL);
+	sx_xlock(&apple_dart_lock);
+	if (apple_dart_l1 == NULL) {
+		sx_xunlock(&apple_dart_lock);
+		return (ENXIO);
+	}
+	for (end = iova + size; iova < end; iova += DART_PAGE_SIZE,
+	    pa += DART_PAGE_SIZE) {
+		l2 = apple_dart_next(apple_dart_l1, (iova >> 36) & 0x7ff);
+		l3 = apple_dart_next(l2, (iova >> 25) & 0x7ff);
+		l3[(iova >> 14) & 0x7ff] = DART_PTE_PA(pa) | DART_PTE_SP_END |
+		    DART_PTE_VALID;
+	}
+	apple_dart_flush_tables(apple_dart_l1, 1);
+	dsb(sy);
+
+	node = ofw_bus_get_node(dev);
+	n = OF_getencprop_alloc_multi(node, "iommus", sizeof(*cells),
+	    (void **)&cells);
+	for (i = 0; i + 1 < n; i += 2)
+		apple_dart_flush_sid(dev, OF_node_from_xref(cells[i]),
+		    cells[i + 1]);
+	sx_xunlock(&apple_dart_lock);
+	if (n > 0)
+		OF_prop_free(cells);
+	return (0);
 }
 
 /* Map all RAM at IOVA == PA on every stream in dev's "iommus" (<&dart sid>). */

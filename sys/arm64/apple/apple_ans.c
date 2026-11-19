@@ -6,9 +6,9 @@
  * controller to nvme(4) with QUIRK_APPLE_ANS (linear SQ + NVMMU).
  *
  * The mailbox and SART are separate DT nodes ("mboxes", "apple,sart"); they
- * have no other users, so they are mapped directly here. RTKit is polled:
- * at boot until the IOP reports power ON, then from a callout that acks
- * syslog and ioreport traffic.
+ * have no other users, so they are mapped directly here. RTKit (apple_rtkit)
+ * is polled: at boot until the IOP reports power ON, then from a callout that
+ * acks syslog and ioreport traffic.
  */
 
 #include <sys/param.h>
@@ -20,7 +20,6 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/rman.h>
-#include <sys/hash.h>
 #include <sys/sysctl.h>
 
 #include <vm/vm.h>
@@ -35,19 +34,11 @@
 
 #include <dev/nvme/nvme_private.h>
 
+#include <arm64/apple/apple_rtkit.h>
+
 /* ASC wrapper (DT reg "ans") */
 #define	ASC_CPU_CONTROL			0x44
 #define	ASC_CPU_CONTROL_RUN		0x10
-
-/* ASC mailbox */
-#define	MBOX_A2I_CONTROL		0x110
-#define	MBOX_I2A_CONTROL		0x114
-#define	MBOX_CONTROL_FULL		(1u << 16)
-#define	MBOX_CONTROL_EMPTY		(1u << 17)
-#define	MBOX_A2I_SEND0			0x800
-#define	MBOX_A2I_SEND1			0x808
-#define	MBOX_I2A_RECV0			0x830
-#define	MBOX_I2A_RECV1			0x838
 
 /* SART v3 */
 #define	SART_MAX_ENTRIES		16
@@ -60,52 +51,6 @@
 #define	ANS_BOOT_STATUS			0x1300
 #define	ANS_BOOT_STATUS_OK		0xde71ce55
 
-/* RTKit */
-#define	EP_MGMT				0
-#define	EP_CRASHLOG			1
-#define	EP_SYSLOG			2
-#define	EP_DEBUG			3
-#define	EP_IOREPORT			4
-#define	EP_OSLOG			8
-
-#define	MSG_TYPE(m)			(((m) >> 52) & 0xff)
-#define	MSG_TYPE_SET(t)			((uint64_t)(t) << 52)
-
-#define	MGMT_HELLO			1
-#define	MGMT_HELLO_ACK			2
-#define	MGMT_START_EP			5
-#define	MGMT_IOP_PWR			6
-#define	MGMT_IOP_PWR_ACK		7
-#define	MGMT_EPMAP			8
-#define	MGMT_AP_PWR			0xb
-#define	MGMT_EPMAP_DONE			(1ull << 51)
-#define	MGMT_EPMAP_MORE			1ull
-
-#define	PWR_ON				0x20
-#define	PWR_INIT			0x220
-
-#define	MSG_BUFFER_REQUEST		1
-#define	BUFREQ_SIZE(m)			(((m) >> 44) & 0xff)	/* 4K pages */
-#define	BUFREQ_ADDR(m)			((m) & ((1ull << 42) - 1))
-#define	MSG_SYSLOG_LOG			5
-#define	MSG_SYSLOG_INIT			8
-
-#define	RTKIT_MIN_VERSION		11
-#define	RTKIT_MAX_VERSION		12
-
-struct ans_buffer {
-	void		*va;
-	vm_paddr_t	pa;
-	size_t		size;
-};
-
-struct ans_syslog_entry {
-	uint32_t	hdr;
-	uint32_t	unk;
-	char		context[24];
-	char		msg[];
-};
-
 struct apple_ans_softc {
 	struct nvme_controller	ctrlr;		/* must be first: DEVICE2SOFTC */
 	device_t		dev;
@@ -117,11 +62,7 @@ struct apple_ans_softc {
 
 	struct mtx		mtx;		/* mailbox */
 	struct callout		poll;
-	uint32_t		iop_power;
-	bool			crashed;
-	struct ans_buffer	crashlog, syslog, ioreport, oslog;
-	uint32_t		syslog_count, syslog_size;
-	uint32_t		syslog_last, syslog_repeats;
+	struct apple_rtkit	*rtk;
 
 	bus_dma_tag_t		tcb_tag;
 	bus_dmamap_t		tcb_map;
@@ -139,9 +80,6 @@ SYSCTL_DECL(_hw_nvme);
 SYSCTL_INT(_hw_nvme, OID_AUTO, apple_ans_verbose, CTLFLAG_RWTUN, &ans_verbose,
     0, "Print Apple ANS firmware syslog");
 
-#define	MBOX_RD4(sc, o)		(*(volatile uint32_t *)((sc)->mbox + (o)))
-#define	MBOX_RD8(sc, o)		(*(volatile uint64_t *)((sc)->mbox + (o)))
-#define	MBOX_WR8(sc, o, v)	(*(volatile uint64_t *)((sc)->mbox + (o)) = (v))
 #define	SART_RD4(sc, o)		(*(volatile uint32_t *)((sc)->sart + (o)))
 #define	SART_WR4(sc, o, v)	(*(volatile uint32_t *)((sc)->sart + (o)) = (v))
 
@@ -168,49 +106,9 @@ ans_map_phandle(device_t dev, const char *prop, vm_offset_t *va,
 }
 
 static int
-ans_send(struct apple_ans_softc *sc, uint32_t ep, uint64_t msg)
+ans_sart_allow(void *arg, vm_paddr_t pa, size_t size, uint64_t *iova)
 {
-	int i;
-
-	for (i = 0; MBOX_RD4(sc, MBOX_A2I_CONTROL) & MBOX_CONTROL_FULL; i++) {
-		if (i == 200000) {
-			device_printf(sc->dev, "mailbox full\n");
-			return (ETIMEDOUT);
-		}
-		DELAY(1);
-	}
-	wmb();
-	MBOX_WR8(sc, MBOX_A2I_SEND0, msg);
-	MBOX_WR8(sc, MBOX_A2I_SEND1, ep);
-	return (0);
-}
-
-static bool
-ans_recv(struct apple_ans_softc *sc, uint32_t *ep, uint64_t *msg)
-{
-	if (MBOX_RD4(sc, MBOX_I2A_CONTROL) & MBOX_CONTROL_EMPTY)
-		return (false);
-	*msg = MBOX_RD8(sc, MBOX_I2A_RECV0);
-	*ep = (uint32_t)MBOX_RD8(sc, MBOX_I2A_RECV1) & 0xff;
-	rmb();
-	return (true);
-}
-
-static int
-ans_recv_timeout(struct apple_ans_softc *sc, uint32_t *ep, uint64_t *msg,
-    int usec)
-{
-	for (; usec > 0; usec -= 10) {
-		if (ans_recv(sc, ep, msg))
-			return (0);
-		DELAY(10);
-	}
-	return (ETIMEDOUT);
-}
-
-static int
-ans_sart_allow(struct apple_ans_softc *sc, vm_paddr_t pa, size_t size)
-{
+	struct apple_ans_softc *sc = arg;
 	int i;
 
 	for (i = 0; i < SART_MAX_ENTRIES; i++) {
@@ -219,226 +117,26 @@ ans_sart_allow(struct apple_ans_softc *sc, vm_paddr_t pa, size_t size)
 		SART_WR4(sc, SART3_PADDR(i), pa >> 12);
 		SART_WR4(sc, SART3_SIZE(i), size >> 12);
 		SART_WR4(sc, SART3_CONFIG(i), SART3_FLAGS_ALLOW);
+		*iova = pa;		/* the SART filters, it doesn't translate */
 		return (0);
 	}
 	device_printf(sc->dev, "no free SART entry\n");
 	return (ENOSPC);
 }
 
-static int
-ans_buffer_request(struct apple_ans_softc *sc, uint32_t ep, uint64_t msg,
-    struct ans_buffer *buf)
-{
-	size_t npages = BUFREQ_SIZE(msg);
-	uint64_t addr = BUFREQ_ADDR(msg);
-	int error;
-
-	buf->size = npages << 12;
-	if (addr != 0) {
-		/* The IOP brought its own buffer; SART-filtered, so physical. */
-		buf->pa = addr;
-		buf->va = pmap_mapdev(addr, buf->size);
-		return (0);
-	}
-
-	if (buf->va == NULL) {
-		buf->size = roundup2(buf->size, 16384);
-		buf->va = contigmalloc(buf->size, M_DEVBUF, M_ZERO | M_NOWAIT,
-		    0, ~(vm_paddr_t)0, 16384, 0);
-		if (buf->va == NULL)
-			return (ENOMEM);
-		buf->pa = pmap_kextract((vm_offset_t)buf->va);
-		error = ans_sart_allow(sc, buf->pa, buf->size);
-		if (error != 0)
-			return (error);
-	}
-	if (bootverbose)
-		device_printf(sc->dev, "ep %u buffer %#zx at %#jx\n", ep,
-		    buf->size, (uintmax_t)buf->pa);
-
-	return (ans_send(sc, ep, MSG_TYPE_SET(MSG_BUFFER_REQUEST) |
-	    (uint64_t)npages << 44 | buf->pa));
-}
-
-static void
-ans_syslog(struct apple_ans_softc *sc, uint64_t msg)
-{
-	struct ans_syslog_entry *e;
-	size_t idx = msg & 0xff, len, stride;
-	uint32_t hash;
-
-	stride = sc->syslog_size + sizeof(*e);
-	if (!ans_verbose || sc->syslog.va == NULL ||
-	    (idx + 1) * stride > sc->syslog.size)
-		return;
-	e = (struct ans_syslog_entry *)((char *)sc->syslog.va + idx * stride);
-	len = strnlen(e->msg, sc->syslog_size);
-	if (len > 0 && e->msg[len - 1] == '\n')
-		len--;
-
-	/* The firmware repeats some lines many times; print a line once. */
-	hash = murmur3_32_hash(e->msg, len, 0);
-	if (hash == sc->syslog_last) {
-		sc->syslog_repeats++;
-		return;
-	}
-	if (sc->syslog_repeats > 0)
-		device_printf(sc->dev, "fw: (last line repeated %u times)\n",
-		    sc->syslog_repeats);
-	sc->syslog_last = hash;
-	sc->syslog_repeats = 0;
-	device_printf(sc->dev, "fw: [%.24s] %.*s\n", e->context, (int)len,
-	    e->msg);
-}
-
-static void
-ans_crashed(struct apple_ans_softc *sc)
-{
-	sc->crashed = true;
-	device_printf(sc->dev, "ANS firmware crashed\n");
-}
-
-/* Handle one system-endpoint message. */
-static int
-ans_handle(struct apple_ans_softc *sc, uint32_t ep, uint64_t msg)
-{
-	uint32_t type = MSG_TYPE(msg);
-
-	switch (ep) {
-	case EP_MGMT:
-		if (type == MGMT_IOP_PWR_ACK)
-			sc->iop_power = msg & 0xffff;
-		else if (type != MGMT_AP_PWR)
-			device_printf(sc->dev, "mgmt message %#jx\n",
-			    (uintmax_t)msg);
-		return (0);
-	case EP_CRASHLOG:
-		if (type != MSG_BUFFER_REQUEST)
-			break;
-		if (sc->crashlog.va != NULL) {
-			ans_crashed(sc);
-			return (EIO);
-		}
-		return (ans_buffer_request(sc, ep, msg, &sc->crashlog));
-	case EP_SYSLOG:
-		if (type == MSG_BUFFER_REQUEST)
-			return (ans_buffer_request(sc, ep, msg, &sc->syslog));
-		if (type == MSG_SYSLOG_INIT) {
-			sc->syslog_count = msg & 0xffff;
-			sc->syslog_size = (msg >> 24) & 0xffff;
-			return (0);
-		}
-		if (type == MSG_SYSLOG_LOG) {
-			ans_syslog(sc, msg);
-			return (ans_send(sc, ep, msg));
-		}
-		break;
-	case EP_IOREPORT:
-		if (type == MSG_BUFFER_REQUEST)
-			return (ans_buffer_request(sc, ep, msg, &sc->ioreport));
-		if (type == 0x8 || type == 0xc)		/* must be echoed */
-			return (ans_send(sc, ep, msg));
-		break;
-	case EP_OSLOG:
-		if (type == MSG_BUFFER_REQUEST)
-			return (ans_buffer_request(sc, ep, msg, &sc->oslog));
-		break;
-	}
-	device_printf(sc->dev, "unhandled message ep %u: %#jx\n", ep,
-	    (uintmax_t)msg);
-	return (0);
-}
+static const struct apple_rtkit_ops ans_rtkit_ops = {
+	.buf_map = ans_sart_allow,
+};
 
 static void
 ans_poll(void *arg)
 {
 	struct apple_ans_softc *sc = arg;
-	uint64_t msg;
-	uint32_t ep;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
-	while (!sc->crashed && ans_recv(sc, &ep, &msg))
-		ans_handle(sc, ep, msg);
-	if (!sc->crashed)
+	apple_rtkit_poll(sc->rtk);
+	if (!apple_rtkit_crashed(sc->rtk))
 		callout_schedule(&sc->poll, hz / 20);
-}
-
-static int
-ans_rtkit_boot(struct apple_ans_softc *sc)
-{
-	uint64_t msg, eps = 0;
-	uint32_t ep, ver, base;
-	int error, i;
-
-	/* Start the IOP if a previous stage stopped it, then wake it. */
-	if ((bus_read_4(sc->asc_res, ASC_CPU_CONTROL) &
-	    ASC_CPU_CONTROL_RUN) == 0) {
-		device_printf(sc->dev, "starting stopped ANS\n");
-		bus_write_4(sc->asc_res, ASC_CPU_CONTROL, ASC_CPU_CONTROL_RUN);
-	}
-	error = ans_send(sc, EP_MGMT, MSG_TYPE_SET(MGMT_IOP_PWR) | PWR_INIT);
-	if (error != 0)
-		return (error);
-
-	if (ans_recv_timeout(sc, &ep, &msg, 1000000) != 0 || ep != EP_MGMT ||
-	    MSG_TYPE(msg) != MGMT_HELLO) {
-		device_printf(sc->dev, "no RTKit HELLO\n");
-		return (ENXIO);
-	}
-	ver = MIN(RTKIT_MAX_VERSION, (msg >> 16) & 0xffff);
-	if ((msg & 0xffff) > RTKIT_MAX_VERSION || ver < RTKIT_MIN_VERSION) {
-		device_printf(sc->dev, "unsupported RTKit versions %ju-%ju\n",
-		    (uintmax_t)(msg & 0xffff), (uintmax_t)((msg >> 16) & 0xffff));
-		return (ENXIO);
-	}
-	error = ans_send(sc, EP_MGMT, MSG_TYPE_SET(MGMT_HELLO_ACK) |
-	    ver << 16 | ver);
-	if (error != 0)
-		return (error);
-
-	do {
-		if (ans_recv_timeout(sc, &ep, &msg, 1000000) != 0 ||
-		    ep != EP_MGMT || MSG_TYPE(msg) != MGMT_EPMAP) {
-			device_printf(sc->dev, "no RTKit endpoint map\n");
-			return (ENXIO);
-		}
-		base = (msg >> 32) & 0x7;
-		if (base == 0)
-			eps = msg & 0xffffffff;	/* system endpoints */
-		error = ans_send(sc, EP_MGMT, MSG_TYPE_SET(MGMT_EPMAP) |
-		    (uint64_t)base << 32 | ((msg & MGMT_EPMAP_DONE) ?
-		    MGMT_EPMAP_DONE : MGMT_EPMAP_MORE));
-		if (error != 0)
-			return (error);
-	} while ((msg & MGMT_EPMAP_DONE) == 0);
-
-	const int sys_eps[] = { EP_DEBUG, EP_CRASHLOG, EP_SYSLOG, EP_IOREPORT,
-	    EP_OSLOG };
-	for (i = 0; i < nitems(sys_eps); i++) {
-		if ((eps & (1u << sys_eps[i])) == 0)
-			continue;
-		error = ans_send(sc, EP_MGMT, MSG_TYPE_SET(MGMT_START_EP) |
-		    (uint64_t)sys_eps[i] << 32 | 2);
-		if (error != 0)
-			return (error);
-	}
-
-	for (i = 0; sc->iop_power != PWR_ON; i++) {
-		if (sc->crashed)
-			return (EIO);
-		if (i == 100000) {
-			device_printf(sc->dev, "IOP power state %#x, not ON\n",
-			    sc->iop_power);
-			return (ETIMEDOUT);
-		}
-		if (ans_recv(sc, &ep, &msg))
-			error = ans_handle(sc, ep, msg);
-		else
-			DELAY(10);
-		if (error != 0)
-			return (error);
-	}
-	return (ans_send(sc, EP_MGMT, MSG_TYPE_SET(MGMT_AP_PWR) | PWR_ON));
 }
 
 static void
@@ -518,8 +216,12 @@ apple_ans_attach(device_t dev)
 		    bus_read_4(ctrlr->resource, ANS_BOOT_STATUS),
 		    nvme_mmio_read_4(ctrlr, cc), nvme_mmio_read_4(ctrlr, csts));
 
+	sc->rtk = apple_rtkit_create(dev,
+	    (vm_offset_t)rman_get_virtual(sc->asc_res), sc->mbox,
+	    &ans_rtkit_ops, sc, 0);
+	apple_rtkit_set_syslog(sc->rtk, ans_verbose != 0);
 	mtx_lock(&sc->mtx);
-	error = ans_rtkit_boot(sc);
+	error = apple_rtkit_boot(sc->rtk);
 	if (error == 0)
 		callout_reset(&sc->poll, hz / 20, ans_poll, sc);
 	mtx_unlock(&sc->mtx);
