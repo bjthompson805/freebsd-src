@@ -15,8 +15,8 @@
  * poll instead (no MSI controller driver yet). Register facts come from the
  * aurora-linux centauri driver's measured J813 sequence.
  *
- * DMA goes through the PCIe DART stream named by the host's "iommu-map",
- * identity-mapped (apple_dart); see n1_dma_alloc for the address window.
+ * DMA goes through the PCIe DART stream named by the host's "iommu-map";
+ * see n1_dma_alloc for the IOVA window.
  */
 
 #include <sys/param.h>
@@ -64,8 +64,8 @@
 
 #define	N1_MSI_DATA		0xa5a0
 #define	N1_PAGE			16384
-#define	N1_DMA_LOW		0x10000100000ul	/* dart-apcie0 vm-base */
-#define	N1_DMA_HIGH		(N1_DMA_LOW + 0x3fe00000ul)	/* + vm-size */
+#define	N1_IOVA_BASE		0xf000000000ul
+#define	N1_IOVA_END		0x10000000000ul	/* 1 TiB: 40 bits */
 #define	N1_FW_MAX		(64 * 1024 * 1024)
 
 struct n1_board {
@@ -85,6 +85,7 @@ struct n1_softc {
 	const struct n1_board	*board;
 	phandle_t		dart;
 	u_int			sid;
+	uint64_t		iova_next;
 	struct task		boot_task;
 	eventhandler_tag	mountroot_tag;
 	void			*fw, *desc, *mbox;
@@ -95,23 +96,33 @@ struct n1_softc {
 #define	N1_WR4(sc, o, v)	bus_write_4((sc)->bar, (o), (v))
 
 /*
- * Allocate page-aligned, physically contiguous memory the N1 can reach. The
- * shared DART table maps RAM at IOVA == PA; buffers come from the part of RAM
- * inside the window macOS uses for this DART (ADT dart-apcie0 vm-base/size).
+ * Allocate page-aligned, physically contiguous memory and map it for the N1
+ * at IOVAs just below 1 TiB (40 bits), where Linux's IOMMU layer would put
+ * them for a 40-bit device. RAM itself sits above 1 TiB on these SoCs.
  */
 static void *
 n1_dma_alloc(struct n1_softc *sc, size_t size, uint64_t *iova)
 {
 	void *buf;
+	int error;
 
 	size = roundup2(size, N1_PAGE);
-	buf = contigmalloc(size, M_DEVBUF, M_WAITOK | M_ZERO, N1_DMA_LOW,
-	    N1_DMA_HIGH, N1_PAGE, 0);
-	if (buf == NULL) {
-		device_printf(sc->dev, "no DMA memory for %zu bytes\n", size);
+	if (sc->iova_next + size > N1_IOVA_END)
+		return (NULL);
+	buf = contigmalloc(size, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, N1_PAGE, 0);
+	if (buf == NULL)
+		return (NULL);
+	error = apple_dart_map_stream(sc->dev, sc->dart, sc->sid,
+	    sc->iova_next, pmap_kextract((vm_offset_t)buf), size);
+	if (error != 0) {
+		device_printf(sc->dev, "DART map of %zu bytes: %d\n", size,
+		    error);
+		free(buf, M_DEVBUF);
 		return (NULL);
 	}
-	*iova = pmap_kextract((vm_offset_t)buf);
+	*iova = sc->iova_next;
+	sc->iova_next += size;
 	return (buf);
 }
 
@@ -165,13 +176,22 @@ n1_dart_errors(struct n1_softc *sc)
 	    *(volatile uint32_t *)(va + 0x174),
 	    *(volatile uint32_t *)(va + 0x170));
 	pmap_unmapdev((void *)va, size);
+
+	/* Root port: interrupt status, link status (pcie-apple PORT_INTSTAT/LINKSTS). */
+	va = (vm_offset_t)pmap_mapdev(0x488028000, 0x4000);
+	device_printf(sc->dev, "port intstat %#x linksts %#x\n",
+	    *(volatile uint32_t *)(va + 0x100), *(volatile uint32_t *)(va + 0x208));
+	pmap_unmapdev((void *)va, 0x4000);
 }
+
+static int n1_corrupt;
+TUNABLE_INT("hw.apple_n1.corrupt", &n1_corrupt);
 
 static int
 n1_rom_boot(struct n1_softc *sc)
 {
-	const struct firmware *fw;
-	uint32_t stage, resp;
+	const struct firmware *fw, *tkt;
+	uint32_t stage, resp, desc_size;
 	int cap, i;
 
 	stage = N1_RD4(sc, N1_STAGE);
@@ -208,9 +228,30 @@ n1_rom_boot(struct n1_softc *sc)
 		return (ENOMEM);
 	}
 	memcpy(sc->fw, fw->data, fw->datasize);
+	if (n1_corrupt)		/* XXX bring-up: does the ROM parse it? */
+		memset((uint8_t *)sc->fw + 0x20, 0, 16);
 	/* Scatter entry: u64 address, u32 length (4K-aligned), u32 flags. */
 	le64enc(sc->desc, sc->fw_iova);
 	le32enc((uint8_t *)sc->desc + 8, roundup2(fw->datasize, 4096));
+	desc_size = 0x20;
+	/* XXX bring-up experiment: the IMG4 ticket as a second scatter entry. */
+	tkt = firmware_get_flags("apple/j815-centauri.im4m", FIRMWARE_GET_NOWARN);
+	if (tkt != NULL) {
+		void *tbuf;
+		uint64_t tiova;
+
+		tbuf = n1_dma_alloc(sc, tkt->datasize, &tiova);
+		if (tbuf != NULL) {
+			memcpy(tbuf, tkt->data, tkt->datasize);
+			cpu_dcache_wb_range(tbuf, roundup2(tkt->datasize, N1_PAGE));
+			le64enc((uint8_t *)sc->desc + 0x20, tiova);
+			le32enc((uint8_t *)sc->desc + 0x28, tkt->datasize);
+			desc_size = 0x40;
+			device_printf(sc->dev, "ticket: %zu bytes as entry 1\n",
+			    tkt->datasize);
+		}
+		firmware_put(tkt, FIRMWARE_UNLOAD);
+	}
 	cpu_dcache_wb_range(sc->fw, roundup2(fw->datasize, N1_PAGE));
 	cpu_dcache_wb_range(sc->desc, N1_PAGE);
 	cpu_dcache_wbinv_range(sc->mbox, N1_PAGE);
@@ -232,7 +273,7 @@ n1_rom_boot(struct n1_softc *sc)
 	N1_WR4(sc, N1_ROM_CTRL, 0);
 	N1_WR4(sc, N1_ROM_DESC_LO, (uint32_t)sc->desc_iova);
 	N1_WR4(sc, N1_ROM_DESC_HI, (uint32_t)(sc->desc_iova >> 32));
-	N1_WR4(sc, N1_ROM_DESC_SIZE, 0x20);
+	N1_WR4(sc, N1_ROM_DESC_SIZE, desc_size);
 	dsb(sy);
 	N1_WR4(sc, N1_ROM_DOORBELL, 1);
 
@@ -246,6 +287,12 @@ n1_rom_boot(struct n1_softc *sc)
 	device_printf(sc->dev, "ROM result: response %#x stage %#x mailbox %#x "
 	    "(%d ms)\n", resp, stage, le32dec(sc->mbox), i * 20);
 	n1_dart_errors(sc);
+	for (i = 0; i < 0x100; i += 0x20)	/* XXX bring-up */
+		device_printf(sc->dev, "%#x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		    0x8000 + i, N1_RD4(sc, 0x8000 + i), N1_RD4(sc, 0x8004 + i),
+		    N1_RD4(sc, 0x8008 + i), N1_RD4(sc, 0x800c + i),
+		    N1_RD4(sc, 0x8010 + i), N1_RD4(sc, 0x8014 + i),
+		    N1_RD4(sc, 0x8018 + i), N1_RD4(sc, 0x801c + i));
 	return (stage == N1_STAGE_RUNNING ? 0 : EIO);
 }
 
@@ -318,6 +365,7 @@ n1_attach(device_t dev)
 	    N1_RD4(sc, N1_STAGE), sc->sid);
 
 	TASK_INIT(&sc->boot_task, 0, n1_boot_task, sc);
+	sc->iova_next = N1_IOVA_BASE;
 	sc->mountroot_tag = EVENTHANDLER_REGISTER(mountroot, n1_mountroot, sc,
 	    EVENTHANDLER_PRI_ANY);
 	return (0);
