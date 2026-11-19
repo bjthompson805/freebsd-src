@@ -89,7 +89,8 @@ struct n1_softc {
 	struct task		boot_task;
 	eventhandler_tag	mountroot_tag;
 	void			*fw, *desc, *mbox;
-	uint64_t		fw_iova, desc_iova, mbox_iova;
+	uint64_t		fw_iova, desc_iova, mbox_iova, tkt_iova;
+	size_t			tkt_size;
 };
 
 #define	N1_RD4(sc, o)		bus_read_4((sc)->bar, (o))
@@ -186,6 +187,14 @@ n1_dart_errors(struct n1_softc *sc)
 
 static int n1_corrupt;
 TUNABLE_INT("hw.apple_n1.corrupt", &n1_corrupt);
+/*
+ * XXX bring-up: ticket placement. 0 none; 1 scatter entry 1 (flags 0); 2 entry 1, flags 1;
+ * 3 ticket as entry 0, ftab as entry 1; 4 ticket IOVA/length in BAR0 0x8050/0x8054/0x8058.
+ */
+static int n1_tkt_mode;
+TUNABLE_INT("hw.apple_n1.tkt_mode", &n1_tkt_mode);
+static int n1_tkt_flags = 1;
+TUNABLE_INT("hw.apple_n1.tkt_flags", &n1_tkt_flags);
 static int n1_desc_len;		/* XXX bring-up: override the scatter length */
 TUNABLE_INT("hw.apple_n1.desc_len", &n1_desc_len);
 
@@ -237,21 +246,36 @@ n1_rom_boot(struct n1_softc *sc)
 	le32enc((uint8_t *)sc->desc + 8, n1_desc_len != 0 ? n1_desc_len :
 	    roundup2(fw->datasize, 4096));
 	desc_size = 0x20;
-	/* XXX bring-up experiment: the IMG4 ticket as a second scatter entry. */
-	tkt = firmware_get_flags("apple/j815-centauri.im4m", FIRMWARE_GET_NOWARN);
+	/* XXX bring-up experiment: where the ROM takes the IMG4 ticket */
+	tkt = n1_tkt_mode != 0 ? firmware_get_flags("apple/j815-centauri.im4m",
+	    FIRMWARE_GET_NOWARN) : NULL;
 	if (tkt != NULL) {
 		void *tbuf;
-		uint64_t tiova;
 
-		tbuf = n1_dma_alloc(sc, tkt->datasize, &tiova);
+		tbuf = n1_dma_alloc(sc, tkt->datasize, &sc->tkt_iova);
 		if (tbuf != NULL) {
 			memcpy(tbuf, tkt->data, tkt->datasize);
 			cpu_dcache_wb_range(tbuf, roundup2(tkt->datasize, N1_PAGE));
-			le64enc((uint8_t *)sc->desc + 0x20, tiova);
-			le32enc((uint8_t *)sc->desc + 0x28, tkt->datasize);
-			desc_size = 0x40;
-			device_printf(sc->dev, "ticket: %zu bytes as entry 1\n",
-			    tkt->datasize);
+			sc->tkt_size = tkt->datasize;
+			switch (n1_tkt_mode) {
+			case 1:
+			case 2:
+				le64enc((uint8_t *)sc->desc + 0x20, sc->tkt_iova);
+				le32enc((uint8_t *)sc->desc + 0x28, tkt->datasize);
+				le32enc((uint8_t *)sc->desc + 0x2c,
+				    n1_tkt_mode == 2 ? n1_tkt_flags : 0);
+				desc_size = 0x40;
+				break;
+			case 3:
+				memmove((uint8_t *)sc->desc + 0x20, sc->desc, 0x20);
+				memset(sc->desc, 0, 0x20);
+				le64enc(sc->desc, sc->tkt_iova);
+				le32enc((uint8_t *)sc->desc + 8, tkt->datasize);
+				desc_size = 0x40;
+				break;
+			}
+			device_printf(sc->dev, "ticket: %zu bytes, mode %d "
+			    "flags %d\n", tkt->datasize, n1_tkt_mode, n1_tkt_flags);
 		}
 		firmware_put(tkt, FIRMWARE_UNLOAD);
 	}
@@ -292,6 +316,11 @@ n1_rom_boot(struct n1_softc *sc)
 	N1_WR4(sc, N1_ROM_DESC_LO, (uint32_t)sc->desc_iova);
 	N1_WR4(sc, N1_ROM_DESC_HI, (uint32_t)(sc->desc_iova >> 32));
 	N1_WR4(sc, N1_ROM_DESC_SIZE, desc_size);
+	if (n1_tkt_mode == 4 && sc->tkt_size != 0) {
+		N1_WR4(sc, 0x8050, (uint32_t)sc->tkt_iova);
+		N1_WR4(sc, 0x8054, (uint32_t)(sc->tkt_iova >> 32));
+		N1_WR4(sc, 0x8058, sc->tkt_size);
+	}
 	dsb(sy);
 	N1_WR4(sc, N1_ROM_DOORBELL, 1);
 
