@@ -180,6 +180,21 @@ apple_pmu_rtc_attach(device_t dev)
 	sc->spmi = (vm_offset_t)pmap_mapdev(pa, size);
 	mtx_init(&sc->mtx, "apple_pmu_rtc", NULL, MTX_DEF);
 
+	/* XXX bring-up: N1 low-power-mode state (ADT info-scrpad_lpm_ctrl/_log) */
+	{
+		static const uint16_t lpm[] = { 0xa7dc, 0xa780, 0xa788, 0xa790,
+		    0xa798 };
+		uint8_t b[8];
+		int i;
+
+		mtx_lock(&sc->mtx);
+		for (i = 0; i < nitems(lpm); i++)
+			if (spmi_readl(sc, lpm[i], b, 8) == 0)
+				device_printf(dev, "pmu %#x: %02x %02x %02x %02x "
+				    "%02x %02x %02x %02x\n", lpm[i], b[0], b[1],
+				    b[2], b[3], b[4], b[5], b[6], b[7]);
+		mtx_unlock(&sc->mtx);
+	}
 	clock_register_flags(dev, 1000000 / 65536, CLOCKF_GETTIME_NO_ADJ);
 	return (0);
 }
