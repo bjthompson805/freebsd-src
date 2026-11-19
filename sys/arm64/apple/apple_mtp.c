@@ -21,8 +21,10 @@
  * Interface 0 ("comm") announces each device with init messages carrying
  * its name and HID report descriptor; once the last one arrives we enable
  * the device (command 0xb4) and it starts sending input reports. Each HID
- * device we support gets a hidbus child; for now only "keyboard" (the
- * trackpad needs firmware and AFE setup first).
+ * device we support gets a hidbus child: the keyboard as is, and the
+ * trackpad ("multi-touch", once its firmware is loaded) as a plain relative
+ * mouse: its 0x75 multitouch frames are turned into the boot-mouse report
+ * (ID 2) its own descriptor declares, so hms(4) drives it. No gestures yet.
  *
  * Everything is polled from a callout; no DockChannel/mailbox interrupts.
  */
@@ -120,6 +122,11 @@ struct mtp_iface {
 	hid_intr_t		*intr;
 	void			*intr_ctx;
 	bool			open;
+
+	/* multi-touch: the contact being followed and its last position */
+	int			mt_contact;	/* -1: none */
+	int			mt_x, mt_y;
+	int			mt_rx, mt_ry;	/* sub-count remainders */
 };
 
 struct mtp_report {
@@ -145,7 +152,6 @@ struct apple_mtp_softc {
 	size_t			gpio_ack_len;
 	struct task		tp_task;	/* trackpad bring-up */
 	eventhandler_tag	mountroot_tag;
-	u_int			mt_logged;
 	u_long			reports;	/* input reports delivered */
 	struct mtp_iface	ifaces[MTP_MAX_IFACES];
 	uint8_t			pkt[PKT_HDR_LEN + PKT_MAX + 4];
@@ -194,7 +200,21 @@ mtp_dma_window(struct apple_mtp_softc *sc, phandle_t node)
 	return (0);
 }
 
-static const char *mtp_hid_ifaces[] = { "keyboard" };
+/* Interfaces we wait for at attach (ready), and the ones given to hidbus. */
+static const char *mtp_wait_ifaces[] = { "keyboard" };
+static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
+
+/* 0x75 multitouch frame: header, then 30-byte contact records. */
+#define	MT_REPORT_ID		0x75
+#define	MT_HDR_LEN		38
+#define	MT_HDR_COUNT		22
+#define	MT_HDR_BUTTONS		23
+#define	MT_REC_LEN		30
+#define	MT_REC_ID		0	/* low byte: contact id */
+#define	MT_REC_X		4	/* signed 16-bit, ~0.01 mm */
+#define	MT_REC_Y		6	/* signed 16-bit, up is positive */
+#define	MT_MOUSE_REPORT_ID	2
+#define	MT_COUNTS_PER_STEP	8	/* touch units per mouse count */
 
 static uint32_t
 mtp_checksum(const uint8_t *p, size_t len)
@@ -298,6 +318,71 @@ mtp_comm_init_msg(struct apple_mtp_softc *sc, const uint8_t *m, size_t len)
 		ifc->want_enable = true;
 }
 
+static int
+mtp_mt_clamp(int *acc)
+{
+	int v = *acc / MT_COUNTS_PER_STEP;
+
+	v = MAX(-127, MIN(127, v));
+	*acc -= v * MT_COUNTS_PER_STEP;
+	return (v);
+}
+
+/*
+ * Turn a multitouch frame into a relative mouse report: follow one contact
+ * (the first one, until it lifts) and report its movement; the button is
+ * the trackpad's click.
+ */
+static void
+mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
+    const uint8_t *p, size_t len)
+{
+	const uint8_t *rec = NULL;
+	int count, i, x, y;
+	uint8_t *r;
+
+	if (len < MT_HDR_LEN || p[0] != MT_REPORT_ID)
+		return;
+	count = p[MT_HDR_COUNT];
+	if (MT_HDR_LEN + (size_t)count * MT_REC_LEN > len)
+		return;
+	for (i = 0; i < count; i++) {
+		if (p[MT_HDR_LEN + i * MT_REC_LEN + MT_REC_ID] ==
+		    ifc->mt_contact) {
+			rec = p + MT_HDR_LEN + i * MT_REC_LEN;
+			break;
+		}
+	}
+	if (rec == NULL && count > 0) {
+		/* New contact: start following it, no movement this frame. */
+		rec = p + MT_HDR_LEN;
+		ifc->mt_contact = rec[MT_REC_ID];
+		ifc->mt_x = (int16_t)le16dec(rec + MT_REC_X);
+		ifc->mt_y = (int16_t)le16dec(rec + MT_REC_Y);
+		ifc->mt_rx = ifc->mt_ry = 0;
+	} else if (rec == NULL)
+		ifc->mt_contact = -1;
+
+	if (!ifc->open || ifc->intr == NULL || sc->rep.ifc != NULL)
+		return;
+	r = sc->rep.data;
+	memset(r, 0, 8);
+	r[0] = MT_MOUSE_REPORT_ID;
+	r[1] = p[MT_HDR_BUTTONS] & 1;
+	if (rec != NULL) {
+		x = (int16_t)le16dec(rec + MT_REC_X);
+		y = (int16_t)le16dec(rec + MT_REC_Y);
+		ifc->mt_rx += x - ifc->mt_x;
+		ifc->mt_ry -= y - ifc->mt_y;	/* screen y grows downward */
+		ifc->mt_x = x;
+		ifc->mt_y = y;
+		r[2] = (int8_t)mtp_mt_clamp(&ifc->mt_rx);
+		r[3] = (int8_t)mtp_mt_clamp(&ifc->mt_ry);
+	}
+	sc->rep.ifc = ifc;
+	sc->rep.len = 8;
+}
+
 /* Handle one packet; an input report is copied to sc->rep. */
 static void
 mtp_packet(struct apple_mtp_softc *sc, uint8_t iface, uint8_t *p, size_t len)
@@ -341,11 +426,9 @@ mtp_packet(struct apple_mtp_softc *sc, uint8_t iface, uint8_t *p, size_t len)
 		}
 		return;
 	}
-	/* XXX bring-up: show the first trackpad reports. */
-	if (strcmp(ifc->name, "multi-touch") == 0 && sc->mt_logged < 4) {
-		sc->mt_logged++;
-		device_printf(sc->dev, "multi-touch report (%u): %*D\n", mlen,
-		    (int)MIN(mlen, 48), p, " ");
+	if (strcmp(ifc->name, "multi-touch") == 0) {
+		mtp_mt_frame(sc, ifc, p, mlen);
+		return;
 	}
 	if (ifc->open && ifc->intr != NULL && sc->rep.ifc == NULL) {
 		sc->rep.ifc = ifc;
@@ -619,6 +702,7 @@ static int
 apple_mtp_add_hid(struct apple_mtp_softc *sc, struct mtp_iface *ifc)
 {
 	ifc->sc = sc;
+	ifc->mt_contact = -1;
 	snprintf(ifc->hw.name, sizeof(ifc->hw.name), "Apple MTP %s",
 	    ifc->name);
 	ifc->hw.idBus = BUS_SPI;
@@ -704,13 +788,13 @@ apple_mtp_attach(device_t dev)
 		mtp_work(sc);
 		sc->rep.ifc = NULL;		/* nobody is listening yet */
 		n = 0;
-		for (j = 0; j < nitems(mtp_hid_ifaces); j++)
+		for (j = 0; j < nitems(mtp_wait_ifaces); j++)
 			for (ifc = &sc->ifaces[1];
 			    ifc < &sc->ifaces[MTP_MAX_IFACES]; ifc++)
 				if (ifc->ready && ifc->rdesc != NULL &&
-				    strcmp(ifc->name, mtp_hid_ifaces[j]) == 0)
+				    strcmp(ifc->name, mtp_wait_ifaces[j]) == 0)
 					n++;
-		if (n == nitems(mtp_hid_ifaces))
+		if (n == nitems(mtp_wait_ifaces))
 			break;
 		DELAY(1000);
 	}
@@ -723,8 +807,9 @@ apple_mtp_attach(device_t dev)
 			device_printf(dev, "interface %u \"%s\": %s, %zu-byte "
 			    "report descriptor\n", ifc->id, ifc->name,
 			    ifc->ready ? "ready" : "not ready", ifc->rdesc_len);
+		/* The trackpad becomes ready later, after its firmware. */
 		for (j = 0; j < nitems(mtp_hid_ifaces); j++)
-			if (ifc->ready && ifc->rdesc != NULL &&
+			if (ifc->rdesc != NULL &&
 			    strcmp(ifc->name, mtp_hid_ifaces[j]) == 0)
 				apple_mtp_add_hid(sc, ifc);
 	}
