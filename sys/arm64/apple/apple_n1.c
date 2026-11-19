@@ -928,13 +928,17 @@ n1_start_ipc(struct n1_softc *sc)
 		device_t rp = device_get_parent(device_get_parent(sc->dev));
 		bus_addr_t dpa;
 		bus_size_t dsz;
-		vm_offset_t dva, pva;
-		uint32_t v[6], pv[6] = { ~0u, ~0u, ~0u, ~0u, ~0u, ~0u };
+		vm_offset_t dva, pva, gva;
+		uint32_t v[7], pv[7] = { ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u };
 		int k;
 
 		ofw_reg_to_paddr(sc->dart, 0, &dpa, &dsz, NULL);
 		dva = (vm_offset_t)pmap_mapdev(dpa, dsz);
 		pva = (vm_offset_t)pmap_mapdev(0x488028000, 0x4000);
+		/* centauri function-error_detect: aop-gpio pin 0x2d */
+		gva = (vm_offset_t)pmap_mapdev(0x390824000, PAGE_SIZE);
+		device_printf(sc->dev, "error_detect gpio before doorbell %#x\n",
+		    *(volatile uint32_t *)(gva + 4 * 0x2d));
 		N1_WR4(sc, 0x9070, 1);
 		for (i = 0; i < 500; i++) {
 			cpu_dcache_inv_range(sc->mbox, N1_PAGE);
@@ -944,12 +948,14 @@ n1_start_ipc(struct n1_softc *sc)
 			v[3] = *(volatile uint32_t *)(dva + 0x170);
 			v[4] = *(volatile uint32_t *)(pva + 0x100);
 			v[5] = le32dec(sc->mbox);
-			for (k = 0; k < 6 && v[k] == pv[k]; k++)
+			v[6] = *(volatile uint32_t *)(gva + 4 * 0x2d);
+			for (k = 0; k < 7 && v[k] == pv[k]; k++)
 				;
-			if (k < 6) {
+			if (k < 7) {
 				device_printf(sc->dev, "XXX t=%d ltssm %#x lnk %#x "
-				    "darterr %#x addr %#x intstat %#x mbox %#x\n",
-				    i * 10, v[0], v[1], v[2], v[3], v[4], v[5]);
+				    "darterr %#x addr %#x intstat %#x mbox %#x "
+				    "errgpio %#x\n", i * 10, v[0], v[1], v[2], v[3],
+				    v[4], v[5], v[6]);
 				memcpy(pv, v, sizeof(v));
 				DELAY(50000);
 			}
@@ -957,6 +963,7 @@ n1_start_ipc(struct n1_softc *sc)
 				break;
 			DELAY(10000);
 		}
+		pmap_unmapdev((void *)gva, PAGE_SIZE);
 		pmap_unmapdev((void *)pva, 0x4000);
 		pmap_unmapdev((void *)dva, dsz);
 	}
