@@ -71,6 +71,7 @@
 static struct sx apple_dart_lock;
 SX_SYSINIT(apple_dart_lock, &apple_dart_lock, "apple_dart");
 static uint64_t *apple_dart_l1;		/* shared identity table */
+static uint64_t *apple_dart_priv_l1;	/* private table: only mapped buffers */
 
 static uint64_t *
 apple_dart_alloc_table(void)
@@ -136,7 +137,16 @@ apple_dart_build_identity(void)
 }
 
 static int
+apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1);
+
+static int
 apple_dart_setup_one(device_t dev, phandle_t dart, u_int sid)
+{
+	return (apple_dart_setup_table(dev, dart, sid, apple_dart_l1));
+}
+
+static int
+apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1)
 {
 	bus_addr_t pa;
 	bus_size_t size;
@@ -164,7 +174,7 @@ apple_dart_setup_one(device_t dev, phandle_t dart, u_int sid)
 		goto out;
 	}
 
-	l1pa = pmap_kextract((vm_offset_t)apple_dart_l1);
+	l1pa = pmap_kextract((vm_offset_t)l1);
 	DART_WR4(va, DART_T8110_TCR(sid), 0);
 	DART_WR4(va, DART_T8110_TTBR(sid),
 	    (l1pa >> DART_PAGE_SHIFT) << 2 | DART_T8110_TTBR_VALID);
@@ -266,28 +276,49 @@ apple_dart_identity_stream(device_t dev, phandle_t dart, u_int sid)
 	return (error);
 }
 
+/*
+ * Translate a stream through a table holding only what apple_dart_map_stream()
+ * puts there: for a device whose firmware DMAs to addresses of its own
+ * choosing, which the identity table would let reach any RAM.
+ */
+int
+apple_dart_private_stream(device_t dev, phandle_t dart, u_int sid)
+{
+	int error;
+
+	sx_xlock(&apple_dart_lock);
+	if (apple_dart_priv_l1 == NULL) {
+		apple_dart_priv_l1 = apple_dart_alloc_table();
+		cpu_dcache_wb_range(apple_dart_priv_l1, DART_PAGE_SIZE);
+	}
+	error = apple_dart_setup_table(dev, dart, sid, apple_dart_priv_l1);
+	sx_xunlock(&apple_dart_lock);
+	return (error);
+}
+
 int
 apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid, uint64_t iova,
     vm_paddr_t pa, size_t size)
 {
-	uint64_t *l2, *l3, end;
+	uint64_t *l2, *l3, *tbl, end;
 
 	if (((iova | pa | size) & (DART_PAGE_SIZE - 1)) != 0 ||
 	    iova + size > (1ul << DART_IOVA_BITS))
 		return (EINVAL);
 	sx_xlock(&apple_dart_lock);
-	if (apple_dart_l1 == NULL) {
+	tbl = apple_dart_priv_l1 != NULL ? apple_dart_priv_l1 : apple_dart_l1;
+	if (tbl == NULL) {
 		sx_xunlock(&apple_dart_lock);
 		return (ENXIO);
 	}
 	for (end = iova + size; iova < end; iova += DART_PAGE_SIZE,
 	    pa += DART_PAGE_SIZE) {
-		l2 = apple_dart_next(apple_dart_l1, (iova >> 36) & 0x7ff);
+		l2 = apple_dart_next(tbl, (iova >> 36) & 0x7ff);
 		l3 = apple_dart_next(l2, (iova >> 25) & 0x7ff);
 		l3[(iova >> 14) & 0x7ff] = DART_PTE_PA(pa) | DART_PTE_SP_END |
 		    DART_PTE_VALID;
 	}
-	apple_dart_flush_tables(apple_dart_l1, 1);
+	apple_dart_flush_tables(tbl, 1);
 	dsb(sy);
 	apple_dart_flush_sid(dev, dart, sid);
 	sx_xunlock(&apple_dart_lock);
@@ -301,9 +332,9 @@ apple_dart_translate(uint64_t iova)
 	uint64_t *t, pte;
 	int shift;
 
-	if (apple_dart_l1 == NULL)
+	if (apple_dart_l1 == NULL && apple_dart_priv_l1 == NULL)
 		return (~(vm_paddr_t)0);
-	t = apple_dart_l1;
+	t = apple_dart_priv_l1 != NULL ? apple_dart_priv_l1 : apple_dart_l1;
 	for (shift = 36; shift >= 14; shift -= 11) {
 		pte = t[(iova >> shift) & 0x7ff];
 		if ((pte & DART_PTE_VALID) == 0)

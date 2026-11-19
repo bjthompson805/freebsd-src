@@ -9,6 +9,7 @@ int	apple_dart_identity(device_t dev);
 int	apple_dart_map(device_t dev, uint64_t iova, vm_paddr_t pa,
 	    size_t size);
 vm_paddr_t apple_dart_translate(uint64_t iova);
+int	apple_dart_private_stream(device_t dev, phandle_t dart, u_int sid);
 int	apple_dart_identity_stream(device_t dev, phandle_t dart, u_int sid);
 int	apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid,
 	    uint64_t iova, vm_paddr_t pa, size_t size);

@@ -114,8 +114,22 @@ struct n1_softc {
 	eventhandler_tag	mountroot_tag;
 	void			*fw, *desc, *mbox;
 	uint64_t		fw_iova, desc_iova, mbox_iova, tkt_iova;
-	size_t			tkt_size;
+	size_t			tkt_size, fw_size;
+	/* Firmware personality: functions 0 control, 1 alpha (Wi-Fi), 2 beta */
+	device_t		fn[3];
+	struct resource		*fnbar[3];
+	void			*fnmsi[3];
+	struct n1_ctx {
+		uint8_t		*buf, *msgs;
+		uint64_t	buf_iova, msgs_iova;
+		uint16_t	tr, cr, index[4], mtr, mcr, head;
+	}			control;
+	void			*secondary;
+	uint64_t		secondary_iova;
+	uint32_t		secondary_size;
 };
+
+static struct n1_softc *n1_sc;	/* the control function, for n1fn */
 
 #define	N1_RD4(sc, o)		bus_read_4((sc)->bar, (o))
 #define	N1_WR4(sc, o, v)	bus_write_4((sc)->bar, (o), (v))
@@ -263,6 +277,7 @@ n1_rom_boot(struct n1_softc *sc)
 		return (ENOMEM);
 	}
 	memcpy(sc->fw, fw->data, fw->datasize);
+	sc->fw_size = fw->datasize;
 	if (n1_corrupt)		/* XXX bring-up: does the ROM parse it? */
 		memset((uint8_t *)sc->fw + 0x20, 0, 16);
 	/* Scatter entry: u64 address, u32 length (4K-aligned), u32 flags. */
@@ -548,6 +563,212 @@ out:
 	return (error);
 }
 
+/* An entry of an rkosftab image (header at 0x20 "rkosftab", count at 0x28) */
+static int
+n1_ftab_entry(const uint8_t *img, size_t size, const char tag[4],
+    uint32_t *off, uint32_t *len)
+{
+	uint32_t i, n;
+
+	if (size < 0x30 || memcmp(img + 0x24, "ftab", 4) != 0)
+		return (EINVAL);
+	n = le32dec(img + 0x28);
+	if (n > 256 || 0x30 + 16 * n > size)
+		return (EINVAL);
+	for (i = 0; i < n; i++) {
+		if (memcmp(img + 0x30 + 16 * i, tag, 4) != 0)
+			continue;
+		*off = le32dec(img + 0x34 + 16 * i);
+		*len = le32dec(img + 0x38 + 16 * i);
+		return (*off + (uint64_t)*len <= size ? 0 : EINVAL);
+	}
+	return (ENOENT);
+}
+
+/*
+ * IPC context: a 32 KiB header + index arrays + rings block and a 16 KiB
+ * message area (15 slots of 512 bytes after the first). Layout as the
+ * firmware expects it: header version 768, size 0x68, the four index arrays
+ * (cr heads, tr heads, cr tails, tr tails) from 0x78, the message transfer
+ * and completion rings after them.
+ */
+static int
+n1_ctx_init(struct n1_softc *sc, struct n1_ctx *c, uint16_t tr, uint16_t cr,
+    uint64_t scratch, uint64_t scratch_size)
+{
+	uint8_t *h;
+	int i;
+
+	c->buf = n1_dma_alloc(sc, 32768, &c->buf_iova);
+	c->msgs = n1_dma_alloc(sc, 16384, &c->msgs_iova);
+	if (c->buf == NULL || c->msgs == NULL)
+		return (ENOMEM);
+	c->tr = tr;
+	c->cr = cr;
+	c->index[0] = 0x78;
+	c->index[1] = c->index[0] + cr * 2;
+	c->index[2] = c->index[1] + tr * 2;
+	c->index[3] = c->index[2] + cr * 2;
+	c->mtr = roundup2(c->index[3] + tr * 2, tr == 192 ? 16 : 2);
+	c->mcr = roundup2(c->mtr + 256, 4);
+	h = c->buf;
+	le16enc(h, 768);
+	le16enc(h + 2, 0x68);
+	le64enc(h + 8, c->buf_iova + 0x68);
+	for (i = 0; i < 4; i++)
+		le64enc(h + 0x10 + 8 * i, c->buf_iova + c->index[i]);
+	le16enc(h + 0x30, cr);
+	le16enc(h + 0x32, tr);
+	le64enc(h + 0x34, c->buf_iova + c->mcr);
+	le64enc(h + 0x3c, c->buf_iova + c->mtr);
+	le16enc(h + 0x44, 16);
+	le16enc(h + 0x46, 16);
+	le64enc(h + 0x58, scratch != 0 ? scratch :
+	    c->buf_iova + roundup2(c->mcr + 256, 8));
+	le64enc(h + 0x60, scratch_size);
+	cpu_dcache_wb_range(c->buf, 32768);
+	return (0);
+}
+
+/* Context handshake: control 1 → status 1, context address, control 2 → status 2 */
+static int
+n1_handshake(struct resource *bar, struct n1_ctx *c, bus_size_t status,
+    bus_size_t addr, bus_size_t control)
+{
+	int i;
+
+	bus_write_4(bar, control, 1);
+	for (i = 0; i < 200 && bus_read_4(bar, status) != 1; i++)
+		pause("n1hs", hz / 100 + 1);
+	if (bus_read_4(bar, status) != 1)
+		return (ETIMEDOUT);
+	bus_write_4(bar, addr, (uint32_t)c->buf_iova);
+	bus_write_4(bar, addr + 4, (uint32_t)(c->buf_iova >> 32));
+	dsb(sy);
+	bus_write_4(bar, control, 2);
+	for (i = 0; i < 200 && bus_read_4(bar, status) != 2; i++)
+		pause("n1hs", hz / 100 + 1);
+	return (bus_read_4(bar, status) == 2 ? 0 : ETIMEDOUT);
+}
+
+/*
+ * Firmware personality: MSI to a DMA mailbox per function (polled until
+ * we have an MSI controller for the port) and bus mastering.
+ */
+static int
+n1_functions(struct n1_softc *sc)
+{
+	uint64_t iova;
+	int cap, i;
+
+	sc->fn[0] = sc->dev;
+	sc->fnbar[0] = sc->bar;
+	for (i = 0; i < 3; i++) {
+		if (sc->fn[i] == NULL || sc->fnbar[i] == NULL) {
+			device_printf(sc->dev, "function %d missing\n", i);
+			return (ENXIO);
+		}
+		if (pci_find_cap(sc->fn[i], PCIY_MSI, &cap) != 0)
+			return (ENXIO);
+		if (i == 0) {
+			iova = sc->mbox_iova;
+		} else {
+			sc->fnmsi[i] = n1_dma_alloc(sc, N1_PAGE, &iova);
+			if (sc->fnmsi[i] == NULL)
+				return (ENOMEM);
+		}
+		pci_write_config(sc->fn[i], cap + PCIR_MSI_ADDR, (uint32_t)iova, 4);
+		pci_write_config(sc->fn[i], cap + PCIR_MSI_ADDR_HIGH,
+		    (uint32_t)(iova >> 32), 4);
+		pci_write_config(sc->fn[i], cap + PCIR_MSI_DATA_64BIT,
+		    N1_MSI_DATA + 0x100 * i, 2);
+		pci_write_config(sc->fn[i], cap + PCIR_MSI_CTRL,
+		    (pci_read_config(sc->fn[i], cap + PCIR_MSI_CTRL, 2) &
+		    ~PCIM_MSICTRL_MME_MASK) | PCIM_MSICTRL_MME_32 |
+		    PCIM_MSICTRL_MSI_ENABLE, 2);
+		pci_enable_busmaster(sc->fn[i]);
+	}
+	return (0);
+}
+
+/*
+ * Stage 1 → 2: hand the control function the secondary ftab ("2ftb" in the
+ * image, seed of the memory it lays out) through config 0xf88/0xf8c/0xf90,
+ * set up the control context, point the boot registers at the image again
+ * with "2ftb" in 0x8074 and ring 0x9070; then the control IPC handshake.
+ */
+static int
+n1_start_ipc(struct n1_softc *sc)
+{
+	uint32_t off, len, n, i, need, end, stage;
+	const uint8_t *seed;
+	int error;
+
+	if ((error = n1_functions(sc)) != 0)
+		return (error);
+	if ((error = n1_ftab_entry(sc->fw, sc->fw_size, "2ftb", &off,
+	    &len)) != 0) {
+		device_printf(sc->dev, "no 2ftb in the image: %d\n", error);
+		return (error);
+	}
+	seed = (const uint8_t *)sc->fw + off;
+	if (len < 0x30 || memcmp(seed + 0x24, "ftab", 4) != 0)
+		return (EINVAL);
+	n = le32dec(seed + 0x28);
+	if (n == 0 || n > 256 || 0x30 + 16 * n != len)
+		return (EINVAL);
+	need = len;
+	for (i = 0; i < n; i++) {
+		end = le32dec(seed + 0x34 + 16 * i) + le32dec(seed + 0x38 + 16 * i);
+		need = MAX(need, end);
+	}
+	sc->secondary = n1_dma_alloc(sc, need, &sc->secondary_iova);
+	if (sc->secondary == NULL)
+		return (ENOMEM);
+	sc->secondary_size = need;
+	memcpy(sc->secondary, seed, len);
+	cpu_dcache_wb_range(sc->secondary, roundup2(need, N1_PAGE));
+	pci_write_config(sc->dev, 0xf88, (uint32_t)sc->secondary_iova, 4);
+	pci_write_config(sc->dev, 0xf8c, (uint32_t)(sc->secondary_iova >> 32), 4);
+	pci_write_config(sc->dev, 0xf90, need, 4);
+	device_printf(sc->dev, "secondary memory: seed %u, %u bytes\n", len,
+	    need);
+
+	if ((error = n1_ctx_init(sc, &sc->control, 13, 1, 0, 0)) != 0)
+		return (error);
+	N1_WR4(sc, N1_ROM_DESC_LO, (uint32_t)sc->desc_iova);
+	N1_WR4(sc, N1_ROM_DESC_HI, (uint32_t)(sc->desc_iova >> 32));
+	N1_WR4(sc, N1_ROM_DESC_SIZE, 0x20);
+	N1_WR4(sc, 0x8074, 0x62746632);		/* "2ftb" */
+	dsb(sy);
+	/*
+	 * The firmware doesn't answer BAR reads while it brings up the
+	 * secondary stage, and an unanswered read resets the SoC. Like macOS,
+	 * wait for its exec-stage interrupt (MSI to the mailbox) first.
+	 */
+	le32enc(sc->mbox, 0);
+	cpu_dcache_wbinv_range(sc->mbox, N1_PAGE);
+	N1_WR4(sc, 0x9070, 1);
+	for (i = 0; i < 500; i++) {
+		pause("n1s2", hz / 100 + 1);
+		cpu_dcache_inv_range(sc->mbox, N1_PAGE);
+		if (le32dec(sc->mbox) != 0)
+			break;
+	}
+	device_printf(sc->dev, "exec-stage MSI %#x after ~%d ms\n",
+	    le32dec(sc->mbox), i * 10);
+	if (le32dec(sc->mbox) == 0)
+		return (ETIMEDOUT);
+	stage = N1_RD4(sc, N1_STAGE);
+	device_printf(sc->dev, "secondary boot: stage %#x\n", stage);
+	n1_dart_errors(sc);
+	if (stage != 2)
+		return (EIO);
+	error = n1_handshake(sc->bar, &sc->control, 0x8050, 0x8054, 0x907c);
+	device_printf(sc->dev, "control IPC handshake: %d\n", error);
+	return (error);
+}
+
 /* hw.apple_n1.boot=0: attach only (bring-up). */
 static int n1_boot = 1;
 TUNABLE_INT("hw.apple_n1.boot", &n1_boot);
@@ -561,12 +782,8 @@ n1_boot_task(void *arg, int pending __unused)
 		device_t *kids;
 		int i, n;
 
-		for (i = 0; i < 5; i++) {	/* XXX bring-up */
-			pause("n1st", hz);
-			device_printf(sc->dev, "after cycle +%ds: stage %#x\n",
-			    i + 1, N1_RD4(sc, N1_STAGE));
-		}
 		BUS_RESCAN(device_get_parent(sc->dev));
+		n1_start_ipc(sc);
 		if (device_get_children(device_get_parent(sc->dev), &kids,
 		    &n) == 0) {
 			for (i = 0; i < n; i++)
@@ -606,6 +823,7 @@ n1_attach(device_t dev)
 	int error, i, rid;
 
 	sc->dev = dev;
+	n1_sc = sc;
 	root = OF_finddevice("/");
 	for (i = 0; i < nitems(n1_boards); i++)
 		if (ofw_bus_node_is_compatible(root, n1_boards[i].compat))
@@ -624,7 +842,7 @@ n1_attach(device_t dev)
 		device_printf(dev, "can't map BAR0\n");
 		return (ENXIO);
 	}
-	error = apple_dart_identity_stream(dev, sc->dart, sc->sid);
+	error = apple_dart_private_stream(dev, sc->dart, sc->sid);
 	if (error != 0) {
 		device_printf(dev, "DART stream %u setup: %d\n", sc->sid,
 		    error);
@@ -665,3 +883,50 @@ static driver_t n1_driver = {
 };
 
 DRIVER_MODULE(apple_n1, pci, n1_driver, NULL, NULL);
+
+/*
+ * Functions 1 (1902, Wi-Fi) and 2 (1903, Bluetooth) of the firmware
+ * personality: claim BAR0 and hand it to the control function's driver.
+ */
+static int
+n1fn_probe(device_t dev)
+{
+	if (pci_get_vendor(dev) != N1_VENDOR ||
+	    (pci_get_device(dev) != 0x1902 && pci_get_device(dev) != 0x1903))
+		return (ENXIO);
+	device_set_desc(dev, pci_get_device(dev) == 0x1902 ?
+	    "Apple N1 Wi-Fi" : "Apple N1 Bluetooth");
+	return (BUS_PROBE_DEFAULT);
+}
+
+static int
+n1fn_attach(device_t dev)
+{
+	struct resource *bar;
+	int f, rid;
+
+	f = pci_get_function(dev);
+	rid = PCIR_BAR(0);
+	bar = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
+	if (bar == NULL) {
+		device_printf(dev, "can't map BAR0\n");
+		return (ENXIO);
+	}
+	device_printf(dev, "BAR0 %#lx (%#lx bytes)\n", rman_get_start(bar),
+	    rman_get_size(bar));
+	if (n1_sc != NULL && f > 0 && f < 3) {
+		n1_sc->fn[f] = dev;
+		n1_sc->fnbar[f] = bar;
+	}
+	return (0);
+}
+
+static device_method_t n1fn_methods[] = {
+	DEVMETHOD(device_probe,		n1fn_probe),
+	DEVMETHOD(device_attach,	n1fn_attach),
+	DEVMETHOD_END
+};
+
+static driver_t n1fn_driver = { "apple_n1fn", n1fn_methods, 0 };
+
+DRIVER_MODULE(apple_n1fn, pci, n1fn_driver, NULL, NULL);
