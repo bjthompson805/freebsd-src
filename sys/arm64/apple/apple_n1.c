@@ -68,6 +68,11 @@
 #define	N1_IOVA_END		0x10000000000ul	/* 1 TiB: 40 bits */
 #define	N1_FW_MAX		(64 * 1024 * 1024)
 
+#define	N1_DART_PARAMS3		0x008
+#define	N1_DART_VERSION(v)	((v) & 0xffff)
+#define	N1_DART_EXCEPTIONS	0x4000
+#define	N1_DART_SID_FAULT(sid)	(0x8000 + 0x40 * (sid))
+
 struct n1_board {
 	const char	*compat;
 	const char	*firmware;
@@ -201,21 +206,42 @@ n1_find_stream(struct n1_softc *sc)
 	return (ENOENT);
 }
 
-/* XXX bring-up: DART T8110 error state (ERROR 0x100, ERROR_ADDR 0x170/0x174). */
+/* Inspect latched faults without acknowledging them. */
 static void
 n1_dart_errors(struct n1_softc *sc)
 {
 	bus_addr_t pa;
 	bus_size_t size;
 	vm_offset_t va;
+	uint32_t pending, params;
+	unsigned int offset, sid;
 
 	if (ofw_reg_to_paddr(sc->dart, 0, &pa, &size, NULL) != 0)
 		return;
 	va = (vm_offset_t)pmap_mapdev(pa, size);
-	device_printf(sc->dev, "DART error %#x addr %#x%08x\n",
-	    *(volatile uint32_t *)(va + 0x100),
-	    *(volatile uint32_t *)(va + 0x174),
-	    *(volatile uint32_t *)(va + 0x170));
+	params = *(volatile uint32_t *)(va + N1_DART_PARAMS3);
+	if (N1_DART_VERSION(params) >= 0x0202 && size >= 0x8010) {
+		/* The radio's streams are all in the first exception word. */
+		pending = *(volatile uint32_t *)(va + N1_DART_EXCEPTIONS);
+		device_printf(sc->dev, "DART exceptions %#x\n", pending);
+		while (pending != 0) {
+			sid = ffs(pending) - 1;
+			pending &= pending - 1;
+			offset = N1_DART_SID_FAULT(sid);
+			if (offset + 0x10 > size)
+				continue;
+			device_printf(sc->dev, "DART SID %u status %#x "
+			    "address %08x:%08x\n", sid,
+			    *(volatile uint32_t *)(va + offset),
+			    *(volatile uint32_t *)(va + offset + 0xc),
+			    *(volatile uint32_t *)(va + offset + 8));
+		}
+	} else {
+		device_printf(sc->dev, "DART error %#x addr %#x%08x\n",
+		    *(volatile uint32_t *)(va + 0x100),
+		    *(volatile uint32_t *)(va + 0x174),
+		    *(volatile uint32_t *)(va + 0x170));
+	}
 	pmap_unmapdev((void *)va, size);
 
 	/* Root port: interrupt status, link status (pcie-apple PORT_INTSTAT/LINKSTS). */
