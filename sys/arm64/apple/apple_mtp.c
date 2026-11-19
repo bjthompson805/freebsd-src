@@ -32,6 +32,8 @@
 #include <sys/bus.h>
 #include <sys/callout.h>
 #include <sys/endian.h>
+#include <sys/eventhandler.h>
+#include <sys/firmware.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -39,6 +41,7 @@
 #include <sys/mutex.h>
 #include <sys/rman.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
@@ -75,10 +78,28 @@
 #define	MSG_FLAGS_CONTROL	0x80
 
 #define	CMD_ENABLE		0xb4
+#define	CMD_SEND_FIRMWARE	0x95
+#define	CMD_RESET_IFACE		0x40	/* power method, iface, state[, changed] */
+#define	CMD_ACK_GPIO		0xa1
+#define	POWER_METHOD_2		2
+#define	POWER_OFF		0
+#define	POWER_ON		2
 
 /* comm (interface 0) notifications */
 #define	NOTIFY_INIT		0xf0
 #define	NOTIFY_READY		0xf1
+#define	NOTIFY_GPIO		0xa0
+
+/* Trackpad firmware file ("HIDF" header, then the blob the MTP takes). */
+struct mtp_fw_header {
+	uint32_t	magic;
+	uint32_t	version;
+	uint32_t	hdr_length;
+	uint32_t	data_length;
+	uint32_t	iface_offset;	/* byte to patch with the iface number */
+	uint32_t	pad[3];
+};
+#define	MTP_FW_MAGIC		0x46444948	/* "HIDF" */
 #define	INIT_BLK_DESCRIPTOR	0
 #define	INIT_BLK_END		2
 
@@ -112,12 +133,19 @@ struct apple_mtp_softc {
 	vm_offset_t		asc;
 	vm_offset_t		mbox;
 	vm_offset_t		dc;		/* DockChannel "data" FIFO */
+	phandle_t		hid_node;
 	struct apple_rtkit	*rtk;
 	uint64_t		iova_next, iova_end;	/* dma-range window */
 
 	struct mtx		mtx;		/* rtkit, FIFO, iface state */
 	struct callout		poll;
 	bool			ctl_pending;	/* device control awaiting ack */
+	uint32_t		ctl_retcode;
+	uint8_t			gpio_ack[16];	/* GPIO request to ack, if len */
+	size_t			gpio_ack_len;
+	struct task		tp_task;	/* trackpad bring-up */
+	eventhandler_tag	mountroot_tag;
+	u_int			mt_logged;
 	u_long			reports;	/* input reports delivered */
 	struct mtp_iface	ifaces[MTP_MAX_IFACES];
 	uint8_t			pkt[PKT_HDR_LEN + PKT_MAX + 4];
@@ -287,6 +315,7 @@ mtp_packet(struct apple_mtp_softc *sc, uint8_t iface, uint8_t *p, size_t len)
 	ifc = &sc->ifaces[iface];
 
 	if (flags == MSG_FLAGS_CONTROL) {
+		sc->ctl_retcode = le32dec(p - 4);
 		sc->ctl_pending = false;
 		return;
 	}
@@ -301,8 +330,22 @@ mtp_packet(struct apple_mtp_softc *sc, uint8_t iface, uint8_t *p, size_t len)
 			if (bootverbose)
 				device_printf(sc->dev, "%s ready\n",
 				    sc->ifaces[p[1]].name);
+		} else if (p[0] == NOTIFY_GPIO && mlen <= 11) {
+			/* XXX no SMC GPIO yet: log the request, ack success. */
+			device_printf(sc->dev, "GPIO request %*D\n", (int)mlen,
+			    p, " ");
+			sc->gpio_ack[0] = CMD_ACK_GPIO;
+			le32enc(sc->gpio_ack + 1, 0);
+			memcpy(sc->gpio_ack + 5, p, mlen);
+			sc->gpio_ack_len = 5 + mlen;
 		}
 		return;
+	}
+	/* XXX bring-up: show the first trackpad reports. */
+	if (strcmp(ifc->name, "multi-touch") == 0 && sc->mt_logged < 4) {
+		sc->mt_logged++;
+		device_printf(sc->dev, "multi-touch report (%u): %*D\n", mlen,
+		    (int)MIN(mlen, 48), p, " ");
 	}
 	if (ifc->open && ifc->intr != NULL && sc->rep.ifc == NULL) {
 		sc->rep.ifc = ifc;
@@ -351,6 +394,12 @@ mtp_work(struct apple_mtp_softc *sc)
 
 	mtx_assert(&sc->mtx, MA_OWNED);
 	apple_rtkit_poll(sc->rtk);
+	if (!sc->ctl_pending && sc->gpio_ack_len != 0) {
+		if (mtp_send(sc, &sc->ifaces[0], MSG_FLAGS_CONTROL,
+		    sc->gpio_ack, sc->gpio_ack_len) == 0)
+			sc->ctl_pending = true;
+		sc->gpio_ack_len = 0;
+	}
 	if (!sc->ctl_pending) {
 		for (i = 1; i < MTP_MAX_IFACES; i++) {
 			ifc = &sc->ifaces[i];
@@ -413,6 +462,147 @@ mtp_map_reg(device_t dev, phandle_t node, const char *name, vm_offset_t *va)
 	}
 	*va = (vm_offset_t)pmap_mapdev_attr(pa, size, VM_MEMATTR_DEVICE_NP);
 	return (0);
+}
+
+/* Send a comm device-control command and wait for its ack (sleepable). */
+static int
+mtp_comm_cmd(struct apple_mtp_softc *sc, const void *cmd, size_t len)
+{
+	int i, error;
+
+	mtx_lock(&sc->mtx);
+	for (i = 0; sc->ctl_pending; i++) {
+		if (i == 100) {
+			mtx_unlock(&sc->mtx);
+			return (EBUSY);
+		}
+		mtx_sleep(&sc->ctl_pending, &sc->mtx, 0, "mtpcmd", hz / 100);
+	}
+	error = mtp_send(sc, &sc->ifaces[0], MSG_FLAGS_CONTROL, cmd, len);
+	if (error == 0)
+		sc->ctl_pending = true;
+	for (i = 0; error == 0 && sc->ctl_pending; i++) {
+		if (i == 200) {
+			error = ETIMEDOUT;
+			break;
+		}
+		mtp_work(sc);
+		mtp_deliver(sc);
+		if (sc->ctl_pending)
+			mtx_sleep(&sc->ctl_pending, &sc->mtx, 0, "mtpack",
+			    hz / 100);
+	}
+	if (error == 0 && sc->ctl_retcode != 0) {
+		device_printf(sc->dev, "command %#x failed: %#x\n",
+		    *(const uint8_t *)cmd, sc->ctl_retcode);
+		error = EIO;
+	}
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
+/* Power method 2 transition: announce, (AFE reset), wait, confirm. */
+static int
+mtp_pm2_set_power(struct apple_mtp_softc *sc, uint8_t iface, uint8_t state)
+{
+	uint8_t cmd[9] = { CMD_RESET_IFACE, POWER_METHOD_2, iface, state };
+	int error;
+
+	error = mtp_comm_cmd(sc, cmd, sizeof(cmd));
+	if (error != 0)
+		return (error);
+	/* XXX the AFE reset line (SMC gP1c) should be driven here. */
+	pause("mtpafe", hz / 20);
+	cmd[4] = 1;				/* has changed */
+	return (mtp_comm_cmd(sc, cmd, sizeof(cmd)));
+}
+
+static struct mtp_iface *
+mtp_iface_by_name(struct apple_mtp_softc *sc, const char *name)
+{
+	int i;
+
+	for (i = 1; i < MTP_MAX_IFACES; i++)
+		if (strcmp(sc->ifaces[i].name, name) == 0)
+			return (&sc->ifaces[i]);
+	return (NULL);
+}
+
+/*
+ * The trackpad (multi-touch) needs firmware from the filesystem: upload it,
+ * then power-cycle the interface. Runs once root is mounted.
+ */
+static void
+mtp_trackpad_task(void *arg, int pending)
+{
+	struct apple_mtp_softc *sc = arg;
+	const struct firmware *fw;
+	const struct mtp_fw_header *hdr;
+	struct mtp_iface *ifc;
+	phandle_t mt;
+	char name[64];
+	uint8_t *buf;
+	uint64_t iova;
+	size_t size;
+	uint8_t cmd[16];
+	int error;
+
+	ifc = mtp_iface_by_name(sc, "multi-touch");
+	mt = ofw_bus_find_child(sc->hid_node, "multi-touch");
+	if (ifc == NULL || mt <= 0 ||
+	    OF_getprop(mt, "firmware-name", name, sizeof(name)) <= 0)
+		return;
+	fw = firmware_get_flags(name, FIRMWARE_GET_NOWARN);
+	if (fw == NULL) {
+		device_printf(sc->dev, "no trackpad firmware /boot/firmware/%s\n",
+		    name);
+		return;
+	}
+	hdr = fw->data;
+	if (fw->datasize < sizeof(*hdr) || hdr->magic != MTP_FW_MAGIC ||
+	    hdr->version != 1 || hdr->hdr_length < sizeof(*hdr) ||
+	    (size_t)hdr->hdr_length + hdr->data_length > fw->datasize ||
+	    hdr->iface_offset >= hdr->data_length) {
+		device_printf(sc->dev, "%s: bad firmware header\n", name);
+		firmware_put(fw, FIRMWARE_UNLOAD);
+		return;
+	}
+	size = roundup2(hdr->data_length, 16384);
+	buf = contigmalloc(size, M_DEVBUF, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, 16384, 0);
+	memcpy(buf, (const uint8_t *)fw->data + hdr->hdr_length,
+	    hdr->data_length);
+	buf[hdr->iface_offset] = ifc->id;
+	cpu_dcache_wb_range(buf, size);
+	error = mtp_buf_map(sc, pmap_kextract((vm_offset_t)buf), size, &iova);
+	if (error != 0)
+		goto out;
+
+	memset(cmd, 0, sizeof(cmd));
+	cmd[0] = CMD_SEND_FIRMWARE;
+	cmd[1] = 2;
+	cmd[3] = ifc->id;
+	le64enc(cmd + 4, iova);
+	le32enc(cmd + 12, hdr->data_length);
+	error = mtp_comm_cmd(sc, cmd, sizeof(cmd));
+	device_printf(sc->dev, "trackpad firmware %s (%u bytes) sent: %d\n",
+	    name, hdr->data_length, error);
+	if (error == 0)
+		error = mtp_pm2_set_power(sc, ifc->id, POWER_OFF);
+	if (error == 0)
+		error = mtp_pm2_set_power(sc, ifc->id, POWER_ON);
+	device_printf(sc->dev, "trackpad power cycle: %d\n", error);
+out:
+	/* The MTP may keep using the buffer: never freed. */
+	firmware_put(fw, FIRMWARE_UNLOAD);
+}
+
+static void
+mtp_mountroot(void *arg)
+{
+	struct apple_mtp_softc *sc = arg;
+
+	taskqueue_enqueue(taskqueue_thread, &sc->tp_task);
 }
 
 static int
@@ -483,6 +673,7 @@ apple_mtp_attach(device_t dev)
 		return (ENXIO);
 	}
 	sc->mbox = (vm_offset_t)pmap_mapdev(pa, size);
+	sc->hid_node = hid;
 	if (mtp_map_reg(dev, hid, "data", &sc->dc) != 0)
 		return (ENXIO);
 
@@ -542,6 +733,9 @@ apple_mtp_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "reports",
 	    CTLFLAG_RD, &sc->reports, "Input reports delivered");
 	callout_reset(&sc->poll, hz / 100, mtp_poll, sc);
+	TASK_INIT(&sc->tp_task, 0, mtp_trackpad_task, sc);
+	sc->mountroot_tag = EVENTHANDLER_REGISTER(mountroot, mtp_mountroot, sc,
+	    EVENTHANDLER_PRI_ANY);
 	bus_attach_children(dev);
 	return (0);
 }
