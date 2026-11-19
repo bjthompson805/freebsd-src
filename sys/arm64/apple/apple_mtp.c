@@ -22,9 +22,11 @@
  * its name and HID report descriptor; once the last one arrives we enable
  * the device (command 0xb4) and it starts sending input reports. Each HID
  * device we support gets a hidbus child: the keyboard as is, and the
- * trackpad ("multi-touch", once its firmware is loaded) as a plain relative
- * mouse: its 0x75 multitouch frames are turned into the boot-mouse report
- * (ID 2) its own descriptor declares, so hms(4) drives it. No gestures yet.
+ * trackpad ("multi-touch", once its firmware is loaded) as a relative mouse
+ * with a wheel: its 0x75 multitouch frames become reports for a descriptor
+ * of our own (mtp_mouse_rdesc), so hms(4) drives it. One finger moves the
+ * pointer, two scroll, a click with two fingers down is a right click, and
+ * so is a quick two-finger tap.
  *
  * Everything is polled from a callout; no DockChannel/mailbox interrupts.
  */
@@ -123,10 +125,17 @@ struct mtp_iface {
 	void			*intr_ctx;
 	bool			open;
 
-	/* multi-touch: the contact being followed and its last position */
-	int			mt_contact;	/* -1: none */
-	int			mt_x, mt_y;
-	int			mt_rx, mt_ry;	/* sub-count remainders */
+	/* multi-touch: followed contacts (-1: none) and last position */
+	int			mt_ids[2];
+	int			mt_x, mt_y;	/* finger, or two-finger centre */
+	int			mt_rx, mt_ry;	/* sub-step remainders */
+	uint8_t			mt_button;	/* latched at press: 1 or 2 */
+	/* the current touch, from first contact until all fingers lift */
+	int			mt_touch_ticks;	/* when it started */
+	int			mt_touch_fingers; /* most fingers seen */
+	int			mt_touch_moved;	/* total movement, touch units */
+	bool			mt_touch_clicked;
+	bool			mt_tap_release;	/* right-button release due */
 };
 
 struct mtp_report {
@@ -214,7 +223,33 @@ static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
 #define	MT_REC_X		4	/* signed 16-bit, ~0.01 mm */
 #define	MT_REC_Y		6	/* signed 16-bit, up is positive */
 #define	MT_MOUSE_REPORT_ID	2
-#define	MT_COUNTS_PER_STEP	8	/* touch units per mouse count */
+#define	MT_POINTER_UNITS	8	/* touch units per pointer count */
+#define	MT_SCROLL_UNITS		60	/* touch units per wheel step */
+#define	MT_TAP_MS		250	/* longest two-finger tap */
+#define	MT_TAP_MOVE		150	/* most movement in a tap (~1.5 mm) */
+
+/* Report 2: 3 buttons, X, Y, wheel, AC pan (horizontal wheel). */
+static const uint8_t mtp_mouse_rdesc[] = {
+	0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, MT_MOUSE_REPORT_ID,
+	0x09, 0x01, 0xa1, 0x00,
+	0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01,
+	0x95, 0x03, 0x75, 0x01, 0x81, 0x02,		/* buttons */
+	0x95, 0x01, 0x75, 0x05, 0x81, 0x03,		/* padding */
+	0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38,
+	0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x03,
+	0x81, 0x06,					/* X, Y, wheel */
+	0x05, 0x0c, 0x0a, 0x38, 0x02, 0x95, 0x01,
+	0x81, 0x06,					/* AC pan */
+	0xc0, 0xc0,
+};
+#define	MT_MOUSE_REPORT_LEN	6
+
+static int mtp_natural_scroll = 1;
+SYSCTL_NODE(_hw, OID_AUTO, apple_mtp, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "Apple MTP keyboard/trackpad");
+SYSCTL_INT(_hw_apple_mtp, OID_AUTO, natural_scroll, CTLFLAG_RWTUN,
+    &mtp_natural_scroll, 0,
+    "Two-finger scrolling moves the content with the fingers (macOS style)");
 
 static uint32_t
 mtp_checksum(const uint8_t *p, size_t len)
@@ -319,68 +354,109 @@ mtp_comm_init_msg(struct apple_mtp_softc *sc, const uint8_t *m, size_t len)
 }
 
 static int
-mtp_mt_clamp(int *acc)
+mtp_mt_steps(int *acc, int units)
 {
-	int v = *acc / MT_COUNTS_PER_STEP;
+	int v = *acc / units;
 
 	v = MAX(-127, MIN(127, v));
-	*acc -= v * MT_COUNTS_PER_STEP;
+	*acc -= v * units;
 	return (v);
 }
 
 /*
- * Turn a multitouch frame into a relative mouse report: follow one contact
- * (the first one, until it lifts) and report its movement; the button is
- * the trackpad's click.
+ * Turn a multitouch frame into a mouse report. One contact moves the
+ * pointer; with two or more, the centre of the first two scrolls. Whenever
+ * the followed contacts change, the reference point restarts without
+ * movement. The click is the trackpad's button, reported as the right
+ * button if two fingers were down when it was pressed.
  */
 static void
 mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
     const uint8_t *p, size_t len)
 {
-	const uint8_t *rec = NULL;
-	int count, i, x, y;
+	const uint8_t *rec;
+	int count, ids[2], n, x, y, dx, dy;
 	uint8_t *r;
+	bool pressed, tap;
 
 	if (len < MT_HDR_LEN || p[0] != MT_REPORT_ID)
 		return;
 	count = p[MT_HDR_COUNT];
 	if (MT_HDR_LEN + (size_t)count * MT_REC_LEN > len)
 		return;
-	for (i = 0; i < count; i++) {
-		if (p[MT_HDR_LEN + i * MT_REC_LEN + MT_REC_ID] ==
-		    ifc->mt_contact) {
-			rec = p + MT_HDR_LEN + i * MT_REC_LEN;
-			break;
-		}
+
+	n = MIN(count, 2);
+	ids[0] = ids[1] = -1;
+	x = y = 0;
+	for (int i = 0; i < n; i++) {
+		rec = p + MT_HDR_LEN + i * MT_REC_LEN;
+		ids[i] = rec[MT_REC_ID];
+		x += (int16_t)le16dec(rec + MT_REC_X);
+		y += (int16_t)le16dec(rec + MT_REC_Y);
 	}
-	if (rec == NULL && count > 0) {
-		/* New contact: start following it, no movement this frame. */
-		rec = p + MT_HDR_LEN;
-		ifc->mt_contact = rec[MT_REC_ID];
-		ifc->mt_x = (int16_t)le16dec(rec + MT_REC_X);
-		ifc->mt_y = (int16_t)le16dec(rec + MT_REC_Y);
+	if (n > 0) {
+		x /= n;
+		y /= n;
+	}
+	dx = dy = 0;
+	if (n > 0 && ids[0] == ifc->mt_ids[0] && ids[1] == ifc->mt_ids[1]) {
+		dx = x - ifc->mt_x;
+		dy = y - ifc->mt_y;		/* touch y grows upward */
+	} else
 		ifc->mt_rx = ifc->mt_ry = 0;
-	} else if (rec == NULL)
-		ifc->mt_contact = -1;
+	ifc->mt_ids[0] = ids[0];
+	ifc->mt_ids[1] = ids[1];
+	ifc->mt_x = x;
+	ifc->mt_y = y;
+
+	pressed = (p[MT_HDR_BUTTONS] & 1) != 0;
+	if (!pressed)
+		ifc->mt_button = 0;
+	else if (ifc->mt_button == 0)
+		ifc->mt_button = count >= 2 ? 2 : 1;
+
+	/* Two-finger tap: short, still, no click, two fingers at most. */
+	if (count > 0 && ifc->mt_touch_fingers == 0) {
+		ifc->mt_touch_ticks = ticks;
+		ifc->mt_touch_moved = 0;
+		ifc->mt_touch_clicked = false;
+	}
+	ifc->mt_touch_moved += abs(dx) + abs(dy);
+	ifc->mt_touch_clicked |= pressed;
+	if (count > 0) {
+		ifc->mt_touch_fingers = MAX(ifc->mt_touch_fingers, count);
+		tap = false;
+	} else {
+		tap = ifc->mt_touch_fingers == 2 && !ifc->mt_touch_clicked &&
+		    ifc->mt_touch_moved < MT_TAP_MOVE &&
+		    ticks - ifc->mt_touch_ticks < MT_TAP_MS * hz / 1000;
+		ifc->mt_touch_fingers = 0;
+	}
 
 	if (!ifc->open || ifc->intr == NULL || sc->rep.ifc != NULL)
 		return;
 	r = sc->rep.data;
-	memset(r, 0, 8);
+	memset(r, 0, MT_MOUSE_REPORT_LEN);
 	r[0] = MT_MOUSE_REPORT_ID;
-	r[1] = p[MT_HDR_BUTTONS] & 1;
-	if (rec != NULL) {
-		x = (int16_t)le16dec(rec + MT_REC_X);
-		y = (int16_t)le16dec(rec + MT_REC_Y);
-		ifc->mt_rx += x - ifc->mt_x;
-		ifc->mt_ry -= y - ifc->mt_y;	/* screen y grows downward */
-		ifc->mt_x = x;
-		ifc->mt_y = y;
-		r[2] = (int8_t)mtp_mt_clamp(&ifc->mt_rx);
-		r[3] = (int8_t)mtp_mt_clamp(&ifc->mt_ry);
+	r[1] = ifc->mt_button == 2 ? 0x2 : ifc->mt_button;
+	if (tap) {
+		r[1] = 0x2;		/* released by mtp_deliver */
+		ifc->mt_tap_release = true;
+	}
+	if (n == 1) {
+		ifc->mt_rx += dx;
+		ifc->mt_ry -= dy;		/* screen y grows downward */
+		r[2] = (int8_t)mtp_mt_steps(&ifc->mt_rx, MT_POINTER_UNITS);
+		r[3] = (int8_t)mtp_mt_steps(&ifc->mt_ry, MT_POINTER_UNITS);
+	} else if (n == 2 && ifc->mt_button == 0) {
+		/* Wheel +1 scrolls up, pan +1 right; natural inverts both. */
+		ifc->mt_ry += mtp_natural_scroll ? -dy : dy;
+		ifc->mt_rx += mtp_natural_scroll ? -dx : dx;
+		r[4] = (int8_t)mtp_mt_steps(&ifc->mt_ry, MT_SCROLL_UNITS);
+		r[5] = (int8_t)mtp_mt_steps(&ifc->mt_rx, MT_SCROLL_UNITS);
 	}
 	sc->rep.ifc = ifc;
-	sc->rep.len = 8;
+	sc->rep.len = MT_MOUSE_REPORT_LEN;
 }
 
 /* Handle one packet; an input report is copied to sc->rep. */
@@ -514,6 +590,14 @@ mtp_deliver(struct apple_mtp_softc *sc)
 		mtx_lock(&sc->mtx);
 		sc->reports++;
 		sc->rep.ifc = NULL;
+		if (ifc->mt_tap_release) {
+			/* The second half of a tap: all buttons up. */
+			ifc->mt_tap_release = false;
+			memset(sc->rep.data + 1, 0, MT_MOUSE_REPORT_LEN - 1);
+			sc->rep.ifc = ifc;
+			sc->rep.len = MT_MOUSE_REPORT_LEN;
+			continue;
+		}
 		mtp_work(sc);
 	}
 }
@@ -702,7 +786,13 @@ static int
 apple_mtp_add_hid(struct apple_mtp_softc *sc, struct mtp_iface *ifc)
 {
 	ifc->sc = sc;
-	ifc->mt_contact = -1;
+	ifc->mt_ids[0] = ifc->mt_ids[1] = -1;
+	if (strcmp(ifc->name, "multi-touch") == 0) {
+		/* Our own mouse descriptor replaces the firmware's stub. */
+		free(ifc->rdesc, M_DEVBUF);
+		ifc->rdesc = __DECONST(uint8_t *, mtp_mouse_rdesc);
+		ifc->rdesc_len = sizeof(mtp_mouse_rdesc);
+	}
 	snprintf(ifc->hw.name, sizeof(ifc->hw.name), "Apple MTP %s",
 	    ifc->name);
 	ifc->hw.idBus = BUS_SPI;
