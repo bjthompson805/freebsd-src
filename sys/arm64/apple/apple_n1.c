@@ -72,12 +72,36 @@ struct n1_board {
 	const char	*compat;
 	const char	*firmware;
 	uint32_t	board_word;
+	/* apcie port 0 config, its lane PHY and the PERST# pad (from the ADT) */
+	bus_addr_t	port, lane, perst;
 };
 
 static const struct n1_board n1_boards[] = {
-	{ "apple,j815", "apple/j815-ftab.bin", 0x00268142 },
-	{ "apple,j813", "apple/j813-ftab.bin", 0x00248142 },
+	{ "apple,j815", "apple/j815-ftab.bin", 0x00268142,
+	    0x488028000, 0x48f010000, 0x39a000300 },
+	{ "apple,j813", "apple/j813-ftab.bin", 0x00248142,
+	    0x488028000, 0x48f010000, 0x39a000300 },
 };
+
+/* apcie port registers used by the post-ROM port cycle */
+#define	PORT_LTSSM_EN		0x080
+#define	PORT_PME		0x088
+#define	PORT_MSICFG		0x124
+#define	PORT_LINKDOWN		0x13c
+#define	PORT_MSIADDR		0x16c
+#define	PORT_PIPE		0x0a8
+#define	PORT_LINKSTS		0x208
+#define	PORT_APPCLK		0x800
+#define	PORT_STATUS		0x804
+#define	PORT_LANES		0x820
+#define	PORT_PERST		0x82c
+#define	PORT_RID2SID		0x3000
+#define	PORT_MSIMAP		0x3800
+#define	RC_LTSSM		0x728	/* root port config: LTSSM state in [5:0] */
+#define	LTSSM_L0		0x11
+#define	LTSSM_L2_IDLE		0x14
+#define	PAD_OUT_LOW		0x2
+#define	PAD_OUT_HIGH		0x3
 
 struct n1_softc {
 	device_t		dev;
@@ -356,6 +380,170 @@ n1_rom_boot(struct n1_softc *sc)
 	return (stage == N1_STAGE_RUNNING ? 0 : EIO);
 }
 
+static void
+n1_rmw(vm_offset_t va, bus_size_t off, uint32_t clear, uint32_t set)
+{
+	volatile uint32_t *r = (volatile uint32_t *)(va + off);
+
+	*r = (*r & ~clear) | set;
+}
+
+static bool
+n1_wait(vm_offset_t va, bus_size_t off, uint32_t mask, uint32_t want, int us)
+{
+	for (; us > 0; us -= 10) {
+		if ((*(volatile uint32_t *)(va + off) & mask) == want)
+			return (true);
+		DELAY(10);
+	}
+	return ((*(volatile uint32_t *)(va + off) & mask) == want);
+}
+
+static bool
+n1_wait_ltssm(device_t rp, uint32_t state, int ms)
+{
+	for (; ms > 0; ms--) {
+		if ((pci_read_config(rp, RC_LTSSM, 4) & 0x3f) == state)
+			return (true);
+		DELAY(1000);
+	}
+	return (false);
+}
+
+/*
+ * After the ROM has run the firmware (stage 4), cycle the port so the N1
+ * re-enumerates in its firmware personality (functions 1901/1902/1903):
+ * endpoint to D3hot, PME_Turn_Off and L2, PERST# asserted, the port reset
+ * to its power-on state, then brought up and retrained as at boot. macOS
+ * does the same (D3, disable, enable); the register order follows the
+ * measured sequence.
+ */
+static int
+n1_port_cycle(struct n1_softc *sc)
+{
+	static const uint32_t reset[][2] = {
+		{ 0x088, 0x110 }, { 0x100, ~0u }, { 0x148, ~0u },
+		{ 0x210, ~0u }, { 0x080, 0 }, { 0x084, 0 },
+		{ 0x104, 0xfffffff0 }, { 0x124, 0x100 }, { 0x16c, 0 },
+		{ 0x13c, 0 }, { 0x800, 0x00100100 }, { 0x808, 0x001001ff },
+		{ 0x82c, 0x00010000 }, { 0x130, 0 }, { 0x140, 0x10 },
+		{ 0x144, 0x00253770 }, { 0x21c, 0 }, { 0x834, 0 },
+		{ 0x83c, 0 },
+	};
+	device_t rp = device_get_parent(device_get_parent(sc->dev));
+	vm_offset_t port, lane, pad;
+	uint32_t *msimap, msicfg, msiaddr, padv, id;
+	int error, i, pm;
+
+	port = (vm_offset_t)pmap_mapdev(sc->board->port, 0x4000);
+	lane = (vm_offset_t)pmap_mapdev(sc->board->lane, 0x4000);
+	pad = (vm_offset_t)pmap_mapdev(trunc_page(sc->board->perst), PAGE_SIZE) +
+	    (sc->board->perst & PAGE_MASK);
+	msimap = malloc(256 * sizeof(*msimap), M_DEVBUF, M_WAITOK);
+	error = ETIMEDOUT;
+
+	pci_save_state(rp);
+	pci_save_state(sc->dev);
+	for (i = 0; i < 256; i++)
+		msimap[i] = *(volatile uint32_t *)(port + PORT_MSIMAP + 4 * i);
+	msicfg = *(volatile uint32_t *)(port + PORT_MSICFG);
+	msiaddr = *(volatile uint32_t *)(port + PORT_MSIADDR);
+	padv = *(volatile uint32_t *)pad;
+
+	/* Endpoint to D3hot, then PME_Turn_Off and wait for L2 */
+	if (pci_find_cap(sc->dev, PCIY_PMG, &pm) == 0) {
+		pci_write_config(sc->dev, pm + PCIR_POWER_STATUS, 0x103, 2);
+		pause("n1d3", hz / 100 + 1);
+	}
+	n1_rmw(port, PORT_APPCLK, 0, 0x100);
+	*(volatile uint32_t *)(port + PORT_PME) = 0x11;
+	if (!n1_wait(port, PORT_PME, 1, 0, 500000) ||
+	    !n1_wait(port, PORT_LINKSTS, 1u << 6, 1u << 6, 500000))
+		device_printf(sc->dev, "port cycle: no PME ack / L2\n");
+
+	/* Link down: PERST# asserted, port quiesced and reset */
+	pci_write_config(rp, PCIR_COMMAND, 0, 2);
+	n1_rmw(lane, 0, 1u << 31, 0);
+	*(volatile uint32_t *)pad = (padv & ~0xfu) | PAD_OUT_LOW;
+	n1_wait(port, PORT_STATUS, 1u << 2, 0, 50000);
+	n1_wait(port, PORT_LANES, 0x1ff, 0, 100000);
+	n1_rmw(port, PORT_LINKDOWN, 0, 0x100);
+	n1_wait_ltssm(rp, LTSSM_L2_IDLE, 200);
+	n1_wait(port, PORT_LINKSTS, 1u << 12, 0, 200000);
+	n1_wait(port, PORT_PIPE, 3, 0, 10000);
+	n1_rmw(port, PORT_PERST, 0, 1u << 24);
+	n1_wait(port, PORT_PIPE, 1u << 16, 1u << 16, 20000);
+	n1_rmw(port, PORT_PERST, 0, 1u << 16);
+	DELAY(10);
+	n1_rmw(port, PORT_PERST, 1, 0);
+	DELAY(10);
+	n1_rmw(port, PORT_PERST, 1u << 24, 0);
+	n1_rmw(port, PORT_LINKDOWN, 0x100, 0);
+	n1_rmw(lane, 0, (1u << 31) | 0x600, 0x10);
+	n1_rmw(lane, 0, 3, 0);
+	*(volatile uint32_t *)(port + 0x100) = ~0u;
+	n1_rmw(port, PORT_APPCLK, 1, 0);
+	n1_wait(port, PORT_STATUS, 1, 0, 200000);
+	for (i = 0; i < nitems(reset); i++)
+		*(volatile uint32_t *)(port + reset[i][0]) = reset[i][1];
+	for (i = 0; i < 16; i++)
+		*(volatile uint32_t *)(port + PORT_RID2SID + 4 * i) = 0;
+	for (i = 0; i < 256; i++)
+		*(volatile uint32_t *)(port + PORT_MSIMAP + 4 * i) = 0;
+
+	/* Bring-up: lane clocks, PERST# released, retrain to L0 */
+	n1_rmw(port, PORT_APPCLK, 0, 1);
+	DELAY(10);
+	n1_rmw(lane, 0, 0, 1);
+	if (!n1_wait(lane, 0, 4, 4, 50000))
+		goto out;
+	n1_rmw(lane, 0, 0, 2);
+	if (!n1_wait(lane, 0, 8, 8, 50000))
+		goto out;
+	n1_rmw(lane, 0, 0x10, 0);
+	DELAY(100);
+	n1_rmw(lane, 0, 0, 0x200);
+	n1_rmw(lane, 0, 0, 0x400);
+	DELAY(100);
+	n1_rmw(port, PORT_PERST, 0, 1);
+	*(volatile uint32_t *)pad = (padv & ~0xfu) | PAD_OUT_HIGH;
+	DELAY(100);
+	n1_wait(port, PORT_PIPE, 3, 0, 20000);
+	n1_rmw(port, PORT_PERST, 1u << 16, 0);
+	if (!n1_wait(port, PORT_STATUS, 1, 1, 200000))
+		goto out;
+	n1_rmw(port, PORT_APPCLK, 0x100, 0);
+	pci_write_config(rp, 0x8bc, pci_read_config(rp, 0x8bc, 4) ^ 1, 4);
+	pci_write_config(rp, 0x80, pci_read_config(rp, 0x80, 4) | 0x400, 4);
+	n1_rmw(lane, 0, 0, 1u << 31);
+	n1_rmw(port, PORT_LTSSM_EN, 0, 1);
+	if (!n1_wait_ltssm(rp, LTSSM_L0, 2000))
+		goto out;
+	pause("n1l0", hz / 10 + 1);
+	pci_restore_state(rp);
+	id = pci_read_config(sc->dev, PCIR_DEVVENDOR, 4);
+	pci_restore_state(sc->dev);
+	device_printf(sc->dev, "port cycle: link up, function 0 now %#x, "
+	    "stage %#x\n", id, N1_RD4(sc, N1_STAGE));
+	error = 0;
+out:
+	for (i = 0; i < 256; i++)
+		*(volatile uint32_t *)(port + PORT_MSIMAP + 4 * i) = msimap[i];
+	*(volatile uint32_t *)(port + PORT_MSIADDR) = msiaddr;
+	*(volatile uint32_t *)(port + PORT_MSICFG) = msicfg;
+	if (error != 0)
+		device_printf(sc->dev, "port cycle timed out (status %#x "
+		    "pipe %#x LTSSM %#x)\n",
+		    *(volatile uint32_t *)(port + PORT_STATUS),
+		    *(volatile uint32_t *)(port + PORT_PIPE),
+		    pci_read_config(rp, RC_LTSSM, 4) & 0x3f);
+	free(msimap, M_DEVBUF);
+	pmap_unmapdev((void *)trunc_page(pad), PAGE_SIZE);
+	pmap_unmapdev((void *)lane, 0x4000);
+	pmap_unmapdev((void *)port, 0x4000);
+	return (error);
+}
+
 /* hw.apple_n1.boot=0: attach only (bring-up). */
 static int n1_boot = 1;
 TUNABLE_INT("hw.apple_n1.boot", &n1_boot);
@@ -365,8 +553,21 @@ n1_boot_task(void *arg, int pending __unused)
 {
 	struct n1_softc *sc = arg;
 
-	if (n1_boot)
-		n1_rom_boot(sc);
+	if (n1_boot && n1_rom_boot(sc) == 0 && n1_port_cycle(sc) == 0) {
+		device_t *kids;
+		int i, n;
+
+		BUS_RESCAN(device_get_parent(sc->dev));
+		if (device_get_children(device_get_parent(sc->dev), &kids,
+		    &n) == 0) {
+			for (i = 0; i < n; i++)
+				device_printf(sc->dev, "function %d: %04x:%04x\n",
+				    pci_get_function(kids[i]),
+				    pci_get_vendor(kids[i]),
+				    pci_get_device(kids[i]));
+			free(kids, M_TEMP);
+		}
+	}
 }
 
 static void
