@@ -294,6 +294,28 @@ apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid, uint64_t iova,
 	return (0);
 }
 
+/* XXX bring-up: walk the shared table; returns the PA an IOVA maps to, or ~0 */
+vm_paddr_t
+apple_dart_translate(uint64_t iova)
+{
+	uint64_t *t, pte;
+	int shift;
+
+	if (apple_dart_l1 == NULL)
+		return (~(vm_paddr_t)0);
+	t = apple_dart_l1;
+	for (shift = 36; shift >= 14; shift -= 11) {
+		pte = t[(iova >> shift) & 0x7ff];
+		if ((pte & DART_PTE_VALID) == 0)
+			return (~(vm_paddr_t)0);
+		if (shift == 14)
+			return (((pte & 0x3ffffffc00ul) << 4) |
+			    (iova & (DART_PAGE_SIZE - 1)));
+		t = (uint64_t *)PHYS_TO_DMAP((pte & 0x3ffffffc00ul) << 4);
+	}
+	return (~(vm_paddr_t)0);
+}
+
 /* Map all RAM at IOVA == PA on every stream in dev's "iommus" (<&dart sid>). */
 int
 apple_dart_identity(device_t dev)

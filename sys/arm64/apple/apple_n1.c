@@ -256,6 +256,21 @@ n1_rom_boot(struct n1_softc *sc)
 		firmware_put(tkt, FIRMWARE_UNLOAD);
 	}
 	cpu_dcache_wb_range(sc->fw, roundup2(fw->datasize, N1_PAGE));
+	/* XXX bring-up: DART table vs. the buffer's physical pages */
+	{
+		size_t off, bad = 0;
+
+		for (off = 0; off < fw->datasize; off += N1_PAGE)
+			if (apple_dart_translate(sc->fw_iova + off) !=
+			    pmap_kextract((vm_offset_t)sc->fw + off) && bad++ < 4)
+				device_printf(sc->dev, "DART: iova %#lx -> %#lx, "
+				    "want %#lx\n", sc->fw_iova + off,
+				    apple_dart_translate(sc->fw_iova + off),
+				    pmap_kextract((vm_offset_t)sc->fw + off));
+		device_printf(sc->dev, "DART walk: %zu bad pages, fw pa %#lx, "
+		    "pte[0] l1 %p\n", bad, pmap_kextract((vm_offset_t)sc->fw),
+		    sc->fw);
+	}
 	cpu_dcache_wb_range(sc->desc, N1_PAGE);
 	cpu_dcache_wbinv_range(sc->mbox, N1_PAGE);
 	device_printf(sc->dev, "ROM boot: %s, %zu bytes at IOVA %#lx\n",
