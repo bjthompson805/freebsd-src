@@ -329,6 +329,19 @@ n1_rom_boot(struct n1_softc *sc)
 		pause("n1rom", hz / 50);
 	for (; i < 2000 && (stage = N1_RD4(sc, N1_STAGE)) == N1_STAGE_ROM; i++)
 		pause("n1rom", hz / 50);
+	/* XXX bring-up: is a response "next image, please"? Ring again. */
+	for (int r = 0; r < 3 && N1_RD4(sc, N1_STAGE) == N1_STAGE_ROM; r++) {
+		uint32_t r2;
+
+		N1_WR4(sc, N1_ROM_RESPONSE, 0);
+		dsb(sy);
+		N1_WR4(sc, N1_ROM_DOORBELL, 1);
+		for (i = 0; i < 500 &&
+		    (r2 = N1_RD4(sc, N1_ROM_RESPONSE)) == 0; i++)
+			pause("n1rom", hz / 50);
+		device_printf(sc->dev, "doorbell %d: response %#x stage %#x "
+		    "(%d ms)\n", r + 2, r2, N1_RD4(sc, N1_STAGE), i * 20);
+	}
 	stage = N1_RD4(sc, N1_STAGE);
 	cpu_dcache_inv_range(sc->mbox, N1_PAGE);
 	device_printf(sc->dev, "ROM result: response %#x stage %#x mailbox %#x "
