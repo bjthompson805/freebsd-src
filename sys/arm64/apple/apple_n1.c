@@ -432,7 +432,7 @@ n1_port_cycle(struct n1_softc *sc)
 	};
 	device_t rp = device_get_parent(device_get_parent(sc->dev));
 	vm_offset_t port, lane, pad;
-	uint32_t *msimap, msicfg, msiaddr, padv, id;
+	uint32_t *msimap, msicfg, msiaddr, padv, id, rpcfg[16];
 	int error, i, pm;
 
 	port = (vm_offset_t)pmap_mapdev(sc->board->port, 0x4000);
@@ -442,7 +442,9 @@ n1_port_cycle(struct n1_softc *sc)
 	msimap = malloc(256 * sizeof(*msimap), M_DEVBUF, M_WAITOK);
 	error = ETIMEDOUT;
 
-	pci_save_state(rp);
+	/* pci_restore_state() leaves a bridge's windows out: keep the header */
+	for (i = 1; i < 16; i++)
+		rpcfg[i] = pci_read_config(rp, 4 * i, 4);
 	pci_save_state(sc->dev);
 	for (i = 0; i < 256; i++)
 		msimap[i] = *(volatile uint32_t *)(port + PORT_MSIMAP + 4 * i);
@@ -520,7 +522,9 @@ n1_port_cycle(struct n1_softc *sc)
 	if (!n1_wait_ltssm(rp, LTSSM_L0, 2000))
 		goto out;
 	pause("n1l0", hz / 10 + 1);
-	pci_restore_state(rp);
+	for (i = 15; i > 0; i--)
+		if (i != 2 && i != 3)
+			pci_write_config(rp, 4 * i, rpcfg[i], 4);
 	id = pci_read_config(sc->dev, PCIR_DEVVENDOR, 4);
 	pci_restore_state(sc->dev);
 	device_printf(sc->dev, "port cycle: link up, function 0 now %#x, "
@@ -557,6 +561,11 @@ n1_boot_task(void *arg, int pending __unused)
 		device_t *kids;
 		int i, n;
 
+		for (i = 0; i < 5; i++) {	/* XXX bring-up */
+			pause("n1st", hz);
+			device_printf(sc->dev, "after cycle +%ds: stage %#x\n",
+			    i + 1, N1_RD4(sc, N1_STAGE));
+		}
 		BUS_RESCAN(device_get_parent(sc->dev));
 		if (device_get_children(device_get_parent(sc->dev), &kids,
 		    &n) == 0) {
