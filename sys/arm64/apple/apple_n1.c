@@ -702,7 +702,7 @@ static int
 n1_start_ipc(struct n1_softc *sc)
 {
 	uint32_t off, len, n, i, need, end, stage;
-	const uint8_t *seed;
+	const uint8_t *seed, *written;
 	int error;
 
 	if ((error = n1_functions(sc)) != 0)
@@ -723,20 +723,6 @@ n1_start_ipc(struct n1_softc *sc)
 		end = le32dec(seed + 0x34 + 16 * i) + le32dec(seed + 0x38 + 16 * i);
 		need = MAX(need, end);
 	}
-	/* XXX bring-up: what the config mailboxes hold at stage 1 */
-	for (i = 0xf80; i < 0x1000; i += 0x20)
-		device_printf(sc->dev, "cfg %#x: %08x %08x %08x %08x %08x %08x "
-		    "%08x %08x\n", i, pci_read_config(sc->dev, i, 4),
-		    pci_read_config(sc->dev, i + 4, 4),
-		    pci_read_config(sc->dev, i + 8, 4),
-		    pci_read_config(sc->dev, i + 12, 4),
-		    pci_read_config(sc->dev, i + 16, 4),
-		    pci_read_config(sc->dev, i + 20, 4),
-		    pci_read_config(sc->dev, i + 24, 4),
-		    pci_read_config(sc->dev, i + 28, 4));
-	/* macOS (CentauriControl ClearConfigSpaceMailboxes): zero 0xf80-0xffc */
-	for (i = 0xf80; i < 0x1000; i += 4)
-		pci_write_config(sc->dev, i, 0, 4);
 	sc->secondary = n1_dma_alloc(sc, need, &sc->secondary_iova);
 	if (sc->secondary == NULL)
 		return (ENOMEM);
@@ -746,6 +732,7 @@ n1_start_ipc(struct n1_softc *sc)
 	pci_write_config(sc->dev, 0xf88, (uint32_t)sc->secondary_iova, 4);
 	pci_write_config(sc->dev, 0xf8c, (uint32_t)(sc->secondary_iova >> 32), 4);
 	pci_write_config(sc->dev, 0xf90, need, 4);
+
 	device_printf(sc->dev, "secondary memory: seed %u, %u bytes\n", len,
 	    need);
 
@@ -802,8 +789,19 @@ n1_start_ipc(struct n1_softc *sc)
 	device_printf(sc->dev, "exec-stage MSI %#x after ~%d ms\n",
 	    le32dec(sc->mbox), i * 10);
 	n1_dart_errors(sc);
-	if (le32dec(sc->mbox) == 0)
+	if (le32dec(sc->mbox) == 0) {
+		/* Check for device writes without accessing the endpoint. */
+		cpu_dcache_inv_range(sc->secondary, roundup2(need, N1_PAGE));
+		written = memcchr((const uint8_t *)sc->secondary + len, 0,
+		    need - len);
+		if (written != NULL)
+			device_printf(sc->dev, "secondary memory populated "
+			    "at offset %#tx\n",
+			    written - (const uint8_t *)sc->secondary);
+		else
+			device_printf(sc->dev, "secondary memory unchanged beyond seed\n");
 		return (ETIMEDOUT);
+	}
 	stage = N1_RD4(sc, N1_STAGE);
 	device_printf(sc->dev, "secondary boot: stage %#x\n", stage);
 	n1_dart_errors(sc);
