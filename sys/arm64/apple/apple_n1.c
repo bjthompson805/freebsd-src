@@ -1021,6 +1021,38 @@ n1_spmi_dump(struct n1_softc *sc, const char *when)
 }
 
 /*
+ * Per-function memswap: after the control handshake each function gets its
+ * own copy of its segment of the secondary ftab (mswc control, mswb beta,
+ * msww alpha) through its config 0xf88/0xf8c/0xf90. Without msww alpha
+ * stays at exec stage 0 (order and registers from aurora-silicon's
+ * centauri_ipc.c memswap_handoff).
+ */
+static int
+n1_memswap(struct n1_softc *sc, int fn, const char tag[4])
+{
+	uint32_t off, len;
+	uint64_t iova;
+	void *buf;
+	int error;
+
+	if ((error = n1_ftab_entry(sc->secondary, sc->secondary_size, tag,
+	    &off, &len)) != 0)
+		return (error);
+	if ((buf = n1_dma_alloc(sc, len, &iova)) == NULL)
+		return (ENOMEM);
+	cpu_dcache_inv_range(sc->secondary, roundup2(sc->secondary_size,
+	    N1_PAGE));
+	memcpy(buf, (uint8_t *)sc->secondary + off, len);
+	cpu_dcache_wb_range(buf, roundup2(len, N1_PAGE));
+	pci_write_config(sc->fn[fn], 0xf88, (uint32_t)iova, 4);
+	pci_write_config(sc->fn[fn], 0xf8c, (uint32_t)(iova >> 32), 4);
+	pci_write_config(sc->fn[fn], 0xf90, len, 4);
+	N1_DPRINTF(sc, "memswap fn%d: %.4s %u bytes at %#lx\n", fn, tag, len,
+	    iova);
+	return (0);
+}
+
+/*
  * Stage 1 → 2: hand the control function the secondary ftab ("2ftb" in the
  * image, seed of the memory it lays out) through config 0xf88/0xf8c/0xf90,
  * set up the control context, point the boot registers at the image again
@@ -1353,6 +1385,12 @@ n1_start_ipc(struct n1_softc *sc)
 	if (error != 0)
 		return (error);
 	N1_AER(sc, "handshake");
+	if ((error = n1_memswap(sc, 0, "mswc")) != 0 ||
+	    (error = n1_memswap(sc, 2, "mswb")) != 0 ||
+	    (error = n1_memswap(sc, 1, "msww")) != 0) {
+		device_printf(sc->dev, "memswap: %d\n", error);
+		return (error);
+	}
 	/* XXX bring-up: function DevCtl and LinkCtl as macOS leaves them */
 	for (i = 0; i < 3; i++) {
 		int c;
