@@ -1340,6 +1340,9 @@ n1_rx_scan(struct n1_softc *sc)
 					printf("n1log: %.*s\n", (int)(k - j),
 					    b + j);
 			}
+			for (j = len > 0x200 ? len - 0x200 : 0; j < len; j += 32)
+				device_printf(sc->dev, "rx %d +%#06x: %32D\n",
+				    sc->rx_seen, j, b + j, " ");
 		}
 		memset(e, 0, 16);
 		e = sc->ring2 + 16 * (sc->rx_posted % 16);
@@ -1465,6 +1468,19 @@ n1_ctrl_rings(struct n1_softc *sc)
 	}
 	device_printf(sc->dev, "wifi function stage %#x after %d ms\n",
 	    bus_read_4(sc->fnbar[1], 0x8), i * 10);
+	for (i = 1; i < 3; i++) {	/* XXX bring-up: does the BAR answer? */
+		uint32_t v, before, after;
+
+		pci_write_config(sc->fn[i], 0x7a, 0xf, 2);
+		before = pci_read_config(sc->fn[i], 0x7a, 2);
+		v = bus_read_4(sc->fnbar[i], 0x8);
+		after = pci_read_config(sc->fn[i], 0x7a, 2);
+		device_printf(sc->dev, "fn%d BAR read %#x: devsts %#x -> %#x, "
+		    "cmd %#x bar0 %#x rman %#jx-%#jx\n", i, v, before, after,
+		    pci_read_config(sc->fn[i], 4, 2),
+		    pci_read_config(sc->fn[i], 0x10, 4),
+		    rman_get_start(sc->fnbar[i]), rman_get_end(sc->fnbar[i]));
+	}
 	for (i = 1; i < 3; i++)	/* XXX bring-up */
 		device_printf(sc->dev, "fn%d %#x bar %#jx: %08x %08x %08x %08x "
 		    "%08x %08x %08x %08x\n", i, pci_get_devid(sc->fn[i]),
@@ -1484,7 +1500,7 @@ n1_ctrl_rings(struct n1_softc *sc)
  * aperture (base, then a 32-bit size running to the top of its IOVA window).
  * Alpha reaches stage 2 only after beta's handshake.
  */
-#define	N1_APERTURE_SIZE	0x10000000u
+#define	N1_APERTURE_SIZE	0x40000000u
 
 static const struct n1_fn_regs {
 	const char	*name;
@@ -1515,7 +1531,7 @@ n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 	le32enc(c->buf + 0x68, 2);
 	le32enc(c->buf + 0x6c, 2);
 	cpu_dcache_wb_range(c->buf, PAGE_SIZE);
-	ap = sc->iova_next;
+	ap = N1_IOVA_BASE;	/* the whole DMA window, as macOS */
 	n1_rx_scan(sc);
 	device_printf(sc->dev, "%s: stage %#x after %d ms, context %#lx\n",
 	    r->name, bus_read_4(bar, r->stage), i * 10, c->buf_iova);
