@@ -1800,6 +1800,47 @@ n1_bt_tx(struct n1_softc *sc, int r, struct mbuf *m)
 	return (0);
 }
 
+/*
+ * The controller refuses Create Connection (0x0405) with Command Disallowed;
+ * macOS connects with vendor 0xff7b instead, whose parameters are 0x0405's
+ * plus three bytes it sends as zero.  Rewrite the command on the way out and
+ * the opcode in its Command Status on the way in, so ng_hci sees 0x0405.
+ */
+#define	N1_BT_CREATE_CON	0x0405
+#define	N1_BT_VSC_CREATE_CON	0xff7b
+
+static struct mbuf *
+n1_bt_fixcmd(struct mbuf *m)
+{
+	struct mbuf *n;
+	uint8_t *p;
+
+	if (m->m_pkthdr.len != 3 + 13)
+		return (m);
+	m = m_pullup(m, 3);
+	if (m == NULL || le16dec(mtod(m, uint8_t *)) != N1_BT_CREATE_CON)
+		return (m);
+	n = m_get2(3 + 16, M_NOWAIT, MT_DATA, M_PKTHDR);
+	if (n == NULL)
+		return (m);
+	p = mtod(n, uint8_t *);
+	le16enc(p, N1_BT_VSC_CREATE_CON);
+	p[2] = 16;
+	m_copydata(m, 3, 13, p + 3);
+	memset(p + 16, 0, 3);
+	n->m_len = n->m_pkthdr.len = 3 + 16;
+	m_freem(m);
+	return (n);
+}
+
+static void
+n1_bt_fixevent(uint8_t *p, uint32_t len)
+{
+	/* Command Status: event 0x0f, length 4, status, ncmd, opcode */
+	if (len >= 6 && p[0] == 0x0f && le16dec(p + 4) == N1_BT_VSC_CREATE_CON)
+		le16enc(p + 4, N1_BT_CREATE_CON);
+}
+
 /* Take the filled receive buffers off a ring, H4 framed, and repost them. */
 static void
 n1_bt_rx(struct n1_softc *sc, int r, struct mbufq *q)
@@ -1823,6 +1864,8 @@ n1_bt_rx(struct n1_softc *sc, int r, struct mbufq *q)
 		if (m != NULL) {
 			*mtod(m, uint8_t *) = d->h4;
 			memcpy(mtod(m, uint8_t *) + 1, e + 16, len);
+			if (d->h4 == NG_HCI_EVENT_PKT)
+				n1_bt_fixevent(mtod(m, uint8_t *) + 1, len);
 			m->m_len = m->m_pkthdr.len = len + 1;
 			if (mbufq_enqueue(q, m) != 0)
 				m_freem(m);
@@ -1970,6 +2013,8 @@ n1bt_ng_rcvdata(hook_p hook, item_p item)
 		return (EINVAL);
 	}
 	m_adj(m, 1);
+	if (r == BT_HCI_TX && (m = n1_bt_fixcmd(m)) == NULL)
+		return (ENOBUFS);
 	mtx_lock(&sc->bt_mtx);
 	error = n1_bt_tx(sc, r, m);
 	mtx_unlock(&sc->bt_mtx);
@@ -2104,6 +2149,9 @@ n1_bt_start(struct n1_softc *sc)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
 	    "bt_cmd", CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
 	    n1_bt_cmd_sysctl, "A", "send a raw HCI command (hex)");
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(sc->dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
+	    "bt_debug", CTLFLAG_RW, &n1_bt_debug, 0, "print Bluetooth rx/tx");
 	callout_reset(&sc->bt_callout, hz / 100 + 1, n1_bt_tick, sc);
 	return (0);
 }
