@@ -826,6 +826,61 @@ n1_enable_ptm(struct n1_softc *sc)
 	pmap_unmapdev((void *)common, PAGE_SIZE);
 }
 
+/* XXX bring-up: PCIe/AER state of the root port (and fn0 when safe) */
+static void
+n1_pcie_dump(struct n1_softc *sc, const char *when, int ep)
+{
+	device_t rp = device_get_parent(device_get_parent(sc->dev));
+	device_t d[2] = { rp, sc->dev };
+	int cap, i;
+
+	for (i = 0; i < (ep ? 2 : 1); i++) {
+		if (pci_find_cap(d[i], PCIY_EXPRESS, &cap) == 0)
+			device_printf(sc->dev, "%s %s: devcap %08x devctl %04x "
+			    "devsts %04x devcap2 %08x devctl2 %04x\n", when,
+			    i ? "fn0" : "rp", pci_read_config(d[i], cap + 4, 4),
+			    pci_read_config(d[i], cap + 8, 2),
+			    pci_read_config(d[i], cap + 10, 2),
+			    pci_read_config(d[i], cap + 0x24, 4),
+			    pci_read_config(d[i], cap + 0x28, 2));
+		if (pci_find_extcap(d[i], PCIZ_AER, &cap) == 0)
+			device_printf(sc->dev, "%s %s AER: ue %08x mask %08x sev "
+			    "%08x ce %08x hdr %08x %08x %08x %08x\n", when,
+			    i ? "fn0" : "rp", pci_read_config(d[i], cap + 4, 4),
+			    pci_read_config(d[i], cap + 8, 4),
+			    pci_read_config(d[i], cap + 12, 4),
+			    pci_read_config(d[i], cap + 16, 4),
+			    pci_read_config(d[i], cap + 28, 4),
+			    pci_read_config(d[i], cap + 32, 4),
+			    pci_read_config(d[i], cap + 36, 4),
+			    pci_read_config(d[i], cap + 40, 4));
+	}
+	if (pci_find_cap(rp, PCIY_EXPRESS, &cap) == 0)
+		device_printf(sc->dev, "%s rp: secsts %04x rootsts %08x\n", when,
+		    pci_read_config(rp, PCIR_SECSTAT_1, 2),
+		    pci_read_config(rp, cap + 0x20, 4));
+}
+
+/* XXX bring-up: aop-spmi0 controller state (the N1 is spmi-wifibt at 0x0e) */
+static void
+n1_spmi_dump(struct n1_softc *sc, const char *when)
+{
+	static const uint64_t base[] = { 0x390914000, 0x390904000, 0x390900000 };
+	vm_offset_t va;
+	int i, j;
+
+	for (i = 0; i < nitems(base); i++) {
+		va = (vm_offset_t)pmap_mapdev(base[i], PAGE_SIZE);
+		for (j = 0; j < 0x40; j += 0x10)
+			device_printf(sc->dev, "spmi %s %#lx+%#x: %08x %08x %08x %08x\n",
+			    when, base[i], j, *(volatile uint32_t *)(va + j),
+			    *(volatile uint32_t *)(va + j + 4),
+			    *(volatile uint32_t *)(va + j + 8),
+			    *(volatile uint32_t *)(va + j + 12));
+		pmap_unmapdev((void *)va, PAGE_SIZE);
+	}
+}
+
 /*
  * Stage 1 → 2: hand the control function the secondary ftab ("2ftb" in the
  * image, seed of the memory it lays out) through config 0xf88/0xf8c/0xf90,
@@ -835,6 +890,16 @@ n1_enable_ptm(struct n1_softc *sc)
  */
 static const uint32_t n1_img_holes[][2] = {
 	/* HOLES */
+	{ 0, 0 },
+};
+/* XXX bring-up: unmapped holes in the secondary (memswap) buffer */
+#define	N1_MSWB_PROT	0ul
+#define	N1_SEC_IOVA	0ul
+#define	N1_NO_RO	0
+#define	N1_CRASH	0
+#define	N1_AOP_RUN	0
+static const uint32_t n1_sec_holes[][2] = {
+	/* SECHOLES */
 	{ 0, 0 },
 };
 
@@ -864,12 +929,48 @@ n1_start_ipc(struct n1_softc *sc)
 		end = le32dec(seed + 0x34 + 16 * i) + le32dec(seed + 0x38 + 16 * i);
 		need = MAX(need, end);
 	}
-	sc->secondary = n1_dma_alloc(sc, need, &sc->secondary_iova);
+	{	/* XXX bring-up: choose the memswap IOVA */
+		uint64_t save = sc->iova_next;
+
+		if (N1_SEC_IOVA != 0)
+			sc->iova_next = N1_SEC_IOVA;
+		sc->secondary = n1_dma_alloc(sc, need, &sc->secondary_iova);
+		if (N1_SEC_IOVA != 0)
+			sc->iova_next = save;
+	}
 	if (sc->secondary == NULL)
 		return (ENOMEM);
 	sc->secondary_size = need;
 	memcpy(sc->secondary, seed, len);
+	/* XXX bring-up: poison mswb to detect device writes */
+	memset((uint8_t *)sc->secondary + 0x200300, 0xa5, 0x180000);
 	cpu_dcache_wb_range(sc->secondary, roundup2(need, N1_PAGE));
+	if (n1_sec_holes[0][1] != 0) {
+		uint64_t base = sc->iova_next;
+		uint32_t pg;
+		int h, hole;
+
+		for (pg = 0; pg < roundup2(need, N1_PAGE); pg += N1_PAGE) {
+			for (h = 0, hole = 0; n1_sec_holes[h][1] != 0; h++)
+				if (pg >= n1_sec_holes[h][0] && pg < n1_sec_holes[h][1])
+					hole = 1;
+			if (!hole)
+				apple_dart_map_stream(sc->dev, sc->dart, sc->sid,
+				    base + pg, pmap_kextract((vm_offset_t)
+				    sc->secondary + pg), N1_PAGE);
+		}
+		sc->iova_next = base + roundup2(need, N1_PAGE);
+		sc->secondary_iova = base;
+		for (h = 0; n1_sec_holes[h][1] != 0; h++)
+			device_printf(sc->dev, "secondary probe: memswap at %#lx, "
+			    "hole %#x-%#x\n", base, n1_sec_holes[h][0],
+			    n1_sec_holes[h][1]);
+	}
+	/* XXX bring-up: DART protection bits on the mswb page (7 no-write, 8 no-read) */
+	if (N1_MSWB_PROT != 0)
+		device_printf(sc->dev, "mswb page prot %#lx: %d\n",
+		    (u_long)N1_MSWB_PROT, apple_dart_pte_bits(sc->dev, sc->dart,
+		    sc->sid, sc->secondary_iova + 0x200000, N1_MSWB_PROT));
 	pci_write_config(sc->dev, 0xf88, (uint32_t)sc->secondary_iova, 4);
 	pci_write_config(sc->dev, 0xf8c, (uint32_t)(sc->secondary_iova >> 32), 4);
 	pci_write_config(sc->dev, 0xf90, need, 4);
@@ -911,6 +1012,31 @@ n1_start_ipc(struct n1_softc *sc)
 			device_printf(sc->dev, "secondary probe: image at %#lx, "
 			    "hole %#x-%#x\n", base, n1_img_holes[h][0],
 			    n1_img_holes[h][1]);
+	}
+	{	/* XXX bring-up: relaxed ordering off on fn0 and the root port */
+		device_t rp = device_get_parent(device_get_parent(sc->dev));
+		int c;
+
+		if (N1_NO_RO && pci_find_cap(sc->dev, PCIY_EXPRESS, &c) == 0)
+			pci_write_config(sc->dev, c + 8,
+			    pci_read_config(sc->dev, c + 8, 2) & ~0x10, 2);
+		if (N1_NO_RO && pci_find_cap(rp, PCIY_EXPRESS, &c) == 0)
+			pci_write_config(rp, c + 8,
+			    pci_read_config(rp, c + 8, 2) & ~0x10, 2);
+	}
+	n1_pcie_dump(sc, "before", 1);
+	n1_spmi_dump(sc, "before");
+	if (N1_AOP_RUN) {	/* XXX bring-up: start the (iBoot-preloaded) AOP */
+		vm_offset_t a = (vm_offset_t)pmap_mapdev(0x390600000, PAGE_SIZE);
+
+		device_printf(sc->dev, "AOP cpu_control %#x -> RUN\n",
+		    *(volatile uint32_t *)(a + 0x44));
+		*(volatile uint32_t *)(a + 0x44) |= 0x10;
+		DELAY(500000);
+		device_printf(sc->dev, "AOP cpu_control %#x mbox %#x\n",
+		    *(volatile uint32_t *)(a + 0x44),
+		    *(volatile uint32_t *)(a + 0x48));
+		pmap_unmapdev((void *)a, PAGE_SIZE);
 	}
 	N1_WR4(sc, N1_ROM_DESC_LO, (uint32_t)sc->desc_iova);
 	N1_WR4(sc, N1_ROM_DESC_HI, (uint32_t)(sc->desc_iova >> 32));
@@ -973,8 +1099,40 @@ n1_start_ipc(struct n1_softc *sc)
 	if (le32dec(sc->mbox) == 0) {
 		/* Check for device writes without accessing the endpoint. */
 		cpu_dcache_inv_range(sc->secondary, roundup2(need, N1_PAGE));
+		written = memcchr((const uint8_t *)sc->secondary + 0x200300, 0xa5,
+		    0x180000);
+		n1_pcie_dump(sc, "after", 0);
+		n1_spmi_dump(sc, "after");
+		if (N1_CRASH) {	/* XXX bring-up: TriggerChipCrash, then look for a crashlog */
+			const uint8_t *b = sc->secondary;
+			uint32_t o, k;
+
+			device_printf(sc->dev, "TriggerChipCrash (config 0xf84 = 1)\n");
+			DELAY(100000);
+			pci_write_config(sc->dev, 0xf84, 1, 4);
+			device_printf(sc->dev, "crash written, waiting\n");
+			DELAY(3000000);
+			cpu_dcache_inv_range(sc->secondary, roundup2(need, N1_PAGE));
+			for (o = len, k = 0; o < need && k < 48; o += 64) {
+				uint32_t j, nz = 0;
+
+				for (j = 0; j < 64; j++)
+					if (b[o + j] != 0 && !(o + j >= 0x200300 &&
+					    o + j < 0x380300 && b[o + j] == 0xa5))
+						nz = 1;
+				if (!nz)
+					continue;
+				k++;
+				device_printf(sc->dev, "sec %#x: %32D\n", o, b + o, "");
+				device_printf(sc->dev, "sec %#x: %32D\n", o + 32, b + o + 32, "");
+			}
+			device_printf(sc->dev, "crash scan: %u nonzero lines\n", k);
+		}
+		device_printf(sc->dev, "mswb poison %s (first %#tx)\n",
+		    written ? "CHANGED" : "intact", written ? written -
+		    (const uint8_t *)sc->secondary : 0);
 		written = memcchr((const uint8_t *)sc->secondary + len, 0,
-		    need - len);
+		    0x200300 - len);
 		if (written != NULL)
 			device_printf(sc->dev, "secondary memory populated "
 			    "at offset %#tx\n",

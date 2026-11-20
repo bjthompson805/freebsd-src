@@ -347,6 +347,32 @@ apple_dart_translate(uint64_t iova)
 	return (~(vm_paddr_t)0);
 }
 
+/* XXX bring-up: OR bits into the leaf PTE of an IOVA, then flush the stream */
+int
+apple_dart_pte_bits(device_t dev, phandle_t dart, u_int sid, uint64_t iova,
+    uint64_t bits)
+{
+	uint64_t *t, pte;
+	int shift;
+
+	t = apple_dart_priv_l1 != NULL ? apple_dart_priv_l1 : apple_dart_l1;
+	if (t == NULL)
+		return (ENXIO);
+	for (shift = 36; shift >= 14; shift -= 11) {
+		pte = t[(iova >> shift) & 0x7ff];
+		if ((pte & DART_PTE_VALID) == 0)
+			return (ENOENT);
+		if (shift == 14) {
+			t[(iova >> shift) & 0x7ff] = pte | bits;
+			cpu_dcache_wb_range(&t[(iova >> shift) & 0x7ff], 8);
+			apple_dart_flush_sid(dev, dart, sid);
+			return (0);
+		}
+		t = (uint64_t *)PHYS_TO_DMAP((pte & 0x3ffffffc00ul) << 4);
+	}
+	return (ENOENT);
+}
+
 /* Map all RAM at IOVA == PA on every stream in dev's "iommus" (<&dart sid>). */
 int
 apple_dart_identity(device_t dev)
