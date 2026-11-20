@@ -923,6 +923,8 @@ static const uint32_t n1_sec_holes[][2] = {
 	{ 0, 0 },
 };
 
+static int n1_ctrl_rings(struct n1_softc *);
+
 static int
 n1_start_ipc(struct n1_softc *sc)
 {
@@ -1210,7 +1212,77 @@ n1_start_ipc(struct n1_softc *sc)
 		return (EIO);
 	error = n1_handshake(sc->bar, &sc->control, 0x8050, 0x8054, 0x907c);
 	device_printf(sc->dev, "control IPC handshake: %d\n", error);
-	return (error);
+	if (error != 0)
+		return (error);
+	return (n1_ctrl_rings(sc));
+}
+
+/*
+ * Control transfer ring 0 carries 0x80-byte messages from the message area;
+ * an entry is u32 (length << 8 | 1), u64 message address. The tail goes to
+ * the tr tail array and to doorbell 0x9000 + 4 * ring; the firmware moves the
+ * tr head when it has taken the message.
+ */
+static int
+n1_ctrl_send(struct n1_softc *sc, const void *msg, uint32_t len)
+{
+	struct n1_ctx *c = &sc->control;
+	uint16_t slot = c->head % 16;
+	uint8_t *ent = c->buf + c->mtr + 16 * slot;
+	int i;
+
+	memset(c->msgs + 0x80 * slot, 0, 0x80);
+	memcpy(c->msgs + 0x80 * slot, msg, len);
+	le32enc(ent, len << 8 | 1);
+	le64enc(ent + 4, c->msgs_iova + 0x80 * slot);
+	le32enc(ent + 12, 0);
+	c->head++;
+	le16enc(c->buf + c->index[3], c->head);
+	cpu_dcache_wb_range(c->buf, 32768);
+	cpu_dcache_wb_range(c->msgs, 16384);
+	N1_WR4(sc, 0x9000, c->head);
+	for (i = 0; i < 100; i++) {
+		cpu_dcache_inv_range(c->buf, PAGE_SIZE);
+		if (le16dec(c->buf + c->index[1]) == c->head)
+			return (0);
+		pause("n1msg", hz / 100 + 1);
+	}
+	return (ETIMEDOUT);
+}
+
+/* Rings 2, 4 and 3 as macOS creates them: 16 entries of 0x40 bytes */
+static int
+n1_ctrl_rings(struct n1_softc *sc)
+{
+	static const struct { uint16_t id, flags; } rings[] = {
+		{ 2, 0 }, { 4, 0x4010 }, { 3, 0x4010 },
+	};
+	uint8_t msg[0x34];
+	uint64_t iova;
+	int error, i;
+
+	for (i = 0; i < nitems(rings); i++) {
+		if (n1_dma_alloc(sc, N1_PAGE, &iova) == NULL)
+			return (ENOMEM);
+		memset(msg, 0, sizeof(msg));
+		le16enc(msg, 1);
+		le16enc(msg + 2, rings[i].flags);
+		le16enc(msg + 4, rings[i].id);
+		le16enc(msg + 6, rings[i].id);
+		le64enc(msg + 8, iova);
+		le64enc(msg + 0x10, ~0ul);
+		le16enc(msg + 0x18, 16);
+		le16enc(msg + 0x1a, 0xffff);
+		le16enc(msg + 0x1c, rings[i].id);
+		le16enc(msg + 0x1e, 0x40);
+		error = n1_ctrl_send(sc, msg, sizeof(msg));
+		device_printf(sc->dev, "create ring %u: %d (tr0 head %u)\n",
+		    rings[i].id, error, le16dec(sc->control.buf +
+		    sc->control.index[1]));
+		if (error != 0)
+			return (error);
+	}
+	return (0);
 }
 
 /* hw.apple_n1.boot=0: attach only (bring-up). */
