@@ -33,6 +33,7 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/rman.h>
+#include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 
 #include <vm/vm.h>
@@ -1791,6 +1792,9 @@ n1_bt_tx(struct n1_softc *sc, int r, struct mbuf *m)
 	le64enc(e + 4, ~0ul);
 	le32enc(e + 12, sc->bt[r].tail % d->n);
 	m_copydata(m, 0, len, e + 16);
+	if (n1_bt_debug)
+		device_printf(sc->dev, "bt tx %u slot %u head %u: %*D\n", d->id,
+		    sc->bt[r].tail % d->n, head, MIN(len, 32), e + 16, " ");
 	sc->bt[r].tail++;
 	n1_bt_doorbell(sc, r);
 	return (0);
@@ -1970,7 +1974,8 @@ n1bt_ng_rcvdata(hook_p hook, item_p item)
 	error = n1_bt_tx(sc, r, m);
 	mtx_unlock(&sc->bt_mtx);
 	if (error != 0)
-		device_printf(sc->dev, "bt tx ring %u full\n", n1_bt_rings[r].id);
+		device_printf(sc->dev, "bt tx ring %u: %d\n", n1_bt_rings[r].id,
+		    error);
 	m_freem(m);
 	return (error);
 }
@@ -2001,6 +2006,51 @@ static struct ng_type n1bt_typestruct = {
 	.shutdown =	n1bt_ng_shutdown,
 };
 NETGRAPH_INIT(n1bt, &n1bt_typestruct);
+
+/*
+ * XXX bring-up: dev.apple_n1.0.bt_cmd="03 0c 00" sends one raw HCI command
+ * (opcode, length, parameters, in hex) next to ng_hci, to replay the macOS
+ * init. The events go up the hook like any other.
+ */
+static int
+n1_bt_cmd_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct n1_softc *sc = arg1;
+	char buf[800], *p, *end;
+	struct mbuf *m;
+	u_long v;
+	int error, i, len = 0;
+	uint8_t pkt[3 + 255];
+
+	buf[0] = '\0';
+	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	for (p = buf; *p != '\0' && len < sizeof(pkt); p = end) {
+		while (*p == ' ')
+			p++;
+		if (*p == '\0')
+			break;
+		v = strtoul(p, &end, 16);
+		if (end == p || v > 0xff)
+			return (EINVAL);
+		pkt[len++] = v;
+	}
+	if (len < 3 || pkt[2] != len - 3)
+		return (EINVAL);
+	m = m_get2(len, M_WAITOK, MT_DATA, M_PKTHDR);
+	m_copyback(m, 0, len, pkt);
+	for (i = 0; i < 50; i++) {
+		mtx_lock(&sc->bt_mtx);
+		error = n1_bt_tx(sc, BT_HCI_TX, m);
+		mtx_unlock(&sc->bt_mtx);
+		if (error != ENOBUFS)
+			break;
+		pause("n1btc", hz / 100 + 1);
+	}
+	m_freem(m);
+	return (error);
+}
 
 static int
 n1_bt_start(struct n1_softc *sc)
@@ -2050,6 +2100,10 @@ n1_bt_start(struct n1_softc *sc)
 		return (error);
 	NG_NODE_SET_PRIVATE(sc->bt_node, sc);
 	NG_NODE_FORCE_WRITER(sc->bt_node);
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(sc->dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
+	    "bt_cmd", CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
+	    n1_bt_cmd_sysctl, "A", "send a raw HCI command (hex)");
 	callout_reset(&sc->bt_callout, hz / 100 + 1, n1_bt_tick, sc);
 	return (0);
 }
