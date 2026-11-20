@@ -122,7 +122,7 @@ static const struct n1_board n1_boards[] = {
 #define	PORT_MSICFG		0x124
 #define	PORT_LINKDOWN		0x13c
 #define	PORT_MSIADDR		0x16c
-#define	N1_PORT_MSI		1
+#define	N1_PORT_MSI		0
 #define	PORT_PIPE		0x0a8
 #define	PORT_LINKSTS		0x208
 #define	PORT_APPCLK		0x800
@@ -181,6 +181,18 @@ struct n1_softc {
 	uint8_t			bt_raddr[6];	/* LE static random address */
 	int			bt_vticks;
 	uint32_t		secondary_size;
+	struct n1_wifi {		/* alpha (Wi-Fi) command rings */
+		uint8_t		*win;
+		uint64_t	win_iova;
+		uint16_t	main_head, cmd_head, seq;
+		uint16_t	rx_next[5], rx_head[5];
+		uint16_t	reply_seq, reply_status;
+		uint32_t	reply_cmd, channels, scans, beacons;
+		int		reply_valid;
+		uint8_t		mac[6];
+		uint8_t		bss[32][6];
+		int		nbss;
+	}			w;
 };
 
 static struct n1_softc *n1_sc;	/* the control function, for n1fn */
@@ -851,9 +863,9 @@ n1_route_functions(struct n1_softc *sc)
 static int
 n1_functions(struct n1_softc *sc)
 {
-	/* Control, Alpha, and Beta vector allocations in the macOS registry. */
+	/* 32 vectors to a DMA mailbox each, as aurora's enumerate_functions */
 	static const uint16_t mme[] = {
-		PCIM_MSICTRL_MME_4, PCIM_MSICTRL_MME_16, PCIM_MSICTRL_MME_2,
+		PCIM_MSICTRL_MME_32, PCIM_MSICTRL_MME_32, PCIM_MSICTRL_MME_32,
 	};
 	uint64_t iova;
 	uint16_t command;
@@ -1083,6 +1095,10 @@ static int n1_ctrl_rings(struct n1_softc *);
 	    pci_read_config((sc)->fn[1], 0x7a, 2),				\
 	    pci_read_config((sc)->fn[2], 0x104, 4))
 static int n1_fn_start(struct n1_softc *, int, struct n1_ctx *);
+static int n1w_start(struct n1_softc *);
+static int n1_cchi_init(struct n1_softc *);
+static int n1_alpha_start(struct n1_softc *);
+static int n1w_scan(struct n1_softc *);
 static int n1_bt_start(struct n1_softc *);
 static struct ng_type n1bt_typestruct;
 
@@ -1169,9 +1185,6 @@ n1_start_ipc(struct n1_softc *sc)
 
 	if ((error = n1_ctx_init(sc, &sc->control, 13, 1, 0, 0)) != 0)
 		return (error);
-	le32enc(sc->control.buf + 0x68, 2);	/* as macOS at its handshake */
-	le32enc(sc->control.buf + 0x6c, 2);
-	cpu_dcache_wb_range(sc->control.buf, PAGE_SIZE);
 	/*
 	 * XXX bring-up: resend the image page by page with unmapped holes; the
 	 * DART fault then names the firmware's first access inside a hole.
@@ -1274,6 +1287,7 @@ n1_start_ipc(struct n1_softc *sc)
 	N1_WR4(sc, N1_ROM_DESC_LO, (uint32_t)sc->desc_iova);
 	N1_WR4(sc, N1_ROM_DESC_HI, (uint32_t)(sc->desc_iova >> 32));
 	N1_WR4(sc, N1_ROM_DESC_SIZE, 0x20);
+	N1_WR4(sc, 0x8074, 0x62746632);	/* "2ftb" */
 	dsb(sy);
 	/*
 	 * The firmware doesn't answer BAR reads while it brings up the
@@ -1385,28 +1399,25 @@ n1_start_ipc(struct n1_softc *sc)
 	if (error != 0)
 		return (error);
 	N1_AER(sc, "handshake");
+	/* From here as aurora's centauri_start_ipc */
 	if ((error = n1_memswap(sc, 0, "mswc")) != 0 ||
 	    (error = n1_memswap(sc, 2, "mswb")) != 0 ||
 	    (error = n1_memswap(sc, 1, "msww")) != 0) {
 		device_printf(sc->dev, "memswap: %d\n", error);
 		return (error);
 	}
-	/* XXX bring-up: function DevCtl and LinkCtl as macOS leaves them */
-	for (i = 0; i < 3; i++) {
-		int c;
-
-		if (pci_find_cap(sc->fn[i], PCIY_EXPRESS, &c) != 0)
-			continue;
-		pci_write_config(sc->fn[i], c + PCIER_DEVICE_CTL, 0x213f, 2);
-		pci_write_config(sc->fn[i], c + PCIER_DEVICE_STA, 0xf, 2);
-		pci_write_config(sc->fn[i], c + PCIER_LINK_CTL, 0x0002, 2);
+	if ((error = n1_cchi_init(sc)) != 0) {
+		device_printf(sc->dev, "CCHI: %d\n", error);
+		return (error);
 	}
+	if ((error = n1_alpha_start(sc)) == 0 && (error = n1w_start(sc)) == 0)
+		error = n1w_scan(sc);
+	device_printf(sc->dev, "wifi: %d\n", error);
+	/* Beta as before (btcentauri needs only control booted, beta at 2) */
 	if ((error = n1_fn_start(sc, 2, &sc->beta)) != 0)
 		return (error);
-	if ((error = n1_ctrl_rings(sc)) != 0)
-		return (error);
 	device_printf(sc->dev, "bluetooth: %d\n", n1_bt_start(sc));
-	return (n1_fn_start(sc, 1, &sc->wifi));
+	return (0);
 }
 
 /*
@@ -1512,7 +1523,7 @@ n1_rx_scan(struct n1_softc *sc)
 }
 
 /* Rings 2, 4 and 3 as macOS creates them: 16 entries of 0x40 bytes */
-static int
+static int __unused
 n1_ctrl_rings(struct n1_softc *sc)
 {
 	static const struct { uint16_t id, flags; } rings[] = {
@@ -1661,6 +1672,8 @@ n1_ctrl_rings(struct n1_softc *sc)
  * Alpha reaches stage 2 only after beta's handshake.
  */
 #define	N1_APERTURE_SIZE	0x40000000u
+#define	W_WINDOW		(16 * 1024 * 1024)	/* alpha: rings, scratch */
+#define	W_SCRATCH		0x800000
 
 static const struct n1_fn_regs {
 	const char	*name;
@@ -1758,6 +1771,510 @@ n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 	    bus_read_4(bar, r->status));
 	n1_dart_errors(sc);
 	return (bus_read_4(bar, r->status) == 2 ? 0 : ETIMEDOUT);
+}
+
+/*
+ * Control messages as aurora's centauri_ipc.c message(): 512-byte slots
+ * after the first, entry u32 (length << 8 | 1), u64 address, u32 head + 1;
+ * the doorbell takes head + 1 and the firmware moves the tr head to it.
+ */
+static int
+n1_cmsg(struct n1_softc *sc, struct n1_ctx *c, struct resource *bar,
+    bus_size_t db, const void *msg, uint32_t len)
+{
+	uint16_t head = c->head;
+	uint8_t *ent;
+	int i;
+
+	if (head >= 15 || len == 0 || len > 512)
+		return (ENOSPC);
+	memcpy(c->msgs + 512 * (head + 1), msg, len);
+	ent = c->buf + c->mtr + 16 * head;
+	le32enc(ent, 1 | len << 8);
+	le64enc(ent + 4, c->msgs_iova + 512 * (head + 1));
+	le32enc(ent + 12, head + 1);
+	cpu_dcache_wb_range(c->msgs, 16384);
+	cpu_dcache_wb_range(c->buf, PAGE_SIZE);
+	bus_write_4(bar, db, head + 1);
+	c->head++;
+	for (i = 0; i < 120; i++) {
+		cpu_dcache_inv_range(c->buf, PAGE_SIZE);
+		if (le16dec(c->buf + c->index[1]) == head + 1)
+			return (0);
+		pause("n1cm", hz / 100 + 1);
+	}
+	return (ETIMEDOUT);
+}
+
+/* Open a control transfer ring on a host buffer (aurora open_transfer) */
+static int
+n1_open_transfer(struct n1_softc *sc, uint16_t id, uint64_t iova,
+    uint16_t footer)
+{
+	uint8_t msg[0x34] = { 1 };
+	uint32_t words = footer >> 2, shift = MIN(ffs(words) - 1, 4);
+
+	msg[2] = words >> shift;
+	msg[3] = shift << 4;
+	le16enc(msg + 4, id);
+	le64enc(msg + 8, iova);
+	le64enc(msg + 0x10, ~0ul);
+	le16enc(msg + 0x18, 16);
+	le16enc(msg + 0x1a, 0xffff);
+	le16enc(msg + 0x1c, id);
+	le16enc(msg + 0x1e, 0x40);
+	return (n1_cmsg(sc, &sc->control, sc->bar, 0x9000, msg, sizeof(msg)));
+}
+
+/*
+ * CCHI (aurora cchi_init): config message {9, 0, ff, ff}, rings 4 (CCHI
+ * receive, 1 KiB footers), 3 (CCHI transmit) and 5 (debug receive, 256),
+ * 15 receive buffers on 4 and 5, then a 64-byte hello on 3 and its answer.
+ */
+static int
+n1_cchi_init(struct n1_softc *sc)
+{
+	static const uint8_t config[4] = { 9, 0, 0xff, 0xff };
+	uint8_t *rx, *tx, *dbg, *e;
+	uint64_t rx_iova, tx_iova, dbg_iova;
+	int error, i;
+
+	rx = n1_dma_alloc(sc, 32768, &rx_iova);
+	tx = n1_dma_alloc(sc, 32768, &tx_iova);
+	dbg = n1_dma_alloc(sc, 16384, &dbg_iova);
+	if (rx == NULL || tx == NULL || dbg == NULL)
+		return (ENOMEM);
+	if ((error = n1_cmsg(sc, &sc->control, sc->bar, 0x9000, config,
+	    sizeof(config))) != 0 ||
+	    (error = n1_open_transfer(sc, 4, rx_iova, 1024)) != 0 ||
+	    (error = n1_open_transfer(sc, 3, tx_iova, 1024)) != 0 ||
+	    (error = n1_open_transfer(sc, 5, dbg_iova, 256)) != 0)
+		return (error);
+	for (i = 0; i < 15; i++) {
+		e = rx + i * 1040;
+		le32enc(e, 1 | 1024 << 8);
+		le32enc(e + 12, i + 1);
+		e = dbg + i * 272;
+		le32enc(e, 1 | 256 << 8);
+		le32enc(e + 12, i + 1);
+	}
+	cpu_dcache_wb_range(rx, 32768);
+	cpu_dcache_wb_range(dbg, 16384);
+	N1_WR4(sc, 0x9010, 15);
+	N1_WR4(sc, 0x9014, 15);
+	le32enc(tx, 1 | 64 << 8);
+	le32enc(tx + 12, 1);
+	le16enc(tx + 16, 64);		/* CCHI gid 0, oid 0, seq 0 hello */
+	cpu_dcache_wb_range(tx, 32768);
+	N1_WR4(sc, 0x900c, 1);
+	for (i = 0; i < 200; i++) {
+		cpu_dcache_inv_range(sc->control.buf, PAGE_SIZE);
+		if (le16dec(sc->control.buf + sc->control.index[1] + 4 * 2) != 0)
+			break;
+		pause("n1cchi", hz / 100 + 1);
+	}
+	if (i == 200)
+		return (ETIMEDOUT);
+	cpu_dcache_inv_range(rx, 32768);
+	if ((le32dec(rx) >> 8) < 8 || rx[18] != 0 || rx[19] != 0)
+		return (EPROTO);
+	device_printf(sc->dev, "control CCHI hello answered\n");
+	return (0);
+}
+
+/*
+ * Alpha (aurora centauri_start_ipc): wait for stage 2, a 16 MiB window with
+ * the firmware's 5 MiB scratch at +8 MiB, the context (192 transfer, 234
+ * completion rings), the window at +0x18/+0x1c/+0x20, then the handshake on
+ * +0x1028 (status +0xc, context address +0x10).
+ */
+static int
+n1_alpha_start(struct n1_softc *sc)
+{
+	struct resource *bar = sc->fnbar[1];
+	struct n1_ctx *c = &sc->wifi;
+	int error, i;
+
+	for (i = 0; i < 200 && bus_read_4(bar, 0x8) != 2; i++)
+		pause("n1fn", hz / 100 + 1);
+	if (bus_read_4(bar, 0x8) != 2) {
+		device_printf(sc->dev, "alpha: stage %#x\n", bus_read_4(bar, 0x8));
+		return (EIO);
+	}
+	if ((sc->w.win = n1_dma_alloc(sc, W_WINDOW, &sc->w.win_iova)) == NULL)
+		return (ENOMEM);
+	if ((error = n1_ctx_init(sc, c, 192, 234, sc->w.win_iova + W_SCRATCH,
+	    5 * 1024 * 1024)) != 0)
+		return (error);
+	bus_write_4(bar, 0x18, (uint32_t)sc->w.win_iova);
+	bus_write_4(bar, 0x1c, (uint32_t)(sc->w.win_iova >> 32));
+	bus_write_4(bar, 0x20, W_WINDOW);
+	error = n1_handshake(bar, c, 0xc, 0x10, 0x1028);
+	device_printf(sc->dev, "alpha: handshake %d\n", error);
+	return (error);
+}
+
+/*
+ * Wi-Fi on alpha, ported from aurora-silicon's centauri_wifi.c (J813). The
+ * host owns a 16 MiB window: completion rings from +1 MiB and transfer rings
+ * from +4 MiB (0x20000 apart, ring id - 1), command buffers at +6 MiB and
+ * receive buffers for rings 2-4 after them; the firmware's scratch is at
+ * +8 MiB (5 MiB). Ring pairs are opened with messages on alpha's message ring
+ * (512-byte slots, doorbell +0x1004). Ring 1 carries commands (24-byte
+ * header: u16 length at 0x10, u16 sequence 0x12, u32 id 0x14), rings 2 and 3
+ * replies and events (bit 31 of the id), ring 4 beacons and probe responses.
+ */
+#define	W_CR_BASE	0x100000
+#define	W_TR_BASE	0x400000
+#define	W_SPAN		0x20000
+#define	W_TX_BUF	0x600000
+#define	W_BUFSZ		2048
+
+static const uint32_t w_rxbuf[5] = { 0, 0, 0x620000, 0x680000, 0x700000 };
+static const uint16_t w_rsize[5] = { 0, 64, 192, 96, 192 };
+
+static uint16_t
+n1w_idx(struct n1_softc *sc, int array, int i)
+{
+	struct n1_ctx *c = &sc->wifi;
+
+	cpu_dcache_inv_range(c->buf, PAGE_SIZE);
+	return (le16dec(c->buf + c->index[array] + 2 * i));
+}
+
+static void
+n1w_idx_set(struct n1_softc *sc, int array, int i, uint16_t v)
+{
+	struct n1_ctx *c = &sc->wifi;
+
+	le16enc(c->buf + c->index[array] + 2 * i, v);
+	cpu_dcache_wb_range(c->buf, PAGE_SIZE);
+}
+
+static int
+n1w_up(struct n1_softc *sc)
+{
+	return (bus_read_4(sc->fnbar[1], 0x8) == 2);
+}
+
+/* Completion tails follow the heads (rings 0-4) */
+static void
+n1w_completions(struct n1_softc *sc)
+{
+	int v;
+
+	for (v = 0; v <= 4; v++)
+		n1w_idx_set(sc, 2, v, n1w_idx(sc, 0, v));
+}
+
+static int
+n1w_msg(struct n1_softc *sc, const void *m, size_t len)
+{
+	struct n1_ctx *c = &sc->wifi;
+	uint16_t head = sc->w.main_head;
+	uint8_t *d;
+	int i;
+
+	if (head >= 15 || len > 512)
+		return (ENOSPC);
+	memcpy(c->msgs + (head + 1) * 512, m, len);
+	d = c->buf + c->mtr + 16 * head;
+	le32enc(d, 1 | len << 8);
+	le64enc(d + 4, c->msgs_iova + (head + 1) * 512);
+	le32enc(d + 12, head + 1);
+	cpu_dcache_wb_range(c->msgs, 16384);
+	n1w_idx_set(sc, 3, 0, head + 1);
+	if (head != 0)
+		n1w_idx_set(sc, 3, 8, head + 1);
+	sc->w.main_head++;
+	bus_write_4(sc->fnbar[1], 0x1004, 1);
+	for (i = 0; i < 200; i++) {
+		if (!n1w_up(sc))
+			return (EIO);
+		if (n1w_idx(sc, 1, 0) >= head + 1) {
+			n1w_completions(sc);
+			return (0);
+		}
+		pause("n1wm", hz / 100 + 1);
+	}
+	return (ETIMEDOUT);
+}
+
+static int
+n1w_open_pair(struct n1_softc *sc, uint16_t id)
+{
+	uint8_t cr[0x2c] = { 2 }, tr[0x34] = { 1 };
+	int error;
+
+	le32enc(cr + 4, id | id << 16);
+	le64enc(cr + 8, sc->w.win_iova + W_CR_BASE + (id - 1) * W_SPAN);
+	le16enc(cr + 0x10, 1024);
+	le16enc(cr + 0x12, 0xffff);
+	if ((error = n1w_msg(sc, cr, sizeof(cr))) != 0)
+		return (error);
+	le32enc(tr + 4, id | id << 16);
+	le64enc(tr + 8, sc->w.win_iova + W_TR_BASE + (id - 1) * W_SPAN);
+	le64enc(tr + 0x10, ~0ul);
+	le16enc(tr + 0x18, w_rsize[id]);
+	le16enc(tr + 0x1a, id);
+	le16enc(tr + 0x1c, id);
+	le16enc(tr + 0x1e, 0x40);
+	le16enc(tr + 0x24, 2);
+	return (n1w_msg(sc, tr, sizeof(tr)));
+}
+
+static void
+n1w_post(struct n1_softc *sc, int ring, uint16_t slot)
+{
+	uint8_t *d = sc->w.win + W_TR_BASE + (ring - 1) * W_SPAN + 16 * slot;
+	uint32_t off = w_rxbuf[ring] + slot * W_BUFSZ;
+
+	memset(sc->w.win + off, 0, W_BUFSZ);
+	cpu_dcache_wb_range(sc->w.win + off, W_BUFSZ);
+	le32enc(d, 1 | W_BUFSZ << 8);
+	le64enc(d + 4, sc->w.win_iova + off);
+	le32enc(d + 12, slot + 1);
+	cpu_dcache_wb_range(d, 16);
+}
+
+/* A beacon or probe response (ring 4): 0x60-byte descriptor, then the frame */
+static void
+n1w_beacon(struct n1_softc *sc, const uint8_t *p, size_t size)
+{
+	const uint8_t *f = p + 0x60, *ie, *end;
+	char ssid[33];
+	int chan = 0, rssi, i;
+
+	if (size < 0x60 + 36 || (f[0] != 0x80 && f[0] != 0x50))
+		return;
+	sc->w.beacons++;
+	for (i = 0; i < sc->w.nbss; i++)
+		if (memcmp(sc->w.bss[i], f + 16, 6) == 0)
+			return;
+	if (sc->w.nbss < (int)nitems(sc->w.bss))
+		memcpy(sc->w.bss[sc->w.nbss++], f + 16, 6);
+	end = p + size;
+	ssid[0] = '\0';
+	for (ie = f + 36; ie + 2 <= end && ie + 2 + ie[1] <= end;
+	    ie += 2 + ie[1]) {
+		if (ie[0] == 0 && ie[1] <= 32) {
+			memcpy(ssid, ie + 2, ie[1]);
+			ssid[ie[1]] = '\0';
+		}
+		if ((ie[0] == 3 || ie[0] == 61) && ie[1] != 0)
+			chan = ie[2];
+	}
+	rssi = MAX((int8_t)p[0x16], (int8_t)p[0x17]);
+	device_printf(sc->dev, "wifi: bss %6D chan %3d rssi %4d \"%s\"\n",
+	    f + 16, ":", chan, rssi, ssid);
+}
+
+static void
+n1w_drain(struct n1_softc *sc)
+{
+	int ring, posted = 0;
+
+	for (ring = 2; ring <= 4; ring++) {
+		int budget = w_rsize[ring];
+
+		while (budget--) {
+			uint16_t slot = sc->w.rx_next[ring], size, status;
+			uint8_t *d = sc->w.win + W_TR_BASE + (ring - 1) * W_SPAN +
+			    16 * slot;
+			uint8_t *p = sc->w.win + w_rxbuf[ring] + slot * W_BUFSZ;
+			uint32_t cmd;
+
+			cpu_dcache_inv_range(d, 16);
+			if ((d[15] & 4) == 0)
+				break;
+			cpu_dcache_inv_range(p, W_BUFSZ);
+			size = le16dec(p + 0x10);
+			status = le16dec(p + 0xe);
+			cmd = le32dec(p + 0x14) & ~(1u << 30);
+			sc->w.rx_next[ring] = (slot + 1) % w_rsize[ring];
+			if (ring != 4)
+				N1_DPRINTF(sc, "wifi: rx%d slot %u desc %16D "
+				    "pkt %32D\n", ring, slot, d, " ", p, " ");
+			if (size < 24 || size > W_BUFSZ)
+				;
+			else if (ring == 4)
+				n1w_beacon(sc, p + 24, size - 24);
+			else if (cmd & (1u << 31)) {
+				if (cmd == 0x80000030)
+					sc->w.channels++;
+				else if (cmd == 0x80000005)
+					sc->w.scans++;
+				else
+					N1_DPRINTF(sc, "wifi: event %#x status "
+					    "%u size %u\n", cmd, status, size);
+			} else {
+				sc->w.reply_valid = 1;
+				sc->w.reply_seq = le16dec(p + 0x12);
+				sc->w.reply_status = status;
+				sc->w.reply_cmd = cmd;
+			}
+			n1w_post(sc, ring, sc->w.rx_head[ring]);
+			sc->w.rx_head[ring] = (sc->w.rx_head[ring] + 1) %
+			    w_rsize[ring];
+			n1w_idx_set(sc, 3, ring, sc->w.rx_head[ring]);
+			posted = 1;
+		}
+	}
+	n1w_completions(sc);
+	if (posted)
+		bus_write_4(sc->fnbar[1], 0x1004, 1);
+}
+
+/* XXX bring-up: alpha ring state */
+static void
+n1w_dump(struct n1_softc *sc)
+{
+	static const char *names[4] = { "cr heads", "tr heads", "cr tails",
+	    "tr tails" };
+	uint8_t *d;
+	int a, ring;
+
+	for (a = 0; a < 4; a++)
+		device_printf(sc->dev, "wifi: %s %u %u %u %u %u (msg %u)\n",
+		    names[a], n1w_idx(sc, a, 0), n1w_idx(sc, a, 1),
+		    n1w_idx(sc, a, 2), n1w_idx(sc, a, 3), n1w_idx(sc, a, 4),
+		    n1w_idx(sc, a, 8));
+	for (ring = 1; ring <= 3; ring++) {
+		d = sc->w.win + W_TR_BASE + (ring - 1) * W_SPAN;
+		cpu_dcache_inv_range(d, 32);
+		device_printf(sc->dev, "wifi: tr%d %16D\n", ring, d, " ");
+		d = sc->w.win + W_CR_BASE + (ring - 1) * W_SPAN;
+		cpu_dcache_inv_range(d, 32);
+		device_printf(sc->dev, "wifi: cr%d %32D\n", ring, d, " ");
+	}
+	n1_ctx_dump(sc, "alpha", &sc->wifi, 0x80);
+	device_printf(sc->dev, "wifi: stage %#x\n",
+	    bus_read_4(sc->fnbar[1], 0x8));
+}
+
+static int
+n1w_cmd(struct n1_softc *sc, uint32_t id, const void *payload, size_t size)
+{
+	uint16_t slot = sc->w.cmd_head, seq = ++sc->w.seq;
+	uint8_t *p, *d;
+	int i;
+
+	if (size + 24 > W_BUFSZ)
+		return (EMSGSIZE);
+	if ((slot + 1) % w_rsize[1] == n1w_idx(sc, 1, 1))
+		return (ENOSPC);
+	p = sc->w.win + W_TX_BUF + slot * W_BUFSZ;
+	memset(p, 0, 24 + size);
+	le16enc(p + 0x10, 24 + size);
+	le16enc(p + 0x12, seq);
+	le32enc(p + 0x14, id);
+	if (size != 0)
+		memcpy(p + 24, payload, size);
+	cpu_dcache_wb_range(p, 24 + size);
+	d = sc->w.win + W_TR_BASE + 16 * slot;
+	le32enc(d, 1 | (24 + size) << 8);
+	le64enc(d + 4, sc->w.win_iova + W_TX_BUF + slot * W_BUFSZ);
+	le32enc(d + 12, slot + 1);
+	cpu_dcache_wb_range(d, 16);
+	sc->w.cmd_head = (slot + 1) % w_rsize[1];
+	n1w_idx_set(sc, 3, 1, sc->w.cmd_head);
+	sc->w.reply_valid = 0;
+	bus_write_4(sc->fnbar[1], 0x1004, 1);
+	for (i = 0; i < 150; i++) {
+		n1w_drain(sc);
+		if (!n1w_up(sc))
+			return (EIO);
+		if (sc->w.reply_valid && sc->w.reply_seq == seq &&
+		    sc->w.reply_cmd == id) {
+			if (sc->w.reply_status != 0)
+				device_printf(sc->dev, "wifi: command %#x "
+				    "status %u\n", id, sc->w.reply_status);
+			return (sc->w.reply_status != 0 ? EIO : 0);
+		}
+		pause("n1wc", hz / 100 + 1);
+	}
+	device_printf(sc->dev, "wifi: command %#x timed out\n", id);
+	n1w_dump(sc);
+	return (ETIMEDOUT);
+}
+
+/* Commands 0 (init), 1 (MAC address), 2 (startInterface) */
+static int
+n1w_start(struct n1_softc *sc)
+{
+	static const uint8_t start[5] = { 0, 0x0b, 0, 0, 0 };
+	int error, ring, slot;
+
+	for (ring = 1; ring <= 4; ring++)
+		if ((error = n1w_open_pair(sc, ring)) != 0) {
+			device_printf(sc->dev, "wifi: ring pair %d: %d\n",
+			    ring, error);
+			return (error);
+		}
+	for (ring = 2; ring <= 4; ring++) {
+		for (slot = 0; slot < w_rsize[ring] - 1; slot++)
+			n1w_post(sc, ring, slot);
+		sc->w.rx_head[ring] = w_rsize[ring] - 1;
+		n1w_idx_set(sc, 3, ring, w_rsize[ring] - 1);
+	}
+	bus_write_4(sc->fnbar[1], 0x1004, 1);
+	pause("n1ws", hz * 4 / 10);
+	arc4rand(sc->w.mac, sizeof(sc->w.mac), 0);
+	sc->w.mac[0] = (sc->w.mac[0] & ~1) | 2;	/* local, unicast */
+	if ((error = n1w_cmd(sc, 0, NULL, 0)) != 0 ||
+	    (error = n1w_cmd(sc, 1, sc->w.mac, 6)) != 0 ||
+	    (error = n1w_cmd(sc, 2, start, sizeof(start))) != 0)
+		return (error);
+	pause("n1ws", hz);
+	device_printf(sc->dev, "wifi: interface started, MAC %6D\n",
+	    sc->w.mac, ":");
+	return (0);
+}
+
+/*
+ * Scan (command 0x1000f) in three chunks of the channel list; the fixed
+ * 14-byte request starts with the chunk number, then dwell times (110 ms).
+ * After 8 channel events of a chunk, command 0x10001 ends it and an event
+ * 0x80000005 reports it done.
+ */
+static int
+n1w_scan(struct n1_softc *sc)
+{
+	uint8_t req[14] = { 1, 0, 0, 0x80, 0, 2, 0, 0x10 };
+	int chunk, error = 0, i, stopped;
+	uint32_t channels, scans;
+
+	le16enc(req + 8, 110);
+	le16enc(req + 10, 110);
+	le16enc(req + 12, 110);
+	for (chunk = 0; chunk < 3 && error == 0; chunk++) {
+		channels = sc->w.channels;
+		scans = sc->w.scans;
+		stopped = 0;
+		req[0] = chunk + 1;
+		if ((error = n1w_cmd(sc, 0x1000f, req, sizeof(req))) != 0)
+			break;
+		for (i = 0; i < 800; i++) {
+			n1w_drain(sc);
+			if (!n1w_up(sc)) {
+				error = EIO;
+				break;
+			}
+			if (!stopped && sc->w.channels - channels >= 8) {
+				stopped = 1;
+				if ((error = n1w_cmd(sc, 0x10001, NULL, 0)) != 0)
+					break;
+			}
+			if (stopped && sc->w.scans != scans)
+				break;
+			pause("n1wscan", hz / 100 + 1);
+		}
+		if (error == 0 && sc->w.scans == scans)
+			error = ETIMEDOUT;
+	}
+	device_printf(sc->dev, "wifi: scan %d: %u channels, %u beacons, "
+	    "%d networks\n", error, sc->w.channels, sc->w.beacons, sc->w.nbss);
+	return (error);
 }
 
 /*
