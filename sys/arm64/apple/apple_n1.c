@@ -469,7 +469,7 @@ n1_port_cycle(struct n1_softc *sc)
 		{ 0x210, ~0u }, { 0x080, 0 }, { 0x084, 0 },
 		{ 0x104, 0xfffffff0 }, { 0x124, 0x100 }, { 0x16c, 0 },
 		{ 0x13c, 0 }, { 0x800, 0x00100100 }, { 0x808, 0x001001ff },
-		{ 0x82c, 0x00010000 }, { 0x130, 0 }, { 0x140, 0x10 },
+		{ 0x82c, 0x00010000 }, { 0x130, 0x03020000 }, { 0x140, 0x10 },
 		{ 0x144, 0x00253770 }, { 0x21c, 0 }, { 0x834, 0 },
 		{ 0x83c, 0 },
 	};
@@ -536,9 +536,33 @@ n1_port_cycle(struct n1_softc *sc)
 	for (i = 0; i < 256; i++)
 		*(volatile uint32_t *)(port + PORT_MSIMAP + 4 * i) = 0;
 
-	/* Bring-up: lane clocks, PERST# released, retrain to L0 */
+	*(volatile uint32_t *)(port + 0x140) = 0x11;
+
+	/*
+	 * Bring-up as macOS does it: PERST bit 0 and the root port setup
+	 * (lost in the port reset) before the lane clocks, PERST bit 16 kept.
+	 */
 	n1_rmw(port, PORT_APPCLK, 0, 1);
-	DELAY(10);
+	n1_rmw(port, PORT_PERST, 0, 1);
+	n1_rmw(port, PORT_APPCLK, 0x100, 0);
+	{
+		static const uint32_t rc[][3] = {
+			{ 0x8bc, 0xbff49, 4 }, { 0x78, 0x100810, 4 },
+			{ 0xb80, 0x1d1f3220, 4 }, { 0x890, 0x2000, 4 },
+			{ 0x8a8, 0xc000061, 4 }, { 0x890, 0x1002000, 4 },
+			{ 0x8a8, 0x4000021, 4 }, { 0xa0, 0x43, 2 },
+			{ 0x710, 0x10120, 4 }, { 0x80c, 0x1301ff, 4 },
+			{ 0x7c, 0x737814, 4 }, { 0x8bc, 0xbff48, 4 },
+			{ 0x80, 0x10110400, 4 }, { 0x80c, 0x1301ff, 4 },
+			{ 0x1a0, 0, 4 }, { 0x19c, 0x4055000f, 4 }, { 0x118, 0, 4 },
+			{ 0x10c, 0x462030, 4 }, { 0x108, 0, 4 }, { 0x114, 0, 4 },
+			{ 0x130, 0xff, 4 }, { 0x12c, 7, 4 }, { 0x78, 0x81f, 2 },
+			{ 0x98, 0x400, 2 }, { 0x80, 0xc02, 2 }, { 0xa0, 0x43, 2 },
+			{ 0xa8, 0, 2 }, { 0x2b8, 1, 4 },
+		};
+		for (i = 0; i < nitems(rc); i++)
+			pci_write_config(rp, rc[i][0], rc[i][1], rc[i][2]);
+	}
 	n1_rmw(lane, 0, 0, 1);
 	if (!n1_wait(lane, 0, 4, 4, 50000))
 		goto out;
@@ -550,18 +574,12 @@ n1_port_cycle(struct n1_softc *sc)
 	n1_rmw(lane, 0, 0, 0x200);
 	n1_rmw(lane, 0, 0, 0x400);
 	DELAY(100);
-	n1_rmw(port, PORT_PERST, 0, 1);
 	*(volatile uint32_t *)pad = (padv & ~0xfu) | PAD_OUT_HIGH;
 	DELAY(100);
-	n1_wait(port, PORT_PIPE, 3, 0, 20000);
-	n1_rmw(port, PORT_PERST, 1u << 16, 0);
-	if (!n1_wait(port, PORT_STATUS, 1, 1, 200000))
-		goto out;
-	n1_rmw(port, PORT_APPCLK, 0x100, 0);
-	pci_write_config(rp, 0x8bc, pci_read_config(rp, 0x8bc, 4) ^ 1, 4);
-	pci_write_config(rp, 0x80, pci_read_config(rp, 0x80, 4) | 0x400, 4);
-	n1_rmw(lane, 0, 0, 1u << 31);
 	n1_rmw(port, PORT_LTSSM_EN, 0, 1);
+	pci_write_config(rp, 0x12c, 0, 4);
+	n1_rmw(lane, 0, 0, 1u << 31);
+	pci_write_config(rp, 0x2b8, 0, 4);
 	if (!n1_wait_ltssm(rp, LTSSM_L0, 2000))
 		goto out;
 	pause("n1l0", hz / 10 + 1);
