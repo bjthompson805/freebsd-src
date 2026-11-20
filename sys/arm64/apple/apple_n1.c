@@ -162,6 +162,7 @@ struct n1_softc {
 	struct mbufq		bt_vq;		/* vendor commands to send */
 	struct mbufq		bt_evq;		/* events made up for ng_hci */
 	uint16_t		bt_vwait;	/* vendor opcode in flight */
+	uint8_t			bt_raddr[6];	/* LE static random address */
 	int			bt_vticks;
 	uint32_t		secondary_size;
 };
@@ -1869,6 +1870,31 @@ static const uint8_t n1_bt_scan_off[] = {
 	0x3f, 0xff, 0x01, 0x0b,
 };
 
+static void n1_bt_vqueue(struct n1_softc *, const uint8_t *, size_t);
+
+/*
+ * After every Reset: the controller state the vendor scan needs, as found by
+ * bisecting the macOS init (2026-11-20).  Without the two event masks no scan
+ * events arrive; without vendor 0xfda3 the scan starts but stays silent;
+ * without a random address ff3e (scan start) fails with 0x12.
+ */
+static void
+n1_bt_postreset(struct n1_softc *sc)
+{
+	static const uint8_t init[] = {
+		0x01, 0x0c, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3f,
+		0x01, 0x20, 0x08, 0x7f, 0xfa, 0x86, 0x3f, 0xff, 0xfb, 0x8f, 0x80,
+		0xa3, 0xfd, 0x04, 0x01, 0x00, 0x00, 0x00,
+	};
+	uint8_t raddr[3 + 6];
+
+	n1_bt_vqueue(sc, init, sizeof(init));
+	le16enc(raddr, 0x2005);
+	raddr[2] = 6;
+	memcpy(raddr + 3, sc->bt_raddr, 6);
+	n1_bt_vqueue(sc, raddr, sizeof(raddr));
+}
+
 static void
 n1_bt_vqueue(struct n1_softc *sc, const uint8_t *p, size_t len)
 {
@@ -1992,6 +2018,8 @@ n1_bt_event(struct n1_softc *sc, struct mbuf *m)
 	if (len >= 6 && p[0] == NG_HCI_EVENT_COMMAND_COMPL) {
 		op = le16dec(p + 3);
 		st = p[5];
+		if (op == 0x0c03 && st == 0 && op != sc->bt_vwait)
+			n1_bt_postreset(sc);
 	} else if (len >= 6 && p[0] == NG_HCI_EVENT_COMMAND_STATUS) {
 		op = le16dec(p + 4);
 		st = p[2];
@@ -2330,6 +2358,11 @@ n1_bt_start(struct n1_softc *sc)
 	if (node != -1 && OF_getprop(node, "local-bd-address", addr,
 	    sizeof(addr)) == sizeof(addr))
 		(void)n1_bt_cmd(sc, 0xfc06, addr, sizeof(addr));
+	else
+		memset(addr, 0x5a, sizeof(addr));
+	/* static random address: the public one, top two bits set */
+	memcpy(sc->bt_raddr, addr, sizeof(addr));
+	sc->bt_raddr[5] |= 0xc0;
 	/*
 	 * macOS then sends vendor 0xff0b (16 bytes 0xff) and 0xfe44 (24 bytes,
 	 * from the trace) before Reset. Without them inquiry gets no Command
@@ -2355,6 +2388,9 @@ n1_bt_start(struct n1_softc *sc)
 	SYSCTL_ADD_INT(device_get_sysctl_ctx(sc->dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
 	    "bt_debug", CTLFLAG_RW, &n1_bt_debug, 0, "print Bluetooth rx/tx");
+	mtx_lock(&sc->bt_mtx);
+	n1_bt_postreset(sc);
+	mtx_unlock(&sc->bt_mtx);
 	callout_reset(&sc->bt_callout, hz / 100 + 1, n1_bt_tick, sc);
 	return (0);
 }
