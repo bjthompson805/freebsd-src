@@ -472,8 +472,30 @@ n1_wait_ltssm(device_t rp, uint32_t state, int ms)
  * does the same (D3, disable, enable); the register order follows the
  * measured sequence.
  */
+/*
+ * XXX bring-up: N1 power off and on through SMC (gP13, gp0e; m1n1's
+ * function-reset template), so the ROM boot follows power-on closely as
+ * under macOS.
+ */
+static void
+n1_power_cycle(struct n1_softc *sc)
+{
+	int error;
+
+	error = apple_smc_write_u32(0x67503133, 0x800000);
+	if (error == 0)
+		error = apple_smc_write_u32(0x67703065, 0x800000);
+	pause("n1off", hz / 4 + 1);
+	if (error == 0)
+		error = apple_smc_write_u32(0x67503133, 0x800001);
+	if (error == 0)
+		error = apple_smc_write_u32(0x67703065, 0x800001);
+	pause("n1on", hz * 15 / 100 + 1);
+	device_printf(sc->dev, "N1 power cycle: %d\n", error);
+}
+
 static int
-n1_port_cycle(struct n1_softc *sc)
+n1_port_cycle_power(struct n1_softc *sc, bool power)
 {
 	static const uint32_t reset[][2] = {
 		{ 0x088, 0x110 }, { 0x100, ~0u }, { 0x148, ~0u },
@@ -521,6 +543,8 @@ n1_port_cycle(struct n1_softc *sc)
 	pci_write_config(rp, PCIR_COMMAND, 0, 2);
 	n1_rmw(lane, 0, 1u << 31, 0);
 	*(volatile uint32_t *)pad = (padv & ~0xfu) | PAD_OUT_LOW;
+	if (power)
+		n1_power_cycle(sc);
 	n1_wait(port, PORT_STATUS, 1u << 2, 0, 50000);
 	n1_wait(port, PORT_LANES, 0x1ff, 0, 100000);
 	n1_rmw(port, PORT_LINKDOWN, 0, 0x100);
@@ -623,6 +647,12 @@ out:
 	pmap_unmapdev((void *)lane, 0x4000);
 	pmap_unmapdev((void *)port, 0x4000);
 	return (error);
+}
+
+static int
+n1_port_cycle(struct n1_softc *sc)
+{
+	return (n1_port_cycle_power(sc, false));
 }
 
 /* An entry of an rkosftab image (header at 0x20 "rkosftab", count at 0x28) */
@@ -1628,10 +1658,17 @@ n1_smc_gp1c(struct n1_softc *sc)
 	device_printf(sc->dev, "SMC gP1c sequence: %d\n", error);
 }
 
+/* hw.apple_n1.repower=1: power-cycle the N1 right before the ROM boot */
+static int n1_repower = 0;
+TUNABLE_INT("hw.apple_n1.repower", &n1_repower);
+
 static void
 n1_boot_task(void *arg, int pending __unused)
 {
 	struct n1_softc *sc = arg;
+
+	if (n1_boot && n1_repower)
+		(void)n1_port_cycle_power(sc, true);
 
 	if (n1_boot && n1_rom_boot(sc) == 0 && n1_port_cycle(sc) == 0) {
 		device_t *kids;
