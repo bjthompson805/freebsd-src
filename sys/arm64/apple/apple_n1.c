@@ -3251,6 +3251,16 @@ n1_bt_event(struct n1_softc *sc, struct mbuf *m)
 		st = p[2];
 		if (op == N1_BT_VSC_CREATE_CON)
 			le16enc(p + 4, N1_BT_CREATE_CON);
+	} else if (len >= 12 && (p[0] == NG_HCI_EVENT_CON_COMPL ||
+	    p[0] == NG_HCI_EVENT_CON_REQ) && (p[11] & 0xfe) == 0xf0) {
+		/*
+		 * The firmware's native ACL link types 0xf0/0xf1 (aurora
+		 * btcentauri): ng_hci matches and accepts only ACL (1).
+		 */
+		if (n1_bt_debug)
+			device_printf(sc->dev, "bt event %#x: link type %#x "
+			    "as ACL\n", p[0], p[11]);
+		p[11] = NG_HCI_LINK_ACL;
 	} else if (len >= 2 && p[0] == 0xff) {
 		n = n1_bt_advrep(p, len);
 		m_freem(m);
@@ -3579,12 +3589,22 @@ n1_bt_start(struct n1_softc *sc)
 		n1_bt_doorbell(sc, r);
 		mtx_unlock(&sc->bt_mtx);
 	}
-	/* The BD_ADDR from the ADT, little endian, as macOS sets it first */
+	/*
+	 * The factory BD_ADDR: local-bd-address is least significant byte
+	 * first, WriteBdAddr (0xfc06) takes network byte order (aurora
+	 * btcentauri cen_bt_address); sent as is, the address came out
+	 * reversed.
+	 */
 	node = OF_finddevice("bluetooth0");
 	if (node != -1 && OF_getprop(node, "local-bd-address", addr,
-	    sizeof(addr)) == sizeof(addr))
-		(void)n1_bt_cmd(sc, 0xfc06, addr, sizeof(addr));
-	else
+	    sizeof(addr)) == sizeof(addr)) {
+		uint8_t be[6];
+		int k;
+
+		for (k = 0; k < 6; k++)
+			be[k] = addr[5 - k];
+		(void)n1_bt_cmd(sc, 0xfc06, be, sizeof(be));
+	} else
 		memset(addr, 0x5a, sizeof(addr));
 	/* static random address: the public one, top two bits set */
 	memcpy(sc->bt_raddr, addr, sizeof(addr));
