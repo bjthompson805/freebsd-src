@@ -44,3 +44,11 @@ include		"std.qcom"
 include		"std.rockchip"
 include		"std.virt"
 include		"std.xilinx"
+
+# Bluetooth for the Apple N1 (apple_n1): netgraph HCI/L2CAP stack, sockets
+options 	NETGRAPH
+options 	NETGRAPH_SOCKET
+options 	NETGRAPH_BLUETOOTH
+options 	NETGRAPH_BLUETOOTH_HCI
+options 	NETGRAPH_BLUETOOTH_L2CAP
+options 	NETGRAPH_BLUETOOTH_SOCKET

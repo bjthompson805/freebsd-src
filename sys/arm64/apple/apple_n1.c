@@ -22,12 +22,16 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/callout.h>
 #include <sys/endian.h>
 #include <sys/eventhandler.h>
 #include <sys/firmware.h>
 #include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
+#include <sys/mbuf.h>
 #include <sys/module.h>
+#include <sys/mutex.h>
 #include <sys/rman.h>
 #include <sys/taskqueue.h>
 
@@ -44,6 +48,12 @@
 #include <dev/ofw/ofw_subr.h>
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
+
+#include <net/vnet.h>
+
+#include <netgraph/ng_message.h>
+#include <netgraph/netgraph.h>
+#include <netgraph/bluetooth/include/ng_hci.h>
 
 #include <arm64/apple/apple_dart.h>
 #include <arm64/apple/apple_smc.h>
@@ -139,8 +149,15 @@ struct n1_softc {
 	uint64_t		rx_iova;	/* map DMA on the function streams too */
 	void			*secondary;
 	uint64_t		secondary_iova;
-	uint8_t			*bt_tx, *bt_rx;	/* beta rings 1 (hci-tx), 7 (hci-rx) */
-	uint16_t		bt_txtail, bt_rxseen, bt_rxpost;
+#define	N1_BT_RINGS		4
+	struct {			/* beta (Bluetooth) rings */
+		uint8_t		*mem;
+		uint16_t	tail, seen;
+	}			bt[N1_BT_RINGS];
+	struct mtx		bt_mtx;
+	struct callout		bt_callout;
+	node_p			bt_node;
+	hook_p			bt_hook;
 	uint32_t		secondary_size;
 };
 
@@ -1010,6 +1027,11 @@ static int n1_ctrl_rings(struct n1_softc *);
 	    pci_read_config((sc)->fn[2], 0x104, 4))
 static int n1_fn_start(struct n1_softc *, int, struct n1_ctx *);
 static int n1_bt_start(struct n1_softc *);
+static struct ng_type n1bt_typestruct;
+
+/* hw.apple_n1.bt_debug=1: print received Bluetooth packets */
+static int n1_bt_debug = 0;
+TUNABLE_INT("hw.apple_n1.bt_debug", &n1_bt_debug);
 
 static int
 n1_start_ipc(struct n1_softc *sc)
@@ -1670,134 +1692,367 @@ n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
  * on beta's message ring (doorbell 0x1000), and each ring's doorbell is
  * 0x1000 + 4 * id. HCI rings carry the data in place: an entry is a 16-byte
  * header (u32 length << 8 | type, u64 ~0, u32 slot; the firmware sets 4 in the
- * last byte when done) followed by a 260-byte footer with the HCI packet,
- * without the H4 type byte. Host commands go out on ring 1 (hci-tx, 5
- * entries, type 2); events come back on ring 7 (hci-rx, 17 entries, 16
- * posted as 0x104-byte buffers).
+ * last byte when done) followed by the footer with the packet, without the
+ * H4 type byte. Transmit entries have type 2; receive buffers are posted
+ * with the footer size as length.
+ *
+ * The node "n1bt" has one hook, "hook", for ng_hci's "drv" hook, and passes
+ * H4 framed packets like ng_ubt. Receive rings are polled.
  */
-#define	BT_ENT			0x114
-#define	BT_FOOTER		260
-#define	BT_TX			1
-#define	BT_TX_N			5
-#define	BT_RX			7
-#define	BT_RX_N			17
+static const struct n1_bt_ringdef {
+	uint16_t	id, flags, n, footer;
+	uint8_t		h4;		/* receive: packet type; 0 for transmit */
+} n1_bt_rings[N1_BT_RINGS] = {
+	{ 7, 0x41, 17, 260, NG_HCI_EVENT_PKT },		/* hci-rx */
+	{ 1, 0x41, 5, 260, 0 },				/* hci-tx */
+	{ 8, 0x3051, 9, 2592, NG_HCI_ACL_DATA_PKT },	/* acl-rx */
+	{ 2, 0x3051, 9, 2592, 0 },			/* acl-tx */
+};
+#define	BT_HCI_RX	0
+#define	BT_HCI_TX	1
+#define	BT_ACL_RX	2
+#define	BT_ACL_TX	3
+#define	BT_ENT(d)	(16 + (d)->footer)
 
 static int
-n1_bt_ring(struct n1_softc *sc, uint16_t id, uint16_t flags, uint16_t n,
-    uint8_t **ring)
+n1_bt_ring(struct n1_softc *sc, int r)
 {
+	const struct n1_bt_ringdef *d = &n1_bt_rings[r];
 	uint8_t msg[0x34];
 	uint64_t iova;
 
-	if ((*ring = n1_dma_alloc(sc, n * BT_ENT, &iova)) == NULL)
+	if ((sc->bt[r].mem = n1_dma_alloc(sc, d->n * BT_ENT(d), &iova)) == NULL)
 		return (ENOMEM);
 	memset(msg, 0, sizeof(msg));
 	le16enc(msg, 1);
-	le16enc(msg + 2, flags);
-	le16enc(msg + 4, id);
-	le16enc(msg + 6, id);
+	le16enc(msg + 2, d->flags);
+	le16enc(msg + 4, d->id);
+	le16enc(msg + 6, d->id);
 	le64enc(msg + 8, iova);
 	le64enc(msg + 0x10, ~0ul);
-	le16enc(msg + 0x18, n);
+	le16enc(msg + 0x18, d->n);
 	le16enc(msg + 0x1a, 0xffff);
-	le16enc(msg + 0x1c, id);
+	le16enc(msg + 0x1c, d->id);
 	le16enc(msg + 0x1e, 0x40);
 	return (n1_msg_send(&sc->beta, sc->fnbar[2], 0x1000, msg, sizeof(msg)));
 }
 
 static void
-n1_bt_rx_post(struct n1_softc *sc)
+n1_bt_doorbell(struct n1_softc *sc, int r)
 {
-	uint8_t *e = sc->bt_rx + BT_ENT * (sc->bt_rxpost % BT_RX_N);
+	const struct n1_bt_ringdef *d = &n1_bt_rings[r];
+	struct n1_ctx *c = &sc->beta;
+	uint16_t tail = sc->bt[r].tail % d->n;
 
-	memset(e, 0, BT_ENT);
-	le32enc(e, BT_FOOTER << 8);
-	le64enc(e + 4, ~0ul);
-	le32enc(e + 12, sc->bt_rxpost % BT_RX_N);
-	sc->bt_rxpost++;
+	cpu_dcache_wb_range(sc->bt[r].mem, d->n * BT_ENT(d));
+	le16enc(c->buf + c->index[3] + 2 * d->id, tail);
+	cpu_dcache_wb_range(c->buf, PAGE_SIZE);
+	bus_write_4(sc->fnbar[2], 0x1000 + 4 * d->id, tail);
+}
+
+static uint8_t *
+n1_bt_entry(struct n1_softc *sc, int r, uint16_t i)
+{
+	const struct n1_bt_ringdef *d = &n1_bt_rings[r];
+
+	return (sc->bt[r].mem + BT_ENT(d) * (i % d->n));
 }
 
 static void
-n1_bt_doorbell(struct n1_softc *sc, int ring, uint16_t tail)
+n1_bt_post(struct n1_softc *sc, int r)
 {
-	struct n1_ctx *c = &sc->beta;
+	uint8_t *e = n1_bt_entry(sc, r, sc->bt[r].tail);
 
-	le16enc(c->buf + c->index[3] + 2 * ring, tail);
-	cpu_dcache_wb_range(c->buf, PAGE_SIZE);
-	bus_write_4(sc->fnbar[2], 0x1000 + 4 * ring, tail);
+	memset(e, 0, 16);
+	le32enc(e, n1_bt_rings[r].footer << 8);
+	le64enc(e + 4, ~0ul);
+	le32enc(e + 12, sc->bt[r].tail % n1_bt_rings[r].n);
+	sc->bt[r].tail++;
 }
 
-/* Print received HCI events and give their buffers back. */
+/* Queue one packet (without the H4 byte) on a transmit ring. */
 static int
-n1_bt_poll(struct n1_softc *sc)
+n1_bt_tx(struct n1_softc *sc, int r, struct mbuf *m)
 {
+	const struct n1_bt_ringdef *d = &n1_bt_rings[r];
+	struct n1_ctx *c = &sc->beta;
+	uint16_t head;
 	uint8_t *e;
+	int len = m->m_pkthdr.len;
+
+	mtx_assert(&sc->bt_mtx, MA_OWNED);
+	cpu_dcache_inv_range(c->buf, PAGE_SIZE);
+	head = le16dec(c->buf + c->index[1] + 2 * d->id);
+	if (len > d->footer || (uint16_t)(sc->bt[r].tail + 1 - head) % d->n == 0)
+		return (ENOBUFS);
+	e = n1_bt_entry(sc, r, sc->bt[r].tail);
+	memset(e, 0, 16);
+	le32enc(e, len << 8 | 2);
+	le64enc(e + 4, ~0ul);
+	le32enc(e + 12, sc->bt[r].tail % d->n);
+	m_copydata(m, 0, len, e + 16);
+	sc->bt[r].tail++;
+	n1_bt_doorbell(sc, r);
+	return (0);
+}
+
+/* Take the filled receive buffers off a ring, H4 framed, and repost them. */
+static void
+n1_bt_rx(struct n1_softc *sc, int r, struct mbufq *q)
+{
+	const struct n1_bt_ringdef *d = &n1_bt_rings[r];
+	struct mbuf *m;
 	uint32_t len;
+	uint8_t *e;
 	int n = 0;
 
-	cpu_dcache_inv_range(sc->bt_rx, BT_RX_N * BT_ENT);
-	for (;;) {
-		e = sc->bt_rx + BT_ENT * (sc->bt_rxseen % BT_RX_N);
+	cpu_dcache_inv_range(sc->bt[r].mem, d->n * BT_ENT(d));
+	for (;; n++) {
+		e = n1_bt_entry(sc, r, sc->bt[r].seen);
 		if (e[15] != 4)
 			break;
-		len = MIN(le32dec(e) >> 8, BT_FOOTER);
-		device_printf(sc->dev, "hci event %u: %*D\n", sc->bt_rxseen,
-		    (int)len, e + 16, " ");
-		sc->bt_rxseen++;
-		n1_bt_rx_post(sc);
-		n++;
+		len = MIN(le32dec(e) >> 8, d->footer);
+		if (n1_bt_debug)
+			device_printf(sc->dev, "bt rx %u: %*D\n", d->id,
+			    (int)MIN(len, 32), e + 16, " ");
+		m = m_get2(len + 1, M_NOWAIT, MT_DATA, M_PKTHDR);
+		if (m != NULL) {
+			*mtod(m, uint8_t *) = d->h4;
+			memcpy(mtod(m, uint8_t *) + 1, e + 16, len);
+			m->m_len = m->m_pkthdr.len = len + 1;
+			if (mbufq_enqueue(q, m) != 0)
+				m_freem(m);
+		}
+		sc->bt[r].seen++;
+		n1_bt_post(sc, r);
 	}
-	if (n != 0) {
-		cpu_dcache_wb_range(sc->bt_rx, BT_RX_N * BT_ENT);
-		n1_bt_doorbell(sc, BT_RX, sc->bt_rxpost % BT_RX_N);
-	}
-	return (n);
+	if (n != 0)
+		n1_bt_doorbell(sc, r);
 }
 
+static void
+n1_bt_tick(void *arg)
+{
+	struct n1_softc *sc = arg;
+	struct mbufq q;
+	struct mbuf *m;
+	hook_p hook;
+	int error;
+
+	mbufq_init(&q, 64);
+	mtx_lock(&sc->bt_mtx);
+	n1_bt_rx(sc, BT_HCI_RX, &q);
+	n1_bt_rx(sc, BT_ACL_RX, &q);
+	hook = sc->bt_hook;
+	if (hook != NULL)
+		NG_HOOK_REF(hook);
+	mtx_unlock(&sc->bt_mtx);
+	while ((m = mbufq_dequeue(&q)) != NULL) {
+		if (hook != NULL)
+			NG_SEND_DATA_ONLY(error, hook, m);
+		else
+			m_freem(m);
+	}
+	if (hook != NULL)
+		NG_HOOK_UNREF(hook);
+	callout_schedule(&sc->bt_callout, hz / 100 + 1);
+}
+
+/* Before the node exists: one command, waiting for its event (bring-up). */
 static int
 n1_bt_cmd(struct n1_softc *sc, uint16_t op, const void *param, uint8_t plen)
 {
-	uint8_t *e = sc->bt_tx + BT_ENT * (sc->bt_txtail % BT_TX_N);
-	int i;
+	struct mbufq q;
+	struct mbuf *m;
+	uint8_t pkt[3 + 255];
+	int error, i;
 
-	memset(e, 0, BT_ENT);
-	le32enc(e, (3 + plen) << 8 | 2);
-	le64enc(e + 4, ~0ul);
-	le32enc(e + 12, sc->bt_txtail % BT_TX_N);
-	le16enc(e + 16, op);
-	e[18] = plen;
-	memcpy(e + 19, param, plen);
-	cpu_dcache_wb_range(sc->bt_tx, BT_TX_N * BT_ENT);
-	sc->bt_txtail++;
-	n1_bt_doorbell(sc, BT_TX, sc->bt_txtail % BT_TX_N);
+	le16enc(pkt, op);
+	pkt[2] = plen;
+	memcpy(pkt + 3, param, plen);
+	if ((m = m_get2(3 + plen, M_WAITOK, MT_DATA, M_PKTHDR)) == NULL)
+		return (ENOMEM);
+	m_copyback(m, 0, 3 + plen, pkt);
+	mtx_lock(&sc->bt_mtx);
+	error = n1_bt_tx(sc, BT_HCI_TX, m);
+	mtx_unlock(&sc->bt_mtx);
+	m_freem(m);
+	if (error != 0)
+		return (error);
+	mbufq_init(&q, 16);
 	for (i = 0; i < 100; i++) {
 		pause("n1bt", hz / 100 + 1);
-		if (n1_bt_poll(sc) != 0)
+		mtx_lock(&sc->bt_mtx);
+		n1_bt_rx(sc, BT_HCI_RX, &q);
+		mtx_unlock(&sc->bt_mtx);
+		if ((m = mbufq_dequeue(&q)) != NULL) {
+			device_printf(sc->dev, "hci %#06x: event %*D\n", op,
+			    (int)MIN(m->m_len, 16), mtod(m, uint8_t *), " ");
+			mbufq_drain(&q);
+			m_freem(m);
 			return (0);
+		}
 	}
-	cpu_dcache_inv_range(sc->bt_tx, BT_TX_N * BT_ENT);
-	device_printf(sc->dev, "hci command %#06x: no event (tx done %#x)\n",
-	    op, e[15]);
+	device_printf(sc->dev, "hci command %#06x: no event\n", op);
 	return (ETIMEDOUT);
 }
 
 static int
-n1_bt_start(struct n1_softc *sc)
+n1bt_ng_constructor(node_p node)
 {
-	int error, i;
 
-	if ((error = n1_bt_ring(sc, BT_RX, 0x41, BT_RX_N, &sc->bt_rx)) != 0 ||
-	    (error = n1_bt_ring(sc, BT_TX, 0x41, BT_TX_N, &sc->bt_tx)) != 0)
-		return (error);
-	for (i = 0; i < BT_RX_N - 1; i++)
-		n1_bt_rx_post(sc);
-	cpu_dcache_wb_range(sc->bt_rx, BT_RX_N * BT_ENT);
-	n1_bt_doorbell(sc, BT_RX, sc->bt_rxpost % BT_RX_N);
-	(void)n1_bt_cmd(sc, 0x0c03, NULL, 0);	/* Reset */
-	(void)n1_bt_cmd(sc, 0x1001, NULL, 0);	/* Read Local Version */
-	return (n1_bt_cmd(sc, 0x1009, NULL, 0));	/* Read BD_ADDR */
+	return (EINVAL);
 }
 
+static int
+n1bt_ng_newhook(node_p node, hook_p hook, const char *name)
+{
+	struct n1_softc *sc = NG_NODE_PRIVATE(node);
+	int error = 0;
+
+	if (strcmp(name, "hook") != 0)
+		return (EINVAL);
+	mtx_lock(&sc->bt_mtx);
+	if (sc->bt_hook != NULL)
+		error = EISCONN;
+	else
+		sc->bt_hook = hook;
+	mtx_unlock(&sc->bt_mtx);
+	return (error);
+}
+
+static int
+n1bt_ng_connect(hook_p hook)
+{
+
+	NG_HOOK_FORCE_QUEUE(NG_HOOK_PEER(hook));
+	return (0);
+}
+
+static int
+n1bt_ng_disconnect(hook_p hook)
+{
+	struct n1_softc *sc = NG_NODE_PRIVATE(NG_HOOK_NODE(hook));
+
+	mtx_lock(&sc->bt_mtx);
+	if (sc->bt_hook == hook)
+		sc->bt_hook = NULL;
+	mtx_unlock(&sc->bt_mtx);
+	return (0);
+}
+
+static int
+n1bt_ng_rcvdata(hook_p hook, item_p item)
+{
+	struct n1_softc *sc = NG_NODE_PRIVATE(NG_HOOK_NODE(hook));
+	struct mbuf *m;
+	int error, r;
+
+	NGI_GET_M(item, m);
+	NG_FREE_ITEM(item);
+	if (m->m_pkthdr.len < 2) {
+		m_freem(m);
+		return (EINVAL);
+	}
+	switch (*mtod(m, uint8_t *)) {
+	case NG_HCI_CMD_PKT:
+		r = BT_HCI_TX;
+		break;
+	case NG_HCI_ACL_DATA_PKT:
+		r = BT_ACL_TX;
+		break;
+	default:
+		m_freem(m);
+		return (EINVAL);
+	}
+	m_adj(m, 1);
+	mtx_lock(&sc->bt_mtx);
+	error = n1_bt_tx(sc, r, m);
+	mtx_unlock(&sc->bt_mtx);
+	if (error != 0)
+		device_printf(sc->dev, "bt tx ring %u full\n", n1_bt_rings[r].id);
+	m_freem(m);
+	return (error);
+}
+
+static int
+n1bt_ng_shutdown(node_p node)
+{
+	struct n1_softc *sc = NG_NODE_PRIVATE(node);
+
+	/* The node lives as long as the device: make a new one. */
+	NG_NODE_UNREF(node);
+	if (ng_make_node_common(&n1bt_typestruct, &sc->bt_node) == 0) {
+		ng_name_node(sc->bt_node, "n1bt0");
+		NG_NODE_SET_PRIVATE(sc->bt_node, sc);
+		NG_NODE_FORCE_WRITER(sc->bt_node);
+	}
+	return (0);
+}
+
+static struct ng_type n1bt_typestruct = {
+	.version =	NG_ABI_VERSION,
+	.name =		"n1bt",
+	.constructor =	n1bt_ng_constructor,
+	.newhook =	n1bt_ng_newhook,
+	.connect =	n1bt_ng_connect,
+	.rcvdata =	n1bt_ng_rcvdata,
+	.disconnect =	n1bt_ng_disconnect,
+	.shutdown =	n1bt_ng_shutdown,
+};
+NETGRAPH_INIT(n1bt, &n1bt_typestruct);
+
+static int
+n1_bt_start(struct n1_softc *sc)
+{
+	static const uint8_t fe44[24] = {
+		0xbd, 0x19, 0x64, 0xa6, 0x07, 0xba, 0x5a, 0xd3, 0x60, 0xb2,
+		0xbb, 0x94, 0xe8, 0xd4, 0x83, 0xa3, 0x7f, 0x9c, 0x59, 0xfe,
+		0xb1, 0x5a, 0x91, 0x68,
+	};
+	uint8_t addr[6], ff0b[16];
+	phandle_t node;
+	int error, r;
+
+	mtx_init(&sc->bt_mtx, "n1bt", NULL, MTX_DEF);
+	callout_init(&sc->bt_callout, 1);
+	for (r = 0; r < N1_BT_RINGS; r++) {
+		if ((error = n1_bt_ring(sc, r)) != 0)
+			return (error);
+		if (n1_bt_rings[r].h4 == 0)
+			continue;
+		mtx_lock(&sc->bt_mtx);
+		while (sc->bt[r].tail < n1_bt_rings[r].n - 1)
+			n1_bt_post(sc, r);
+		n1_bt_doorbell(sc, r);
+		mtx_unlock(&sc->bt_mtx);
+	}
+	/* The BD_ADDR from the ADT, little endian, as macOS sets it first */
+	node = OF_finddevice("bluetooth0");
+	if (node != -1 && OF_getprop(node, "local-bd-address", addr,
+	    sizeof(addr)) == sizeof(addr))
+		(void)n1_bt_cmd(sc, 0xfc06, addr, sizeof(addr));
+	/*
+	 * macOS then sends vendor 0xff0b (16 bytes 0xff) and 0xfe44 (24 bytes,
+	 * from the trace) before Reset. Without them inquiry gets no Command
+	 * Status. XXX what 0xfe44 carries is unknown; macOS also sees HCI
+	 * version 0x11 where we see 0x0e.
+	 */
+	memset(ff0b, 0xff, sizeof(ff0b));
+	(void)n1_bt_cmd(sc, 0xff0b, ff0b, sizeof(ff0b));
+	(void)n1_bt_cmd(sc, 0xfe44, fe44, sizeof(fe44));
+	CURVNET_SET(vnet0);	/* the boot task has no vnet */
+	error = ng_make_node_common(&n1bt_typestruct, &sc->bt_node);
+	if (error == 0)
+		ng_name_node(sc->bt_node, "n1bt0");
+	CURVNET_RESTORE();
+	if (error != 0)
+		return (error);
+	NG_NODE_SET_PRIVATE(sc->bt_node, sc);
+	NG_NODE_FORCE_WRITER(sc->bt_node);
+	callout_reset(&sc->bt_callout, hz / 100 + 1, n1_bt_tick, sc);
+	return (0);
+}
 
 /* hw.apple_n1.boot=0: attach only (bring-up). */
 static int n1_boot = 1;

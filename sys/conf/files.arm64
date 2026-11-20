@@ -562,7 +562,7 @@ arm64/apple/apple_aic.c				optional soc_apple_t8103 fdt
 arm64/apple/apple_dart.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_ans.c				optional soc_apple_t8103 fdt nvme
 arm64/apple/apple_mtp.c				optional soc_apple_t8103 fdt hidbus
-arm64/apple/apple_n1.c				optional soc_apple_t8103 fdt pci
+arm64/apple/apple_n1.c				optional soc_apple_t8103 fdt pci netgraph_bluetooth_hci
 arm64/apple/apple_rtkit.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_pmu_rtc.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_smc.c				optional soc_apple_t8103 fdt
