@@ -152,6 +152,10 @@ static struct n1_softc *n1_sc;	/* the control function, for n1fn */
  * at IOVAs just below 1 TiB (40 bits), where Linux's IOMMU layer would put
  * them for a 40-bit device. RAM itself sits above 1 TiB on these SoCs.
  */
+/* hw.apple_n1.sid17=1: enable DART stream 17 as macOS does */
+static int n1_sid17 = 0;
+TUNABLE_INT("hw.apple_n1.sid17", &n1_sid17);
+
 static void *
 n1_dma_alloc(struct n1_softc *sc, size_t size, uint64_t *iova)
 {
@@ -175,6 +179,9 @@ n1_dma_alloc(struct n1_softc *sc, size_t size, uint64_t *iova)
 	}
 	for (u_int sid = 2; error == 0 && sc->routed && sid <= 3; sid++)
 		error = apple_dart_map_stream(sc->dev, sc->dart, sid,
+		    sc->iova_next, pmap_kextract((vm_offset_t)buf), size);
+	if (error == 0 && sc->routed && n1_sid17)
+		error = apple_dart_map_stream(sc->dev, sc->dart, 17,
 		    sc->iova_next, pmap_kextract((vm_offset_t)buf), size);
 	if (error != 0)
 		device_printf(sc->dev, "DART function map: %d\n", error);
@@ -776,6 +783,17 @@ n1_route_functions(struct n1_softc *sc)
 			error = apple_dart_map_stream(sc->dev, sc->dart, 16,
 			    0x381204000ul, 0x381204000ul, N1_PAGE);
 		device_printf(sc->dev, "SID 16 MSI doorbell map: %d\n", error);
+	}
+	/*
+	 * XXX bring-up: macOS has stream 17 enabled with its own table before
+	 * alpha starts (not in RID2SID); mirror the function mappings there.
+	 */
+	if (n1_sid17) {
+		error = apple_dart_private_stream(sc->dev, sc->dart, 17);
+		if (error == 0)
+			error = apple_dart_map_stream(sc->dev, sc->dart, 17,
+			    0x381204000ul, 0x381204000ul, N1_PAGE);
+		device_printf(sc->dev, "SID 17 enable: %d\n", error);
 	}
 	sc->sid = 1;
 	sc->routed = 1;
