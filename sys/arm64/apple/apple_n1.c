@@ -94,6 +94,7 @@ static const struct n1_board n1_boards[] = {
 #define	PORT_MSICFG		0x124
 #define	PORT_LINKDOWN		0x13c
 #define	PORT_MSIADDR		0x16c
+#define	N1_PORT_MSI		1
 #define	PORT_PIPE		0x0a8
 #define	PORT_LINKSTS		0x208
 #define	PORT_APPCLK		0x800
@@ -131,7 +132,10 @@ struct n1_softc {
 		uint64_t	buf_iova, msgs_iova;
 		uint16_t	tr, cr, index[4], mtr, mcr, head;
 	}			control, wifi, beta;
-	int			routed;	/* map DMA on the function streams too */
+	int			routed;
+	uint8_t			*ring2, *rx;	/* XXX bring-up: control receive */
+	int			rx_seen, rx_posted;
+	uint64_t		rx_iova;	/* map DMA on the function streams too */
 	void			*secondary;
 	uint64_t		secondary_iova;
 	uint32_t		secondary_size;
@@ -602,6 +606,11 @@ out:
 		*(volatile uint32_t *)(port + PORT_MSIMAP + 4 * i) = msimap[i];
 	*(volatile uint32_t *)(port + PORT_MSIADDR) = msiaddr;
 	*(volatile uint32_t *)(port + PORT_MSICFG) = msicfg;
+	if (N1_PORT_MSI) {	/* XXX bring-up: port MSI doorbell as macOS */
+		*(volatile uint32_t *)(port + PORT_MSIADDR) = 0xfffff000;
+		*(volatile uint32_t *)(port + PORT_MSIADDR + 4) = 0;
+		*(volatile uint32_t *)(port + PORT_MSICFG) = 1;
+	}
 	if (error != 0)
 		device_printf(sc->dev, "port cycle timed out (status %#x "
 		    "pipe %#x LTSSM %#x)\n",
@@ -728,6 +737,14 @@ n1_route_functions(struct n1_softc *sc)
 	}
 	dsb(sy);
 	pmap_unmapdev(__DEVOLATILE(void *, routes), 16 * sizeof(*routes));
+	/* XXX bring-up: the port forwards MSIs to the AIC doorbell on SID 16 */
+	if (N1_PORT_MSI) {
+		error = apple_dart_private_stream(sc->dev, sc->dart, 16);
+		if (error == 0)
+			error = apple_dart_map_stream(sc->dev, sc->dart, 16,
+			    0x381204000ul, 0x381204000ul, N1_PAGE);
+		device_printf(sc->dev, "SID 16 MSI doorbell map: %d\n", error);
+	}
 	sc->sid = 1;
 	sc->routed = 1;
 	return (0);
@@ -763,6 +780,8 @@ n1_functions(struct n1_softc *sc)
 			return (ENXIO);
 		if (i == 0) {
 			iova = sc->mbox_iova;
+		} else if (N1_PORT_MSI) {
+			iova = 0xfffff000;	/* data 0x10 (alpha), 0 (beta) */
 		} else {
 			sc->fnmsi[i] = n1_dma_alloc(sc, N1_PAGE, &iova);
 			if (sc->fnmsi[i] == NULL)
@@ -772,7 +791,8 @@ n1_functions(struct n1_softc *sc)
 		pci_write_config(sc->fn[i], cap + PCIR_MSI_ADDR_HIGH,
 		    (uint32_t)(iova >> 32), 4);
 		pci_write_config(sc->fn[i], cap + PCIR_MSI_DATA_64BIT,
-		    N1_MSI_DATA + 0x100 * i, 2);
+		    i == 0 || !N1_PORT_MSI ? N1_MSI_DATA + 0x100 * i :
+		    (i == 1 ? 0x10 : 0), 2);
 		pci_write_config(sc->fn[i], cap + PCIR_MSI_CTRL,
 		    (pci_read_config(sc->fn[i], cap + PCIR_MSI_CTRL, 2) &
 		    ~PCIM_MSICTRL_MME_MASK) | mme[i] | PCIM_MSICTRL_MSI_ENABLE, 2);
@@ -931,6 +951,11 @@ static const uint32_t n1_sec_holes[][2] = {
 };
 
 static int n1_ctrl_rings(struct n1_softc *);
+#define	N1_AER(sc, what)	/* XXX bring-up */				\
+	device_printf((sc)->dev, "AER %s: fn1 ue %#x devsts %#x, fn2 ue %#x\n",	\
+	    what, pci_read_config((sc)->fn[1], 0x104, 4),			\
+	    pci_read_config((sc)->fn[1], 0x7a, 2),				\
+	    pci_read_config((sc)->fn[2], 0x104, 4))
 static int n1_fn_start(struct n1_softc *, int, struct n1_ctx *);
 
 static int
@@ -942,6 +967,7 @@ n1_start_ipc(struct n1_softc *sc)
 
 	if ((error = n1_functions(sc)) != 0)
 		return (error);
+	N1_AER(sc, "functions");
 	n1_enable_ptm(sc);
 	if ((error = n1_ftab_entry(sc->fw, sc->fw_size, "2ftb", &off,
 	    &len)) != 0) {
@@ -1215,6 +1241,7 @@ n1_start_ipc(struct n1_softc *sc)
 	}
 	stage = N1_RD4(sc, N1_STAGE);
 	device_printf(sc->dev, "secondary boot: stage %#x\n", stage);
+	N1_AER(sc, "secondary");
 	n1_dart_errors(sc);
 	if (stage != 2)
 		return (EIO);
@@ -1222,6 +1249,7 @@ n1_start_ipc(struct n1_softc *sc)
 	device_printf(sc->dev, "control IPC handshake: %d\n", error);
 	if (error != 0)
 		return (error);
+	N1_AER(sc, "handshake");
 	/* XXX bring-up: function DevCtl and LinkCtl as macOS leaves them */
 	for (i = 0; i < 3; i++) {
 		int c;
@@ -1276,6 +1304,61 @@ n1_ctrl_send(struct n1_softc *sc, const void *msg, uint32_t len)
 	return (ETIMEDOUT);
 }
 
+/*
+ * Control receive (ring 2, 16 slots): print what the firmware returned and
+ * give each buffer back at the tail, which the doorbell takes modulo 16.
+ */
+static void
+n1_rx_scan(struct n1_softc *sc)
+{
+	struct n1_ctx *c = &sc->control;
+	uint8_t *e, *b;
+	uint32_t len, id, j, k;
+	int posted = 0;
+
+	if (sc->ring2 == NULL)
+		return;
+	cpu_dcache_inv_range(sc->ring2, N1_PAGE);
+	while (sc->ring2[16 * (sc->rx_seen % 16) + 15] != 0) {
+		e = sc->ring2 + 16 * (sc->rx_seen % 16);
+		id = le32dec(e + 12) & 0xffffff;
+		b = sc->rx + 0x8000 * (id % 15);
+		len = MIN(le32dec(e) >> 8, 0x8000);
+		cpu_dcache_inv_range(b, 0x8000);
+		device_printf(sc->dev, "rx %d: type %u len %#x\n", sc->rx_seen,
+		    e[0], len);
+		if (len <= 0x40) {
+			for (j = 0; j < len; j += 32)
+				device_printf(sc->dev, "rx %d +%#04x: %32D\n",
+				    sc->rx_seen, j, b + j, " ");
+		} else {
+			for (j = 0; j < len; j = k + 1) {
+				for (k = j; k < len && b[k] >= 0x20 &&
+				    b[k] < 0x7f; k++)
+					;
+				if (k - j >= 4)
+					printf("n1log: %.*s\n", (int)(k - j),
+					    b + j);
+			}
+		}
+		memset(e, 0, 16);
+		e = sc->ring2 + 16 * (sc->rx_posted % 16);
+		le16enc(e, 1);
+		le16enc(e + 2, 0x80);
+		le64enc(e + 4, sc->rx_iova + 0x8000 * (id % 15));
+		le32enc(e + 12, id % 15);
+		sc->rx_posted++;
+		sc->rx_seen++;
+		posted = 1;
+	}
+	if (posted) {
+		cpu_dcache_wb_range(sc->ring2, N1_PAGE);
+		le16enc(c->buf + c->index[3] + 2 * 2, sc->rx_posted % 16);
+		cpu_dcache_wb_range(c->buf, PAGE_SIZE);
+		N1_WR4(sc, 0x9008, sc->rx_posted % 16);
+	}
+}
+
 /* Rings 2, 4 and 3 as macOS creates them: 16 entries of 0x40 bytes */
 static int
 n1_ctrl_rings(struct n1_softc *sc)
@@ -1327,19 +1410,15 @@ n1_ctrl_rings(struct n1_softc *sc)
 	le16enc(sc->control.buf + sc->control.index[3] + 2 * 2, 15);
 	cpu_dcache_wb_range(sc->control.buf, PAGE_SIZE);
 	N1_WR4(sc, 0x9008, 15);
-	for (n = 0, i = 0; i < 200 && n < 15; i++) {
+	sc->rx_iova = rx_iova;
+	sc->rx_posted = 15;
+	sc->rx = rx;
+	sc->ring2 = ring[2];
+	for (i = 0; i < 100; i++) {
 		pause("n1rx", hz / 100 + 1);
-		cpu_dcache_inv_range(ring[2], N1_PAGE);
-		for (; n < 15 && ring[2][16 * n + 15] != 0; n++) {
-			e = ring[2] + 16 * n;
-			cpu_dcache_inv_range(rx + 0x8000 * n, 0x8000);
-			device_printf(sc->dev, "rx %d: %02x %02x %02x %02x len %#x\n",
-			    n, e[0], e[1], e[2], e[3], le32dec(e) >> 8);
-			for (j = 0; j < MIN(le32dec(e) >> 8, 0x100); j += 32)
-				device_printf(sc->dev, "rx %d +%#04x: %32D\n", n, j,
-				    rx + 0x8000 * n + j, " ");
-		}
+		n1_rx_scan(sc);
 	}
+	n = sc->rx_seen;
 	device_printf(sc->dev, "ring 2: %d buffers returned, tr heads %*D\n",
 	    n, 10, sc->control.buf + sc->control.index[1], " ");
 
@@ -1380,8 +1459,10 @@ n1_ctrl_rings(struct n1_softc *sc)
 					    i, j, ring[i] + j, " ");
 					break;
 				}
-	for (i = 0; i < 500 && bus_read_4(sc->fnbar[1], 0x8) != 2; i++)
+	for (i = 0; i < 500 && bus_read_4(sc->fnbar[1], 0x8) != 2; i++) {
 		pause("n1fn1", hz / 100 + 1);
+		n1_rx_scan(sc);
+	}
 	device_printf(sc->dev, "wifi function stage %#x after %d ms\n",
 	    bus_read_4(sc->fnbar[1], 0x8), i * 10);
 	for (i = 1; i < 3; i++)	/* XXX bring-up */
@@ -1435,6 +1516,7 @@ n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 	le32enc(c->buf + 0x6c, 2);
 	cpu_dcache_wb_range(c->buf, PAGE_SIZE);
 	ap = sc->iova_next;
+	n1_rx_scan(sc);
 	device_printf(sc->dev, "%s: stage %#x after %d ms, context %#lx\n",
 	    r->name, bus_read_4(bar, r->stage), i * 10, c->buf_iova);
 	bus_write_4(bar, r->control, 1);
