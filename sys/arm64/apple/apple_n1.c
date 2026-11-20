@@ -159,6 +159,10 @@ struct n1_softc {
 	struct callout		bt_callout;
 	node_p			bt_node;
 	hook_p			bt_hook;
+	struct mbufq		bt_vq;		/* vendor commands to send */
+	struct mbufq		bt_evq;		/* events made up for ng_hci */
+	uint16_t		bt_vwait;	/* vendor opcode in flight */
+	int			bt_vticks;
 	uint32_t		secondary_size;
 };
 
@@ -1833,12 +1837,201 @@ n1_bt_fixcmd(struct mbuf *m)
 	return (n);
 }
 
+/*
+ * LE Set Scan Parameters and Enable are refused as well.  macOS scans with
+ * vendor ff42 (one per scan type), ff3e (apply) and ff3f (commit), and the
+ * results come as vendor event 0xff/0x0e: an LE Extended Advertising Report
+ * after a 3-byte header, with a 12-byte trailer.  Answer 0x200b/0x200c here,
+ * send the vendor sequence from the tick one command at a time, swallow its
+ * completions, and give ng_hci legacy Advertising Reports.
+ * Each entry: opcode (le16), parameter length, parameters.
+ */
+static const uint8_t n1_bt_scan_on[] = {
+	0x3e, 0xff, 0x09, 0x00, 0x02, 0x01, 0x02, 0x09, 0x00, 0x00, 0x00, 0x00,
+	0x41, 0xff, 0x04, 0x06, 0x00, 0x00, 0x84,
+	0xe6, 0xfd, 0x0e, 0x02, 0x01, 0x02, 0x00, 0x00, 0x00,
+	    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xbd, 0xfd, 0x10, 0x06, 0x00, 0x00, 0x80, 0x07, 0x00, 0x00, 0x80,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0xb2, 0xfd, 0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xc9, 0xfd, 0x00,
+	0x42, 0xff, 0x0c, 0x01, 0x00, 0x01, 0x02, 0x01, 0x01, 0xe0, 0x01,
+	    0x30, 0x00, 0x1e, 0x00,
+	0x42, 0xff, 0x0c, 0x01, 0x00, 0x01, 0x02, 0x02, 0x01, 0xe0, 0x01,
+	    0x2b, 0x00, 0x1e, 0x00,
+	0x42, 0xff, 0x0c, 0x01, 0x00, 0x01, 0x02, 0x08, 0x01, 0xe0, 0x01,
+	    0x10, 0x00, 0x1e, 0x00,
+	0x3e, 0xff, 0x09, 0x01, 0x02, 0x00, 0x02, 0x0b, 0x00, 0x00, 0x00, 0x00,
+	0x3f, 0xff, 0x01, 0x0b,
+};
+static const uint8_t n1_bt_scan_off[] = {
+	0x3e, 0xff, 0x09, 0x00, 0x02, 0x00, 0x02, 0x0b, 0x00, 0x00, 0x00, 0x00,
+	0x3f, 0xff, 0x01, 0x0b,
+};
+
 static void
-n1_bt_fixevent(uint8_t *p, uint32_t len)
+n1_bt_vqueue(struct n1_softc *sc, const uint8_t *p, size_t len)
 {
-	/* Command Status: event 0x0f, length 4, status, ncmd, opcode */
-	if (len >= 6 && p[0] == 0x0f && le16dec(p + 4) == N1_BT_VSC_CREATE_CON)
-		le16enc(p + 4, N1_BT_CREATE_CON);
+	struct mbuf *m;
+	size_t n;
+
+	mtx_assert(&sc->bt_mtx, MA_OWNED);
+	for (; len >= 3; p += n, len -= n) {
+		n = 3 + p[2];
+		m = m_get2(n, M_NOWAIT, MT_DATA, M_PKTHDR);
+		if (m == NULL)
+			return;
+		memcpy(mtod(m, uint8_t *), p, n);
+		m->m_len = m->m_pkthdr.len = n;
+		if (mbufq_enqueue(&sc->bt_vq, m) != 0)
+			m_freem(m);
+	}
+}
+
+/* Queue a made-up Command Complete (status 0) for ng_hci. */
+static void
+n1_bt_fakecc(struct n1_softc *sc, uint16_t op)
+{
+	struct mbuf *m;
+	uint8_t *p;
+
+	mtx_assert(&sc->bt_mtx, MA_OWNED);
+	m = m_get2(7, M_NOWAIT, MT_DATA, M_PKTHDR);
+	if (m == NULL)
+		return;
+	p = mtod(m, uint8_t *);
+	p[0] = NG_HCI_EVENT_PKT;
+	p[1] = NG_HCI_EVENT_COMMAND_COMPL;
+	p[2] = 4;
+	p[3] = 1;
+	le16enc(p + 4, op);
+	p[6] = 0;
+	m->m_len = m->m_pkthdr.len = 7;
+	if (mbufq_enqueue(&sc->bt_evq, m) != 0)
+		m_freem(m);
+}
+
+/* Host commands answered here; true if the command was consumed. */
+static bool
+n1_bt_hostcmd(struct n1_softc *sc, struct mbuf *m)
+{
+	uint8_t p[4];
+	uint16_t op;
+
+	if (m->m_pkthdr.len < 3)
+		return (false);
+	m_copydata(m, 0, MIN(m->m_pkthdr.len, 4), p);
+	op = le16dec(p);
+	if (op != 0x200b && op != 0x200c)
+		return (false);
+	mtx_lock(&sc->bt_mtx);
+	if (op == 0x200c && m->m_pkthdr.len >= 4) {
+		if (p[3])
+			n1_bt_vqueue(sc, n1_bt_scan_on, sizeof(n1_bt_scan_on));
+		else
+			n1_bt_vqueue(sc, n1_bt_scan_off,
+			    sizeof(n1_bt_scan_off));
+	}
+	n1_bt_fakecc(sc, op);
+	mtx_unlock(&sc->bt_mtx);
+	return (true);
+}
+
+/* Vendor event 0xff/0x0e (one legacy report) as an LE Advertising Report. */
+static struct mbuf *
+n1_bt_advrep(const uint8_t *p, uint32_t len)
+{
+	struct mbuf *m;
+	uint8_t *q, t, dlen;
+
+	if (len < 30 || p[2] != 0x0e || p[5] != 1 || (p[6] & 0x10) == 0)
+		return (NULL);
+	dlen = p[29];
+	if (dlen > 31 || 30 + dlen > len)
+		return (NULL);
+	t = p[6];
+	if (t & 0x08)
+		t = 4;			/* SCAN_RSP */
+	else if (t & 0x04)
+		t = 1;			/* ADV_DIRECT_IND */
+	else if ((t & 0x03) == 0x03)
+		t = 0;			/* ADV_IND */
+	else if (t & 0x02)
+		t = 2;			/* ADV_SCAN_IND */
+	else
+		t = 3;			/* ADV_NONCONN_IND */
+	m = m_get2(1 + 2 + 12 + dlen, M_NOWAIT, MT_DATA, M_PKTHDR);
+	if (m == NULL)
+		return (NULL);
+	q = mtod(m, uint8_t *);
+	q[0] = NG_HCI_EVENT_PKT;
+	q[1] = NG_HCI_EVENT_LE;
+	q[2] = 12 + dlen;
+	q[3] = NG_HCI_LEEV_ADVREP;
+	q[4] = 1;
+	q[5] = t;
+	q[6] = p[8] & 1;
+	memcpy(q + 7, p + 9, 6);
+	q[13] = dlen;
+	memcpy(q + 14, p + 30, dlen);
+	q[14 + dlen] = p[19];		/* RSSI */
+	m->m_len = m->m_pkthdr.len = 1 + 2 + 12 + dlen;
+	return (m);
+}
+
+/* Received HCI event (H4 framed): pass, rewrite, replace or drop it. */
+static struct mbuf *
+n1_bt_event(struct n1_softc *sc, struct mbuf *m)
+{
+	uint8_t *p = mtod(m, uint8_t *) + 1;
+	uint32_t len = m->m_len - 1;
+	struct mbuf *n;
+	uint16_t op = 0;
+	uint8_t st = 0;
+
+	if (len >= 6 && p[0] == NG_HCI_EVENT_COMMAND_COMPL) {
+		op = le16dec(p + 3);
+		st = p[5];
+	} else if (len >= 6 && p[0] == NG_HCI_EVENT_COMMAND_STATUS) {
+		op = le16dec(p + 4);
+		st = p[2];
+		if (op == N1_BT_VSC_CREATE_CON)
+			le16enc(p + 4, N1_BT_CREATE_CON);
+	} else if (len >= 2 && p[0] == 0xff) {
+		n = n1_bt_advrep(p, len);
+		m_freem(m);
+		return (n);
+	}
+	if (op != 0 && op == sc->bt_vwait) {
+		if (st != 0)
+			device_printf(sc->dev, "bt vendor %04x: status %#x\n",
+			    op, st);
+		sc->bt_vwait = 0;
+		m_freem(m);
+		return (NULL);
+	}
+	return (m);
+}
+
+/* Send the next queued vendor command once the previous one completed. */
+static void
+n1_bt_vsend(struct n1_softc *sc)
+{
+	struct mbuf *m;
+
+	mtx_assert(&sc->bt_mtx, MA_OWNED);
+	if (sc->bt_vwait != 0 && ++sc->bt_vticks < 100)
+		return;
+	sc->bt_vwait = 0;
+	if ((m = mbufq_dequeue(&sc->bt_vq)) == NULL)
+		return;
+	if (n1_bt_tx(sc, BT_HCI_TX, m) != 0) {
+		mbufq_prepend(&sc->bt_vq, m);
+		return;
+	}
+	sc->bt_vwait = le16dec(mtod(m, uint8_t *));
+	sc->bt_vticks = 0;
+	m_freem(m);
 }
 
 /* Take the filled receive buffers off a ring, H4 framed, and repost them. */
@@ -1864,10 +2057,10 @@ n1_bt_rx(struct n1_softc *sc, int r, struct mbufq *q)
 		if (m != NULL) {
 			*mtod(m, uint8_t *) = d->h4;
 			memcpy(mtod(m, uint8_t *) + 1, e + 16, len);
-			if (d->h4 == NG_HCI_EVENT_PKT)
-				n1_bt_fixevent(mtod(m, uint8_t *) + 1, len);
 			m->m_len = m->m_pkthdr.len = len + 1;
-			if (mbufq_enqueue(q, m) != 0)
+			if (d->h4 == NG_HCI_EVENT_PKT)
+				m = n1_bt_event(sc, m);
+			if (m != NULL && mbufq_enqueue(q, m) != 0)
 				m_freem(m);
 		}
 		sc->bt[r].seen++;
@@ -1890,6 +2083,10 @@ n1_bt_tick(void *arg)
 	mtx_lock(&sc->bt_mtx);
 	n1_bt_rx(sc, BT_HCI_RX, &q);
 	n1_bt_rx(sc, BT_ACL_RX, &q);
+	while ((m = mbufq_dequeue(&sc->bt_evq)) != NULL)
+		if (mbufq_enqueue(&q, m) != 0)
+			m_freem(m);
+	n1_bt_vsend(sc);
 	hook = sc->bt_hook;
 	if (hook != NULL)
 		NG_HOOK_REF(hook);
@@ -2013,6 +2210,10 @@ n1bt_ng_rcvdata(hook_p hook, item_p item)
 		return (EINVAL);
 	}
 	m_adj(m, 1);
+	if (r == BT_HCI_TX && n1_bt_hostcmd(sc, m)) {
+		m_freem(m);
+		return (0);
+	}
 	if (r == BT_HCI_TX && (m = n1_bt_fixcmd(m)) == NULL)
 		return (ENOBUFS);
 	mtx_lock(&sc->bt_mtx);
@@ -2110,6 +2311,8 @@ n1_bt_start(struct n1_softc *sc)
 	int error, r;
 
 	mtx_init(&sc->bt_mtx, "n1bt", NULL, MTX_DEF);
+	mbufq_init(&sc->bt_vq, 64);
+	mbufq_init(&sc->bt_evq, 64);
 	callout_init(&sc->bt_callout, 1);
 	for (r = 0; r < N1_BT_RINGS; r++) {
 		if ((error = n1_bt_ring(sc, r)) != 0)

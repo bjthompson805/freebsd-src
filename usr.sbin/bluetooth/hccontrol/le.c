@@ -630,7 +630,7 @@ le_scan(int s, int argc, char *argv[])
 	int n, bufsize, scancount, numscans;
 	bool verbose;
 	uint8_t active = 0;
-	char ch;
+	int ch;
 
 	char			 b[512];
 	ng_hci_event_pkt_t	*e = (ng_hci_event_pkt_t *) b;
@@ -825,7 +825,7 @@ le_add_device_to_white_list(int s, int argc, char *argv[])
 	ng_hci_le_add_device_to_white_list_cp cp;
 	ng_hci_le_add_device_to_white_list_rp rp;
 	int n;
-	char ch;
+	int ch;
 	optreset = 1;
 	optind = 0;
 	bool addr_set = false;
@@ -884,7 +884,7 @@ le_remove_device_from_white_list(int s, int argc, char *argv[])
 	ng_hci_le_remove_device_from_white_list_cp cp;
 	ng_hci_le_remove_device_from_white_list_rp rp;
 	int n;
-	char ch;
+	int ch;
 	optreset = 1;
 	optind = 0;
 	bool addr_set = false;
@@ -946,7 +946,7 @@ le_connect(int s, int argc, char *argv[])
 	ng_hci_event_pkt_t	*e = (ng_hci_event_pkt_t *) b;
 
 	int n, scancount, bufsize;
-	char ch;
+	int ch;
 	bool addr_set = false;
 	bool verbose = false;
 
