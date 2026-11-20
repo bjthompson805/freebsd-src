@@ -130,7 +130,8 @@ struct n1_softc {
 		uint8_t		*buf, *msgs;
 		uint64_t	buf_iova, msgs_iova;
 		uint16_t	tr, cr, index[4], mtr, mcr, head;
-	}			control;
+	}			control, wifi, beta;
+	int			routed;	/* map DMA on the function streams too */
 	void			*secondary;
 	uint64_t		secondary_iova;
 	uint32_t		secondary_size;
@@ -167,6 +168,11 @@ n1_dma_alloc(struct n1_softc *sc, size_t size, uint64_t *iova)
 		free(buf, M_DEVBUF);
 		return (NULL);
 	}
+	for (u_int sid = 2; error == 0 && sc->routed && sid <= 3; sid++)
+		error = apple_dart_map_stream(sc->dev, sc->dart, sid,
+		    sc->iova_next, pmap_kextract((vm_offset_t)buf), size);
+	if (error != 0)
+		device_printf(sc->dev, "DART function map: %d\n", error);
 	*iova = sc->iova_next;
 	sc->iova_next += size;
 	return (buf);
@@ -723,6 +729,7 @@ n1_route_functions(struct n1_softc *sc)
 	dsb(sy);
 	pmap_unmapdev(__DEVOLATILE(void *, routes), 16 * sizeof(*routes));
 	sc->sid = 1;
+	sc->routed = 1;
 	return (0);
 }
 
@@ -924,6 +931,7 @@ static const uint32_t n1_sec_holes[][2] = {
 };
 
 static int n1_ctrl_rings(struct n1_softc *);
+static int n1_fn_start(struct n1_softc *, int, struct n1_ctx *);
 
 static int
 n1_start_ipc(struct n1_softc *sc)
@@ -1214,7 +1222,21 @@ n1_start_ipc(struct n1_softc *sc)
 	device_printf(sc->dev, "control IPC handshake: %d\n", error);
 	if (error != 0)
 		return (error);
-	return (n1_ctrl_rings(sc));
+	/* XXX bring-up: function DevCtl and LinkCtl as macOS leaves them */
+	for (i = 0; i < 3; i++) {
+		int c;
+
+		if (pci_find_cap(sc->fn[i], PCIY_EXPRESS, &c) != 0)
+			continue;
+		pci_write_config(sc->fn[i], c + PCIER_DEVICE_CTL, 0x213f, 2);
+		pci_write_config(sc->fn[i], c + PCIER_DEVICE_STA, 0xf, 2);
+		pci_write_config(sc->fn[i], c + PCIER_LINK_CTL, 0x0002, 2);
+	}
+	if ((error = n1_fn_start(sc, 2, &sc->beta)) != 0)
+		return (error);
+	if ((error = n1_ctrl_rings(sc)) != 0)
+		return (error);
+	return (n1_fn_start(sc, 1, &sc->wifi));
 }
 
 /*
@@ -1243,8 +1265,12 @@ n1_ctrl_send(struct n1_softc *sc, const void *msg, uint32_t len)
 	N1_WR4(sc, 0x9000, c->head);
 	for (i = 0; i < 100; i++) {
 		cpu_dcache_inv_range(c->buf, PAGE_SIZE);
-		if (le16dec(c->buf + c->index[1]) == c->head)
+		if (le16dec(c->buf + c->index[1]) == c->head) {
+			/* consume the completion as macOS does: cr tail = cr head */
+			le16enc(c->buf + c->index[2], le16dec(c->buf + c->index[0]));
+			cpu_dcache_wb_range(c->buf, PAGE_SIZE);
 			return (0);
+		}
 		pause("n1msg", hz / 100 + 1);
 	}
 	return (ETIMEDOUT);
@@ -1316,8 +1342,124 @@ n1_ctrl_rings(struct n1_softc *sc)
 	}
 	device_printf(sc->dev, "ring 2: %d buffers returned, tr heads %*D\n",
 	    n, 10, sc->control.buf + sc->control.index[1], " ");
+
+	/*
+	 * Ring 4 takes firmware messages in host-posted 0x40-byte slots; ring 3
+	 * carries host messages: u8 type, u8 length, u16 0, u64 ~0, u32 flags,
+	 * u32 length, u32 0, payload. Type 2 opens "CentauriTransport", after
+	 * which macOS sees the Wi-Fi function at stage 2.
+	 */
+	memset(ring[4], 0, N1_PAGE);
+	memset(ring[3], 0, N1_PAGE);
+	le32enc(ring[4], 0x00040000);
+	le64enc(ring[4] + 4, ~0ul);
+	ring[3][0] = 2;
+	ring[3][1] = 0x1a;
+	le64enc(ring[3] + 4, ~0ul);
+	le32enc(ring[3] + 0x10, 0x1a);
+	memcpy(ring[3] + 0x18, "CentauriTransport", sizeof("CentauriTransport"));
+	cpu_dcache_wb_range(ring[4], N1_PAGE);
+	cpu_dcache_wb_range(ring[3], N1_PAGE);
+	le16enc(sc->control.buf + sc->control.index[3] + 2 * 4, 7);
+	le16enc(sc->control.buf + sc->control.index[3] + 2 * 3, 1);
+	cpu_dcache_wb_range(sc->control.buf, PAGE_SIZE);
+	N1_WR4(sc, 0x9010, 7);
+	N1_WR4(sc, 0x900c, 1);
+	pause("n1r34", hz);
+	cpu_dcache_inv_range(sc->control.buf, PAGE_SIZE);
+	cpu_dcache_inv_range(ring[3], N1_PAGE);
+	cpu_dcache_inv_range(ring[4], N1_PAGE);
+	device_printf(sc->dev, "after rings 3/4: heads %*D tails %*D\n",
+	    10, sc->control.buf + sc->control.index[1], " ",
+	    10, sc->control.buf + sc->control.index[3], " ");
+	for (i = 3; i <= 4; i++)
+		for (j = 0; j < 16 * 0x40; j += 32)
+			for (n = 0; n < 32; n++)
+				if (ring[i][j + n] != 0) {
+					device_printf(sc->dev, "ring%d +%#05x: %32D\n",
+					    i, j, ring[i] + j, " ");
+					break;
+				}
+	for (i = 0; i < 500 && bus_read_4(sc->fnbar[1], 0x8) != 2; i++)
+		pause("n1fn1", hz / 100 + 1);
+	device_printf(sc->dev, "wifi function stage %#x after %d ms\n",
+	    bus_read_4(sc->fnbar[1], 0x8), i * 10);
+	for (i = 1; i < 3; i++)	/* XXX bring-up */
+		device_printf(sc->dev, "fn%d %#x bar %#jx: %08x %08x %08x %08x "
+		    "%08x %08x %08x %08x\n", i, pci_get_devid(sc->fn[i]),
+		    rman_get_start(sc->fnbar[i]), bus_read_4(sc->fnbar[i], 0),
+		    bus_read_4(sc->fnbar[i], 4), bus_read_4(sc->fnbar[i], 8),
+		    bus_read_4(sc->fnbar[i], 0xc), bus_read_4(sc->fnbar[i], 0x10),
+		    bus_read_4(sc->fnbar[i], 0x14), bus_read_4(sc->fnbar[i], 0x18),
+		    bus_read_4(sc->fnbar[i], 0x1c));
 	return (0);
 }
+
+/*
+ * Data functions under macOS: alpha (Wi-Fi, function 1, BAR 0xb82010000)
+ * has 192 transfer and 234 completion rings; beta (function 2, BAR
+ * 0xb82000000) 22 and 1. Each takes a two-step handshake on its control
+ * register; before the second step macOS passes the context and a DMA
+ * aperture (base, then a 32-bit size running to the top of its IOVA window).
+ * Alpha reaches stage 2 only after beta's handshake.
+ */
+#define	N1_APERTURE_SIZE	0x10000000u
+
+static const struct n1_fn_regs {
+	const char	*name;
+	bus_size_t	stage, status, ctx, aperture, control;
+	uint16_t	tr, cr;
+	uint32_t	w50, scratch, scratch_size;
+} n1_fn_regs[3] = {
+	[1] = { "alpha", 0x8, 0xc, 0x10, 0x18, 0x1028, 192, 234,
+	    0, 0x920, 0x500000 },
+	[2] = { "beta", 0x18, 0x0, 0x4, 0xc, 0x107c, 22, 1,
+	    0x04000000, 0x3d8, 0 },
+};
+
+static int
+n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
+{
+	const struct n1_fn_regs *r = &n1_fn_regs[fn];
+	struct resource *bar = sc->fnbar[fn];
+	uint64_t ap;
+	int error, i;
+
+	for (i = 0; i < 200 && bus_read_4(bar, r->stage) != 2; i++)
+		pause("n1fn", hz / 100 + 1);
+	if ((error = n1_ctx_init(sc, c, r->tr, r->cr, 0, r->scratch_size)) != 0)
+		return (error);
+	le32enc(c->buf + 0x50, r->w50);
+	le64enc(c->buf + 0x58, c->buf_iova + r->scratch);
+	le32enc(c->buf + 0x68, 2);
+	le32enc(c->buf + 0x6c, 2);
+	cpu_dcache_wb_range(c->buf, PAGE_SIZE);
+	ap = sc->iova_next;
+	device_printf(sc->dev, "%s: stage %#x after %d ms, context %#lx\n",
+	    r->name, bus_read_4(bar, r->stage), i * 10, c->buf_iova);
+	bus_write_4(bar, r->control, 1);
+	for (i = 0; i < 200 && bus_read_4(bar, r->status) != 1; i++)
+		pause("n1hs", hz / 100 + 1);
+	if (bus_read_4(bar, r->status) != 1) {
+		device_printf(sc->dev, "%s: no handshake step 1 (%#x)\n",
+		    r->name, bus_read_4(bar, r->status));
+		return (ETIMEDOUT);
+	}
+	bus_write_4(bar, r->aperture, (uint32_t)ap);
+	bus_write_4(bar, r->aperture + 4, (uint32_t)(ap >> 32));
+	bus_write_4(bar, r->aperture + 8, N1_APERTURE_SIZE);
+	bus_write_4(bar, r->ctx, (uint32_t)c->buf_iova);
+	bus_write_4(bar, r->ctx + 4, (uint32_t)(c->buf_iova >> 32));
+	dsb(sy);
+	bus_write_4(bar, r->control, 2);
+	for (i = 0; i < 200 && bus_read_4(bar, r->status) != 2; i++)
+		pause("n1hs", hz / 100 + 1);
+	device_printf(sc->dev, "%s: handshake status %#x\n", r->name,
+	    bus_read_4(bar, r->status));
+	n1_dart_errors(sc);
+	return (bus_read_4(bar, r->status) == 2 ? 0 : ETIMEDOUT);
+}
+
 
 /* hw.apple_n1.boot=0: attach only (bring-up). */
 static int n1_boot = 1;
