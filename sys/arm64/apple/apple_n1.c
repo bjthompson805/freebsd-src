@@ -46,6 +46,7 @@
 #include <dev/pci/pcivar.h>
 
 #include <arm64/apple/apple_dart.h>
+#include <arm64/apple/apple_smc.h>
 
 #define	N1_VENDOR		0x106b
 #define	N1_DEV_CONTROL		0x1900
@@ -1563,6 +1564,24 @@ n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 static int n1_boot = 1;
 TUNABLE_INT("hw.apple_n1.boot", &n1_boot);
 
+/*
+ * hw.apple_n1.gp1c=1: replay the SMC gP1c sequence macOS writes before the
+ * ROM doorbell, after our post-ROM port cycle (bring-up: alpha stage 0).
+ */
+static int n1_gp1c = 1;
+TUNABLE_INT("hw.apple_n1.gp1c", &n1_gp1c);
+
+static void
+n1_smc_gp1c(struct n1_softc *sc)
+{
+	static const uint32_t seq[] = { 0x10001, 0x10001, 0x10000 };
+	int error = 0, i;
+
+	for (i = 0; error == 0 && i < nitems(seq); i++)
+		error = apple_smc_write_u32(0x67503163, seq[i]);
+	device_printf(sc->dev, "SMC gP1c sequence: %d\n", error);
+}
+
 static void
 n1_boot_task(void *arg, int pending __unused)
 {
@@ -1572,6 +1591,8 @@ n1_boot_task(void *arg, int pending __unused)
 		device_t *kids;
 		int i, n;
 
+		if (n1_gp1c)
+			n1_smc_gp1c(sc);
 		BUS_RESCAN(device_get_parent(sc->dev));
 		n1_start_ipc(sc);
 		if (device_get_children(device_get_parent(sc->dev), &kids,
