@@ -65,7 +65,7 @@
 
 #define	N1_MSI_DATA		0xa5a0
 #define	N1_PAGE			16384
-#define	N1_IOVA_BASE		0xf000000000ul
+#define	N1_IOVA_BASE		0x200000ul	/* below 4 GiB, as macOS (0x250000) */
 #define	N1_IOVA_END		0x10000000000ul	/* 1 TiB: 40 bits */
 #define	N1_FW_MAX		(64 * 1024 * 1024)
 
@@ -685,6 +685,7 @@ n1_ctx_init(struct n1_softc *sc, struct n1_ctx *c, uint16_t tr, uint16_t cr,
 	le64enc(h + 0x3c, c->buf_iova + c->mtr);
 	le16enc(h + 0x44, 16);
 	le16enc(h + 0x46, 16);
+	le16enc(h + 0x4a, 0xffff);	/* as macOS (control and beta) */
 	le64enc(h + 0x58, scratch != 0 ? scratch :
 	    c->buf_iova + roundup2(c->mcr + 256, 8));
 	le64enc(h + 0x60, scratch_size);
@@ -1038,6 +1039,9 @@ n1_start_ipc(struct n1_softc *sc)
 
 	if ((error = n1_ctx_init(sc, &sc->control, 13, 1, 0, 0)) != 0)
 		return (error);
+	le32enc(sc->control.buf + 0x68, 2);	/* as macOS at its handshake */
+	le32enc(sc->control.buf + 0x6c, 2);
+	cpu_dcache_wb_range(sc->control.buf, PAGE_SIZE);
 	/*
 	 * XXX bring-up: resend the image page by page with unmapped holes; the
 	 * DART fault then names the firmware's first access inside a hole.
@@ -1515,6 +1519,23 @@ static const struct n1_fn_regs {
 	    0x04000000, 0x3d8, 0 },
 };
 
+/* XXX bring-up: dump a context like hv_trace_n1_ipc.py to diff with macOS */
+static void
+n1_ctx_dump(struct n1_softc *sc, const char *name, struct n1_ctx *c,
+    size_t len)
+{
+	char line[3 * 32 + 1];
+	size_t o;
+	int i;
+
+	cpu_dcache_inv_range(c->buf, len);
+	for (o = 0; o < len; o += 32) {
+		for (i = 0; i < 32; i++)
+			snprintf(line + 3 * i, 4, " %02x", c->buf[o + i]);
+		printf("n1ctx %s +0x%03zx:%s\n", name, o, line);
+	}
+}
+
 static int
 n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 {
@@ -1523,6 +1544,10 @@ n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 	uint64_t ap;
 	int error, i;
 
+	if (fn == 1) {
+		n1_ctx_dump(sc, "control", &sc->control, 0x200);
+		n1_ctx_dump(sc, "beta", &sc->beta, 0x100);
+	}
 	for (i = 0; i < 200 && bus_read_4(bar, r->stage) != 2; i++)
 		pause("n1fn", hz / 100 + 1);
 	if ((error = n1_ctx_init(sc, c, r->tr, r->cr, 0, r->scratch_size)) != 0)
