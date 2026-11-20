@@ -898,6 +898,7 @@ static const uint32_t n1_img_holes[][2] = {
 #define	N1_NO_RO	0
 #define	N1_CRASH	0
 #define	N1_AOP_RUN	0
+#define	N1_POISON	0
 static const uint32_t n1_sec_holes[][2] = {
 	/* SECHOLES */
 	{ 0, 0 },
@@ -943,7 +944,8 @@ n1_start_ipc(struct n1_softc *sc)
 	sc->secondary_size = need;
 	memcpy(sc->secondary, seed, len);
 	/* XXX bring-up: poison mswb to detect device writes */
-	memset((uint8_t *)sc->secondary + 0x200300, 0xa5, 0x180000);
+	if (N1_POISON)
+		memset((uint8_t *)sc->secondary + 0x200300, 0xa5, 0x180000);
 	cpu_dcache_wb_range(sc->secondary, roundup2(need, N1_PAGE));
 	if (n1_sec_holes[0][1] != 0) {
 		uint64_t base = sc->iova_next;
