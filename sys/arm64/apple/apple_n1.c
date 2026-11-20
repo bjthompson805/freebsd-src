@@ -59,6 +59,22 @@
 #include <arm64/apple/apple_dart.h>
 #include <arm64/apple/apple_smc.h>
 
+/* hw.apple_n1.debug=1: bring-up diagnostics (register/ring/context dumps, firmware log) */
+static int n1_debug = 0;
+TUNABLE_INT("hw.apple_n1.debug", &n1_debug);
+#define	N1_DPRINTF(sc, ...) do {					\
+	if (n1_debug)							\
+		device_printf((sc)->dev, __VA_ARGS__);			\
+} while (0)
+#define	N1_DPRINTF_DEV(dev, ...) do {					\
+	if (n1_debug)							\
+		device_printf((dev), __VA_ARGS__);			\
+} while (0)
+#define	N1_PRINTF(...) do {						\
+	if (n1_debug)							\
+		printf(__VA_ARGS__);					\
+} while (0)
+
 #define	N1_VENDOR		0x106b
 #define	N1_DEV_CONTROL		0x1900
 #define	N1_DEV_CONTROL_FW	0x1901
@@ -266,7 +282,7 @@ n1_dart_errors(struct n1_softc *sc)
 	if (N1_DART_VERSION(params) >= 0x0202 && size >= 0x8010) {
 		/* The radio's streams are all in the first exception word. */
 		pending = *(volatile uint32_t *)(va + N1_DART_EXCEPTIONS);
-		device_printf(sc->dev, "DART exceptions %#x\n", pending);
+		N1_DPRINTF(sc, "DART exceptions %#x\n", pending);
 		while (pending != 0) {
 			sid = ffs(pending) - 1;
 			pending &= pending - 1;
@@ -289,7 +305,7 @@ n1_dart_errors(struct n1_softc *sc)
 
 	/* Root port: interrupt status, link status (pcie-apple PORT_INTSTAT/LINKSTS). */
 	va = (vm_offset_t)pmap_mapdev(0x488028000, 0x4000);
-	device_printf(sc->dev, "port intstat %#x linksts %#x\n",
+	N1_DPRINTF(sc, "port intstat %#x linksts %#x\n",
 	    *(volatile uint32_t *)(va + 0x100), *(volatile uint32_t *)(va + 0x208));
 	pmap_unmapdev((void *)va, 0x4000);
 }
@@ -384,7 +400,7 @@ n1_rom_boot(struct n1_softc *sc)
 				desc_size = 0x40;
 				break;
 			}
-			device_printf(sc->dev, "ticket: %zu bytes, mode %d "
+			N1_DPRINTF(sc, "ticket: %zu bytes, mode %d "
 			    "flags %d\n", tkt->datasize, n1_tkt_mode, n1_tkt_flags);
 		}
 		firmware_put(tkt, FIRMWARE_UNLOAD);
@@ -449,16 +465,16 @@ n1_rom_boot(struct n1_softc *sc)
 		for (i = 0; i < 500 &&
 		    (r2 = N1_RD4(sc, N1_ROM_RESPONSE)) == 0; i++)
 			pause("n1rom", hz / 50);
-		device_printf(sc->dev, "doorbell %d: response %#x stage %#x "
+		N1_DPRINTF(sc, "doorbell %d: response %#x stage %#x "
 		    "(%d ms)\n", r + 2, r2, N1_RD4(sc, N1_STAGE), i * 20);
 	}
 	stage = N1_RD4(sc, N1_STAGE);
 	cpu_dcache_inv_range(sc->mbox, N1_PAGE);
-	device_printf(sc->dev, "ROM result: response %#x stage %#x mailbox %#x "
+	N1_DPRINTF(sc, "ROM result: response %#x stage %#x mailbox %#x "
 	    "(%d ms)\n", resp, stage, le32dec(sc->mbox), i * 20);
 	n1_dart_errors(sc);
 	for (i = 0; i < 0x100; i += 0x20)	/* XXX bring-up */
-		device_printf(sc->dev, "%#x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		N1_DPRINTF(sc, "%#x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
 		    0x8000 + i, N1_RD4(sc, 0x8000 + i), N1_RD4(sc, 0x8004 + i),
 		    N1_RD4(sc, 0x8008 + i), N1_RD4(sc, 0x800c + i),
 		    N1_RD4(sc, 0x8010 + i), N1_RD4(sc, 0x8014 + i),
@@ -523,7 +539,8 @@ n1_power_cycle(struct n1_softc *sc)
 	if (error == 0)
 		error = apple_smc_write_u32(0x67703065, 0x800001);
 	pause("n1on", hz * 15 / 100 + 1);
-	device_printf(sc->dev, "N1 power cycle: %d\n", error);
+	if (error != 0)
+		device_printf(sc->dev, "N1 power cycle: %d\n", error);
 }
 
 static int
@@ -655,7 +672,7 @@ n1_port_cycle_power(struct n1_softc *sc, bool power)
 			pci_write_config(rp, 4 * i, rpcfg[i], 4);
 	id = pci_read_config(sc->dev, PCIR_DEVVENDOR, 4);
 	pci_restore_state(sc->dev);
-	device_printf(sc->dev, "port cycle: link up, function 0 now %#x, "
+	N1_DPRINTF(sc, "port cycle: link up, function 0 now %#x, "
 	    "stage %#x\n", id, N1_RD4(sc, N1_STAGE));
 	error = 0;
 out:
@@ -807,7 +824,8 @@ n1_route_functions(struct n1_softc *sc)
 		if (error == 0)
 			error = apple_dart_map_stream(sc->dev, sc->dart, 16,
 			    0x381204000ul, 0x381204000ul, N1_PAGE);
-		device_printf(sc->dev, "SID 16 MSI doorbell map: %d\n", error);
+		if (error != 0)
+			device_printf(sc->dev, "SID 16 MSI doorbell map: %d\n", error);
 	}
 	/*
 	 * XXX bring-up: macOS has stream 17 enabled with its own table before
@@ -818,7 +836,8 @@ n1_route_functions(struct n1_softc *sc)
 		if (error == 0)
 			error = apple_dart_map_stream(sc->dev, sc->dart, 17,
 			    0x381204000ul, 0x381204000ul, N1_PAGE);
-		device_printf(sc->dev, "SID 17 enable: %d\n", error);
+		if (error != 0)
+			device_printf(sc->dev, "SID 17 enable: %d\n", error);
 	}
 	sc->sid = 1;
 	sc->routed = 1;
@@ -906,7 +925,7 @@ n1_enable_ptm(struct n1_softc *sc)
 
 	common = (vm_offset_t)pmap_mapdev(N1_COMMON, PAGE_SIZE);
 	pcfg = (vm_offset_t)pmap_mapdev(N1_PORT_CONFIG, 0x4000);
-	device_printf(sc->dev, "PTM: common 0x50 %#x, port cfg 0x2b0 %#x, "
+	N1_DPRINTF(sc, "PTM: common 0x50 %#x, port cfg 0x2b0 %#x, "
 	    "bridge 0x2b0 %08x %08x %08x, 0x2f4 %#x 0x2f8 %#x 0x304 %#x\n",
 	    *(volatile uint32_t *)(common + 0x50),
 	    *(volatile uint32_t *)(pcfg + 0x2b0),
@@ -935,11 +954,11 @@ n1_enable_ptm(struct n1_softc *sc)
 			continue;
 		pci_write_config(sc->fn[i], cap + 8,
 		    pci_read_config(sc->fn[i], cap + 8, 4) | 1, 4);
-		device_printf(sc->dev, "PTM: function %d cap %#x %08x ctl %08x\n",
+		N1_DPRINTF(sc, "PTM: function %d cap %#x %08x ctl %08x\n",
 		    i, cap, pci_read_config(sc->fn[i], cap + 4, 4),
 		    pci_read_config(sc->fn[i], cap + 8, 4));
 	}
-	device_printf(sc->dev, "PTM: common 0x50 %#x, port cfg 0x2b0 %#x, "
+	N1_DPRINTF(sc, "PTM: common 0x50 %#x, port cfg 0x2b0 %#x, "
 	    "bridge ctl %#x\n", *(volatile uint32_t *)(common + 0x50),
 	    *(volatile uint32_t *)(pcfg + 0x2b0), pci_read_config(rp, 0x2b8, 4));
 	pmap_unmapdev((void *)pcfg, 0x4000);
@@ -956,7 +975,7 @@ n1_pcie_dump(struct n1_softc *sc, const char *when, int ep)
 
 	for (i = 0; i < (ep ? 2 : 1); i++) {
 		if (pci_find_cap(d[i], PCIY_EXPRESS, &cap) == 0)
-			device_printf(sc->dev, "%s %s: devcap %08x devctl %04x "
+			N1_DPRINTF(sc, "%s %s: devcap %08x devctl %04x "
 			    "devsts %04x devcap2 %08x devctl2 %04x\n", when,
 			    i ? "fn0" : "rp", pci_read_config(d[i], cap + 4, 4),
 			    pci_read_config(d[i], cap + 8, 2),
@@ -964,7 +983,7 @@ n1_pcie_dump(struct n1_softc *sc, const char *when, int ep)
 			    pci_read_config(d[i], cap + 0x24, 4),
 			    pci_read_config(d[i], cap + 0x28, 2));
 		if (pci_find_extcap(d[i], PCIZ_AER, &cap) == 0)
-			device_printf(sc->dev, "%s %s AER: ue %08x mask %08x sev "
+			N1_DPRINTF(sc, "%s %s AER: ue %08x mask %08x sev "
 			    "%08x ce %08x hdr %08x %08x %08x %08x\n", when,
 			    i ? "fn0" : "rp", pci_read_config(d[i], cap + 4, 4),
 			    pci_read_config(d[i], cap + 8, 4),
@@ -976,7 +995,7 @@ n1_pcie_dump(struct n1_softc *sc, const char *when, int ep)
 			    pci_read_config(d[i], cap + 40, 4));
 	}
 	if (pci_find_cap(rp, PCIY_EXPRESS, &cap) == 0)
-		device_printf(sc->dev, "%s rp: secsts %04x rootsts %08x\n", when,
+		N1_DPRINTF(sc, "%s rp: secsts %04x rootsts %08x\n", when,
 		    pci_read_config(rp, PCIR_SECSTAT_1, 2),
 		    pci_read_config(rp, cap + 0x20, 4));
 }
@@ -992,7 +1011,7 @@ n1_spmi_dump(struct n1_softc *sc, const char *when)
 	for (i = 0; i < nitems(base); i++) {
 		va = (vm_offset_t)pmap_mapdev(base[i], PAGE_SIZE);
 		for (j = 0; j < 0x40; j += 0x10)
-			device_printf(sc->dev, "spmi %s %#lx+%#x: %08x %08x %08x %08x\n",
+			N1_DPRINTF(sc, "spmi %s %#lx+%#x: %08x %08x %08x %08x\n",
 			    when, base[i], j, *(volatile uint32_t *)(va + j),
 			    *(volatile uint32_t *)(va + j + 4),
 			    *(volatile uint32_t *)(va + j + 8),
@@ -1027,7 +1046,7 @@ static const uint32_t n1_sec_holes[][2] = {
 
 static int n1_ctrl_rings(struct n1_softc *);
 #define	N1_AER(sc, what)	/* XXX bring-up */				\
-	device_printf((sc)->dev, "AER %s: fn1 ue %#x devsts %#x, fn2 ue %#x\n",	\
+	N1_DPRINTF((sc), "AER %s: fn1 ue %#x devsts %#x, fn2 ue %#x\n",	\
 	    what, pci_read_config((sc)->fn[1], 0x104, 4),			\
 	    pci_read_config((sc)->fn[1], 0x7a, 2),				\
 	    pci_read_config((sc)->fn[2], 0x104, 4))
@@ -1100,20 +1119,20 @@ n1_start_ipc(struct n1_softc *sc)
 		sc->iova_next = base + roundup2(need, N1_PAGE);
 		sc->secondary_iova = base;
 		for (h = 0; n1_sec_holes[h][1] != 0; h++)
-			device_printf(sc->dev, "secondary probe: memswap at %#lx, "
+			N1_DPRINTF(sc, "secondary probe: memswap at %#lx, "
 			    "hole %#x-%#x\n", base, n1_sec_holes[h][0],
 			    n1_sec_holes[h][1]);
 	}
 	/* XXX bring-up: DART protection bits on the mswb page (7 no-write, 8 no-read) */
 	if (N1_MSWB_PROT != 0)
-		device_printf(sc->dev, "mswb page prot %#lx: %d\n",
+		N1_DPRINTF(sc, "mswb page prot %#lx: %d\n",
 		    (u_long)N1_MSWB_PROT, apple_dart_pte_bits(sc->dev, sc->dart,
 		    sc->sid, sc->secondary_iova + 0x200000, N1_MSWB_PROT));
 	pci_write_config(sc->dev, 0xf88, (uint32_t)sc->secondary_iova, 4);
 	pci_write_config(sc->dev, 0xf8c, (uint32_t)(sc->secondary_iova >> 32), 4);
 	pci_write_config(sc->dev, 0xf90, need, 4);
 
-	device_printf(sc->dev, "secondary memory: seed %u, %u bytes\n", len,
+	N1_DPRINTF(sc, "secondary memory: seed %u, %u bytes\n", len,
 	    need);
 
 	if ((error = n1_ctx_init(sc, &sc->control, 13, 1, 0, 0)) != 0)
@@ -1150,7 +1169,7 @@ n1_start_ipc(struct n1_softc *sc)
 		le64enc(sc->desc, base);
 		cpu_dcache_wb_range(sc->desc, N1_PAGE);
 		for (h = 0; n1_img_holes[h][1] != 0; h++)
-			device_printf(sc->dev, "secondary probe: image at %#lx, "
+			N1_DPRINTF(sc, "secondary probe: image at %#lx, "
 			    "hole %#x-%#x\n", base, n1_img_holes[h][0],
 			    n1_img_holes[h][1]);
 	}
@@ -1174,11 +1193,11 @@ n1_start_ipc(struct n1_softc *sc)
 
 		for (k = 0; k < 2; k++) {
 			if (pci_find_extcap(dv[k], PCIZ_VC, &c) != 0) {
-				device_printf(sc->dev, "VC %s: none\n", k ? "fn0" : "rp");
+				N1_DPRINTF(sc, "VC %s: none\n", k ? "fn0" : "rp");
 				continue;
 			}
 			for (w = 0; w < 0x30; w += 0x10)
-				device_printf(sc->dev, "VC %s %#x+%#x: %08x %08x %08x %08x\n",
+				N1_DPRINTF(sc, "VC %s %#x+%#x: %08x %08x %08x %08x\n",
 				    k ? "fn0" : "rp", c, w,
 				    pci_read_config(dv[k], c + w, 4),
 				    pci_read_config(dv[k], c + w + 4, 4),
@@ -1187,7 +1206,7 @@ n1_start_ipc(struct n1_softc *sc)
 		}
 		for (k = 0x18c; k <= 0x298; k += 0x298 - 0x18c)	/* Apple VSECs */
 			for (w = 0; w < 0x40; w += 0x10)
-				device_printf(sc->dev, "VSEC %#x+%#x: %08x %08x %08x %08x\n",
+				N1_DPRINTF(sc, "VSEC %#x+%#x: %08x %08x %08x %08x\n",
 				    k, w, pci_read_config(sc->dev, k + w, 4),
 				    pci_read_config(sc->dev, k + w + 4, 4),
 				    pci_read_config(sc->dev, k + w + 8, 4),
@@ -1198,12 +1217,12 @@ n1_start_ipc(struct n1_softc *sc)
 					pci_write_config(dv[k], c + 0x28,
 					    pci_read_config(dv[k], c + 0x28, 2) | 0x400, 2);
 			pci_write_config(sc->dev, 0x174 + 4, 0x08100810, 4);
-			device_printf(sc->dev, "LTR on: fn0 ltr %08x\n",
+			N1_DPRINTF(sc, "LTR on: fn0 ltr %08x\n",
 			    pci_read_config(sc->dev, 0x174 + 4, 4));
 		}
 		for (k = 0x100, c = 0; k && c < 20; c++) {	/* fn0 ext cap list */
 			w = pci_read_config(sc->dev, k, 4);
-			device_printf(sc->dev, "fn0 extcap %#x: id %#x ver %u\n", k,
+			N1_DPRINTF(sc, "fn0 extcap %#x: id %#x ver %u\n", k,
 			    w & 0xffff, (w >> 16) & 0xf);
 			k = (w >> 20) & 0xffc;
 		}
@@ -1211,11 +1230,11 @@ n1_start_ipc(struct n1_softc *sc)
 	if (N1_AOP_RUN) {	/* XXX bring-up: start the (iBoot-preloaded) AOP */
 		vm_offset_t a = (vm_offset_t)pmap_mapdev(0x390600000, PAGE_SIZE);
 
-		device_printf(sc->dev, "AOP cpu_control %#x -> RUN\n",
+		N1_DPRINTF(sc, "AOP cpu_control %#x -> RUN\n",
 		    *(volatile uint32_t *)(a + 0x44));
 		*(volatile uint32_t *)(a + 0x44) |= 0x10;
 		DELAY(500000);
-		device_printf(sc->dev, "AOP cpu_control %#x mbox %#x\n",
+		N1_DPRINTF(sc, "AOP cpu_control %#x mbox %#x\n",
 		    *(volatile uint32_t *)(a + 0x44),
 		    *(volatile uint32_t *)(a + 0x48));
 		pmap_unmapdev((void *)a, PAGE_SIZE);
@@ -1245,7 +1264,7 @@ n1_start_ipc(struct n1_softc *sc)
 		pva = (vm_offset_t)pmap_mapdev(0x488028000, 0x4000);
 		/* centauri function-error_detect: aop-gpio pin 0x2d */
 		gva = (vm_offset_t)pmap_mapdev(0x390824000, PAGE_SIZE);
-		device_printf(sc->dev, "error_detect gpio before doorbell %#x\n",
+		N1_DPRINTF(sc, "error_detect gpio before doorbell %#x\n",
 		    *(volatile uint32_t *)(gva + 4 * 0x2d));
 		N1_WR4(sc, 0x9070, 1);
 		for (i = 0; i < 500; i++) {
@@ -1260,7 +1279,7 @@ n1_start_ipc(struct n1_softc *sc)
 			for (k = 0; k < 7 && v[k] == pv[k]; k++)
 				;
 			if (k < 7) {
-				device_printf(sc->dev, "XXX t=%d ltssm %#x lnk %#x "
+				N1_DPRINTF(sc, "XXX t=%d ltssm %#x lnk %#x "
 				    "darterr %#x addr %#x intstat %#x mbox %#x "
 				    "errgpio %#x\n", i * 10, v[0], v[1], v[2], v[3],
 				    v[4], v[5], v[6]);
@@ -1275,7 +1294,7 @@ n1_start_ipc(struct n1_softc *sc)
 		pmap_unmapdev((void *)pva, 0x4000);
 		pmap_unmapdev((void *)dva, dsz);
 	}
-	device_printf(sc->dev, "exec-stage MSI %#x after ~%d ms\n",
+	N1_DPRINTF(sc, "exec-stage MSI %#x after ~%d ms\n",
 	    le32dec(sc->mbox), i * 10);
 	n1_dart_errors(sc);
 	if (le32dec(sc->mbox) == 0) {
@@ -1289,10 +1308,10 @@ n1_start_ipc(struct n1_softc *sc)
 			const uint8_t *b = sc->secondary;
 			uint32_t o, k;
 
-			device_printf(sc->dev, "TriggerChipCrash (config 0xf84 = 1)\n");
+			N1_DPRINTF(sc, "TriggerChipCrash (config 0xf84 = 1)\n");
 			DELAY(100000);
 			pci_write_config(sc->dev, 0xf84, 1, 4);
-			device_printf(sc->dev, "crash written, waiting\n");
+			N1_DPRINTF(sc, "crash written, waiting\n");
 			DELAY(3000000);
 			cpu_dcache_inv_range(sc->secondary, roundup2(need, N1_PAGE));
 			for (o = len, k = 0; o < need && k < 48; o += 64) {
@@ -1305,18 +1324,18 @@ n1_start_ipc(struct n1_softc *sc)
 				if (!nz)
 					continue;
 				k++;
-				device_printf(sc->dev, "sec %#x: %32D\n", o, b + o, "");
-				device_printf(sc->dev, "sec %#x: %32D\n", o + 32, b + o + 32, "");
+				N1_DPRINTF(sc, "sec %#x: %32D\n", o, b + o, "");
+				N1_DPRINTF(sc, "sec %#x: %32D\n", o + 32, b + o + 32, "");
 			}
-			device_printf(sc->dev, "crash scan: %u nonzero lines\n", k);
+			N1_DPRINTF(sc, "crash scan: %u nonzero lines\n", k);
 		}
-		device_printf(sc->dev, "mswb poison %s (first %#tx)\n",
+		N1_DPRINTF(sc, "mswb poison %s (first %#tx)\n",
 		    written ? "CHANGED" : "intact", written ? written -
 		    (const uint8_t *)sc->secondary : 0);
 		written = memcchr((const uint8_t *)sc->secondary + len, 0,
 		    0x200300 - len);
 		if (written != NULL)
-			device_printf(sc->dev, "secondary memory populated "
+			N1_DPRINTF(sc, "secondary memory populated "
 			    "at offset %#tx\n",
 			    written - (const uint8_t *)sc->secondary);
 		else
@@ -1417,11 +1436,11 @@ n1_rx_scan(struct n1_softc *sc)
 		b = sc->rx + 0x8000 * (id % 15);
 		len = MIN(le32dec(e) >> 8, 0x8000);
 		cpu_dcache_inv_range(b, 0x8000);
-		device_printf(sc->dev, "rx %d: type %u len %#x\n", sc->rx_seen,
+		N1_DPRINTF(sc, "rx %d: type %u len %#x\n", sc->rx_seen,
 		    e[0], len);
 		if (len <= 0x40) {
 			for (j = 0; j < len; j += 32)
-				device_printf(sc->dev, "rx %d +%#04x: %32D\n",
+				N1_DPRINTF(sc, "rx %d +%#04x: %32D\n",
 				    sc->rx_seen, j, b + j, " ");
 		} else {
 			for (j = 0; j < len; j = k + 1) {
@@ -1429,11 +1448,11 @@ n1_rx_scan(struct n1_softc *sc)
 				    b[k] < 0x7f; k++)
 					;
 				if (k - j >= 4)
-					printf("n1log: %.*s\n", (int)(k - j),
+					N1_PRINTF("n1log: %.*s\n", (int)(k - j),
 					    b + j);
 			}
 			for (j = len > 0x200 ? len - 0x200 : 0; j < len; j += 32)
-				device_printf(sc->dev, "rx %d +%#06x: %32D\n",
+				N1_DPRINTF(sc, "rx %d +%#06x: %32D\n",
 				    sc->rx_seen, j, b + j, " ");
 		}
 		memset(e, 0, 16);
@@ -1480,7 +1499,7 @@ n1_ctrl_rings(struct n1_softc *sc)
 		le16enc(msg + 0x1c, rings[i].id);
 		le16enc(msg + 0x1e, 0x40);
 		error = n1_ctrl_send(sc, msg, sizeof(msg));
-		device_printf(sc->dev, "create ring %u: %d (tr0 head %u)\n",
+		N1_DPRINTF(sc, "create ring %u: %d (tr0 head %u)\n",
 		    rings[i].id, error, le16dec(sc->control.buf +
 		    sc->control.index[1]));
 		if (error != 0)
@@ -1514,7 +1533,7 @@ n1_ctrl_rings(struct n1_softc *sc)
 		n1_rx_scan(sc);
 	}
 	n = sc->rx_seen;
-	device_printf(sc->dev, "ring 2: %d buffers returned, tr heads %*D\n",
+	N1_DPRINTF(sc, "ring 2: %d buffers returned, tr heads %*D\n",
 	    n, 10, sc->control.buf + sc->control.index[1], " ");
 
 	/*
@@ -1543,14 +1562,14 @@ n1_ctrl_rings(struct n1_softc *sc)
 	cpu_dcache_inv_range(sc->control.buf, PAGE_SIZE);
 	cpu_dcache_inv_range(ring[3], N1_PAGE);
 	cpu_dcache_inv_range(ring[4], N1_PAGE);
-	device_printf(sc->dev, "after rings 3/4: heads %*D tails %*D\n",
+	N1_DPRINTF(sc, "after rings 3/4: heads %*D tails %*D\n",
 	    10, sc->control.buf + sc->control.index[1], " ",
 	    10, sc->control.buf + sc->control.index[3], " ");
 	for (i = 3; i <= 4; i++)
 		for (j = 0; j < 16 * 0x40; j += 32)
 			for (n = 0; n < 32; n++)
 				if (ring[i][j + n] != 0) {
-					device_printf(sc->dev, "ring%d +%#05x: %32D\n",
+					N1_DPRINTF(sc, "ring%d +%#05x: %32D\n",
 					    i, j, ring[i] + j, " ");
 					break;
 				}
@@ -1558,7 +1577,7 @@ n1_ctrl_rings(struct n1_softc *sc)
 		pause("n1fn1", hz / 100 + 1);
 		n1_rx_scan(sc);
 	}
-	device_printf(sc->dev, "wifi function stage %#x after %d ms\n",
+	N1_DPRINTF(sc, "wifi function stage %#x after %d ms\n",
 	    bus_read_4(sc->fnbar[1], 0x8), i * 10);
 	for (i = 1; i < 3; i++) {	/* XXX bring-up: does the BAR answer? */
 		uint32_t v, before, after;
@@ -1567,14 +1586,14 @@ n1_ctrl_rings(struct n1_softc *sc)
 		before = pci_read_config(sc->fn[i], 0x7a, 2);
 		v = bus_read_4(sc->fnbar[i], 0x8);
 		after = pci_read_config(sc->fn[i], 0x7a, 2);
-		device_printf(sc->dev, "fn%d BAR read %#x: devsts %#x -> %#x, "
+		N1_DPRINTF(sc, "fn%d BAR read %#x: devsts %#x -> %#x, "
 		    "cmd %#x bar0 %#x rman %#jx-%#jx\n", i, v, before, after,
 		    pci_read_config(sc->fn[i], 4, 2),
 		    pci_read_config(sc->fn[i], 0x10, 4),
 		    rman_get_start(sc->fnbar[i]), rman_get_end(sc->fnbar[i]));
 	}
 	for (i = 1; i < 3; i++)	/* XXX bring-up */
-		device_printf(sc->dev, "fn%d %#x bar %#jx: %08x %08x %08x %08x "
+		N1_DPRINTF(sc, "fn%d %#x bar %#jx: %08x %08x %08x %08x "
 		    "%08x %08x %08x %08x\n", i, pci_get_devid(sc->fn[i]),
 		    rman_get_start(sc->fnbar[i]), bus_read_4(sc->fnbar[i], 0),
 		    bus_read_4(sc->fnbar[i], 4), bus_read_4(sc->fnbar[i], 8),
@@ -1619,7 +1638,7 @@ n1_ctx_dump(struct n1_softc *sc, const char *name, struct n1_ctx *c,
 	for (o = 0; o < len; o += 32) {
 		for (i = 0; i < 32; i++)
 			snprintf(line + 3 * i, 4, " %02x", c->buf[o + i]);
-		printf("n1ctx %s +0x%03zx:%s\n", name, o, line);
+		N1_PRINTF("n1ctx %s +0x%03zx:%s\n", name, o, line);
 	}
 }
 
@@ -1635,11 +1654,11 @@ n1_bar_scan(struct n1_softc *sc, int fn)
 	for (o = 0; o < size && n < 200; o += 4) {
 		v = bus_read_4(bar, o);
 		if (v != 0 && v != 0xffffffff) {
-			printf("n1bar fn%d +0x%04jx = %#x\n", fn, (uintmax_t)o, v);
+			N1_PRINTF("n1bar fn%d +0x%04jx = %#x\n", fn, (uintmax_t)o, v);
 			n++;
 		}
 	}
-	printf("n1bar fn%d: %d nonzero words in %#jx\n", fn, n, (uintmax_t)size);
+	N1_PRINTF("n1bar fn%d: %d nonzero words in %#jx\n", fn, n, (uintmax_t)size);
 }
 
 static int
@@ -1667,7 +1686,7 @@ n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 	cpu_dcache_wb_range(c->buf, PAGE_SIZE);
 	ap = N1_IOVA_BASE;	/* the whole DMA window, as macOS */
 	n1_rx_scan(sc);
-	device_printf(sc->dev, "%s: stage %#x after %d ms, context %#lx\n",
+	N1_DPRINTF(sc, "%s: stage %#x after %d ms, context %#lx\n",
 	    r->name, bus_read_4(bar, r->stage), i * 10, c->buf_iova);
 	bus_write_4(bar, r->control, 1);
 	for (i = 0; i < 200 && bus_read_4(bar, r->status) != 1; i++)
@@ -1686,7 +1705,7 @@ n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 	bus_write_4(bar, r->control, 2);
 	for (i = 0; i < 200 && bus_read_4(bar, r->status) != 2; i++)
 		pause("n1hs", hz / 100 + 1);
-	device_printf(sc->dev, "%s: handshake status %#x\n", r->name,
+	N1_DPRINTF(sc, "%s: handshake status %#x\n", r->name,
 	    bus_read_4(bar, r->status));
 	n1_dart_errors(sc);
 	return (bus_read_4(bar, r->status) == 2 ? 0 : ETIMEDOUT);
@@ -2158,7 +2177,7 @@ n1_bt_cmd(struct n1_softc *sc, uint16_t op, const void *param, uint8_t plen)
 		n1_bt_rx(sc, BT_HCI_RX, &q);
 		mtx_unlock(&sc->bt_mtx);
 		if ((m = mbufq_dequeue(&q)) != NULL) {
-			device_printf(sc->dev, "hci %#06x: event %*D\n", op,
+			N1_DPRINTF(sc, "hci %#06x: event %*D\n", op,
 			    (int)MIN(m->m_len, 16), mtod(m, uint8_t *), " ");
 			mbufq_drain(&q);
 			m_freem(m);
@@ -2414,7 +2433,8 @@ n1_smc_gp1c(struct n1_softc *sc)
 
 	for (i = 0; error == 0 && i < nitems(seq); i++)
 		error = apple_smc_write_u32(0x67503163, seq[i]);
-	device_printf(sc->dev, "SMC gP1c sequence: %d\n", error);
+	if (error != 0)
+		device_printf(sc->dev, "SMC gP1c sequence: %d\n", error);
 }
 
 /* hw.apple_n1.repower=1: power-cycle the N1 right before the ROM boot */
@@ -2440,7 +2460,7 @@ n1_boot_task(void *arg, int pending __unused)
 		if (device_get_children(device_get_parent(sc->dev), &kids,
 		    &n) == 0) {
 			for (i = 0; i < n; i++)
-				device_printf(sc->dev, "function %d: %04x:%04x\n",
+				N1_DPRINTF(sc, "function %d: %04x:%04x\n",
 				    pci_get_function(kids[i]),
 				    pci_get_vendor(kids[i]),
 				    pci_get_device(kids[i]));
@@ -2501,7 +2521,7 @@ n1_attach(device_t dev)
 		    error);
 		goto fail;
 	}
-	device_printf(dev, "BAR0 %#lx (%#lx bytes), stage %#x, DART sid %u\n",
+	N1_DPRINTF_DEV(dev, "BAR0 %#lx (%#lx bytes), stage %#x, DART sid %u\n",
 	    rman_get_start(sc->bar), rman_get_size(sc->bar),
 	    N1_RD4(sc, N1_STAGE), sc->sid);
 
@@ -2565,7 +2585,7 @@ n1fn_attach(device_t dev)
 		device_printf(dev, "can't map BAR0\n");
 		return (ENXIO);
 	}
-	device_printf(dev, "BAR0 %#lx (%#lx bytes)\n", rman_get_start(bar),
+	N1_DPRINTF_DEV(dev, "BAR0 %#lx (%#lx bytes)\n", rman_get_start(bar),
 	    rman_get_size(bar));
 	if (n1_sc != NULL && f > 0 && f < 3) {
 		n1_sc->fn[f] = dev;
