@@ -1504,37 +1504,41 @@ n1_ctrl_rings(struct n1_softc *sc)
 		    sc->control.index[1]));
 		if (error != 0)
 			return (error);
-	}
+		if (rings[i].id != 2)
+			continue;
 
-	/*
-	 * Ring 2 receives: 16-byte entries u16 1, u16 size >> 8, u64 buffer,
-	 * u32 index; the firmware fills a buffer, writes the length into bits 8-31
-	 * of the first word and sets 4 in the last byte. macOS posts 15 of 32 KiB.
-	 */
-	if ((rx = n1_dma_alloc(sc, 15 * 0x8000, &rx_iova)) == NULL)
-		return (ENOMEM);
-	for (j = 0; j < 15; j++) {
-		e = ring[2] + 16 * j;
-		le16enc(e, 1);
-		le16enc(e + 2, 0x80);
-		le64enc(e + 4, rx_iova + 0x8000 * j);
-		le32enc(e + 12, j);
+		/*
+		 * Ring 2 receives: 16-byte entries u16 1, u16 size >> 8, u64
+		 * buffer, u32 index; the firmware fills a buffer, writes the
+		 * length into bits 8-31 of the first word and sets 4 in the
+		 * last byte. macOS posts 15 of 32 KiB, and posts and recycles
+		 * them before it creates rings 4 and 3.
+		 */
+		if ((rx = n1_dma_alloc(sc, 15 * 0x8000, &rx_iova)) == NULL)
+			return (ENOMEM);
+		for (j = 0; j < 15; j++) {
+			e = ring[2] + 16 * j;
+			le16enc(e, 1);
+			le16enc(e + 2, 0x80);
+			le64enc(e + 4, rx_iova + 0x8000 * j);
+			le32enc(e + 12, j);
+		}
+		cpu_dcache_wb_range(ring[2], N1_PAGE);
+		le16enc(sc->control.buf + sc->control.index[3] + 2 * 2, 15);
+		cpu_dcache_wb_range(sc->control.buf, PAGE_SIZE);
+		N1_WR4(sc, 0x9008, 15);
+		sc->rx_iova = rx_iova;
+		sc->rx_posted = 15;
+		sc->rx = rx;
+		sc->ring2 = ring[2];
+		for (j = 0; j < 100; j++) {
+			pause("n1rx", hz / 100 + 1);
+			n1_rx_scan(sc);
+		}
+		n = sc->rx_seen;
+		N1_DPRINTF(sc, "ring 2: %d buffers returned, tr heads %*D\n",
+		    n, 10, sc->control.buf + sc->control.index[1], " ");
 	}
-	cpu_dcache_wb_range(ring[2], N1_PAGE);
-	le16enc(sc->control.buf + sc->control.index[3] + 2 * 2, 15);
-	cpu_dcache_wb_range(sc->control.buf, PAGE_SIZE);
-	N1_WR4(sc, 0x9008, 15);
-	sc->rx_iova = rx_iova;
-	sc->rx_posted = 15;
-	sc->rx = rx;
-	sc->ring2 = ring[2];
-	for (i = 0; i < 100; i++) {
-		pause("n1rx", hz / 100 + 1);
-		n1_rx_scan(sc);
-	}
-	n = sc->rx_seen;
-	N1_DPRINTF(sc, "ring 2: %d buffers returned, tr heads %*D\n",
-	    n, 10, sc->control.buf + sc->control.index[1], " ");
 
 	/*
 	 * Ring 4 takes firmware messages in host-posted 0x40-byte slots; ring 3
@@ -1557,6 +1561,13 @@ n1_ctrl_rings(struct n1_softc *sc)
 	le16enc(sc->control.buf + sc->control.index[3] + 2 * 3, 1);
 	cpu_dcache_wb_range(sc->control.buf, PAGE_SIZE);
 	N1_WR4(sc, 0x9010, 7);
+	/* macOS sees alpha at stage 2 here, before its first ring 3 message */
+	for (i = 0; i < 100 && bus_read_4(sc->fnbar[1], 0x8) != 2; i++) {
+		pause("n1fn1", hz / 100 + 1);
+		n1_rx_scan(sc);
+	}
+	N1_PRINTF("apple_n1: alpha stage %#x %d ms after ring 4 post\n",
+	    bus_read_4(sc->fnbar[1], 0x8), i * 10);
 	N1_WR4(sc, 0x900c, 1);
 	pause("n1r34", hz);
 	cpu_dcache_inv_range(sc->control.buf, PAGE_SIZE);
