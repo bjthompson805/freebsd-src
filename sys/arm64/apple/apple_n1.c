@@ -2232,48 +2232,112 @@ n1w_start(struct n1_softc *sc)
 }
 
 /*
- * Scan (command 0x1000f) in three chunks of the channel list; the fixed
- * 14-byte request starts with the chunk number, then dwell times (110 ms).
- * After 8 channel events of a chunk, command 0x10001 ends it and an event
- * 0x80000005 reports it done.
+ * Scan (command 0x1000f, aurora scan_worker and build_scan) in chunks of 13
+ * entries of the channel table (2.4 GHz 1-13, then 5 GHz). The request is
+ * 14 fixed bytes (chunk number first, dwell times 110 ms at +8/+10/+12);
+ * J815's macOS 27 adapter appends TLV 0x104 (count, then {channel, band, 0,
+ * 0}) and TLV 0x165 (OCE, flags bit 0). The firmware reports each finished
+ * channel (event 0x80000030) and the end (0x80000005). A chunk runs to its
+ * end; it's stopped (command 0x10001) when all its channels reported without
+ * an end event, or after a second without progress. A refused stop means
+ * the chunk had already ended.
  */
+static const uint8_t w_5ghz[] = {
+	36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112,
+	116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165,
+};
+#define	W_NCHAN		(13 + nitems(w_5ghz))
+#define	W_DWELL		110
+
+static void
+n1w_tlv(uint8_t *buf, size_t *size, uint16_t tag, const void *data,
+    uint16_t len)
+{
+	le16enc(buf + *size, tag);
+	le16enc(buf + *size + 2, len);
+	memcpy(buf + *size + 4, data, len);
+	*size += 4 + len;
+}
+
+static size_t
+n1w_scan_req(int chunk, uint8_t *buf)
+{
+	static const uint8_t fixed[14] = { 1, 0, 0, 0x80, 0, 2, 0, 0x10 };
+	static const uint8_t oce[5] = { 0, 0, 1, 0, 0 };
+	uint8_t list[1 + 4 * 13];
+	size_t size = sizeof(fixed);
+	int first = chunk * 13, n, i, ch;
+
+	memcpy(buf, fixed, sizeof(fixed));
+	buf[0] = chunk + 1;
+	le16enc(buf + 8, W_DWELL);
+	le16enc(buf + 10, W_DWELL);
+	le16enc(buf + 12, W_DWELL);
+	n = MIN(13, (int)W_NCHAN - first);
+	list[0] = n;
+	for (i = 0; i < n; i++) {
+		ch = first + i;
+		list[1 + 4 * i] = ch < 13 ? ch + 1 : w_5ghz[ch - 13];
+		list[2 + 4 * i] = ch >= 13;
+		list[3 + 4 * i] = 0;
+		list[4 + 4 * i] = 0;
+	}
+	n1w_tlv(buf, &size, 0x104, list, 1 + 4 * n);
+	n1w_tlv(buf, &size, 0x165, oce, sizeof(oce));
+	return (size);
+}
+
 static int
 n1w_scan(struct n1_softc *sc)
 {
-	uint8_t req[14] = { 1, 0, 0, 0x80, 0, 2, 0, 0x10 };
-	int chunk, error = 0, i, stopped;
-	uint32_t channels, scans;
+	uint8_t req[14 + 4 + 1 + 4 * 13 + 4 + 5];
+	uint32_t channels, scans, seen, ch0 = sc->w.channels;
+	int chunk, count, error = 0, i, limit, progress, stopped, refused;
 
-	le16enc(req + 8, 110);
-	le16enc(req + 10, 110);
-	le16enc(req + 12, 110);
-	for (chunk = 0; chunk < 3 && error == 0; chunk++) {
-		channels = sc->w.channels;
+	for (chunk = 0; chunk * 13 < (int)W_NCHAN && error == 0; chunk++) {
+		count = MIN(13, (int)W_NCHAN - chunk * 13);
+		channels = seen = sc->w.channels;
 		scans = sc->w.scans;
-		stopped = 0;
-		req[0] = chunk + 1;
-		if ((error = n1w_cmd(sc, 0x1000f, req, sizeof(req))) != 0)
+		stopped = refused = 0;
+		if ((error = n1w_cmd(sc, 0x1000f, req,
+		    n1w_scan_req(chunk, req))) != 0)
 			break;
-		for (i = 0; i < 800; i++) {
+		/* ticks of 10 ms */
+		limit = MAX(800, (count * 2 * W_DWELL + 2000) / 10);
+		for (i = progress = 0; i < limit; i++) {
 			n1w_drain(sc);
 			if (!n1w_up(sc)) {
 				error = EIO;
 				break;
 			}
-			if (!stopped && sc->w.channels - channels >= 8) {
-				stopped = 1;
-				if ((error = n1w_cmd(sc, 0x10001, NULL, 0)) != 0)
-					break;
-			}
-			if (stopped && sc->w.scans != scans)
+			if (sc->w.scans != scans)
 				break;
+			if (sc->w.channels != seen) {
+				seen = sc->w.channels;
+				progress = i;
+			}
+			if (!stopped && (seen - channels >= (uint32_t)count ||
+			    (seen != channels && i - progress > 100))) {
+				stopped = 1;
+				if (n1w_cmd(sc, 0x10001, NULL, 0) != 0) {
+					refused = 1;
+					break;
+				}
+				limit = i + 100;
+			}
 			pause("n1wscan", hz / 100 + 1);
 		}
-		if (error == 0 && sc->w.scans == scans)
-			error = ETIMEDOUT;
+		if (error == 0 && !refused && sc->w.scans == scans) {
+			device_printf(sc->dev, "wifi: scan chunk %d: %u of %d "
+			    "channels, no end event\n", chunk,
+			    sc->w.channels - channels, count);
+			if (!stopped)
+				n1w_cmd(sc, 0x10001, NULL, 0);
+		}
 	}
-	device_printf(sc->dev, "wifi: scan %d: %u channels, %u beacons, "
-	    "%d networks\n", error, sc->w.channels, sc->w.beacons, sc->w.nbss);
+	device_printf(sc->dev, "wifi: scan %d: %u of %zu channels, %u beacons, "
+	    "%d networks\n", error, sc->w.channels - ch0, W_NCHAN,
+	    sc->w.beacons, sc->w.nbss);
 	return (error);
 }
 
