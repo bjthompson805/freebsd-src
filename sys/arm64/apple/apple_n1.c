@@ -139,6 +139,8 @@ struct n1_softc {
 	uint64_t		rx_iova;	/* map DMA on the function streams too */
 	void			*secondary;
 	uint64_t		secondary_iova;
+	uint8_t			*bt_tx, *bt_rx;	/* beta rings 1 (hci-tx), 7 (hci-rx) */
+	uint16_t		bt_txtail, bt_rxseen, bt_rxpost;
 	uint32_t		secondary_size;
 };
 
@@ -1007,6 +1009,7 @@ static int n1_ctrl_rings(struct n1_softc *);
 	    pci_read_config((sc)->fn[1], 0x7a, 2),				\
 	    pci_read_config((sc)->fn[2], 0x104, 4))
 static int n1_fn_start(struct n1_softc *, int, struct n1_ctx *);
+static int n1_bt_start(struct n1_softc *);
 
 static int
 n1_start_ipc(struct n1_softc *sc)
@@ -1317,6 +1320,7 @@ n1_start_ipc(struct n1_softc *sc)
 		return (error);
 	if ((error = n1_ctrl_rings(sc)) != 0)
 		return (error);
+	device_printf(sc->dev, "bluetooth: %d\n", n1_bt_start(sc));
 	return (n1_fn_start(sc, 1, &sc->wifi));
 }
 
@@ -1327,9 +1331,9 @@ n1_start_ipc(struct n1_softc *sc)
  * tr head when it has taken the message.
  */
 static int
-n1_ctrl_send(struct n1_softc *sc, const void *msg, uint32_t len)
+n1_msg_send(struct n1_ctx *c, struct resource *bar, bus_size_t db,
+    const void *msg, uint32_t len)
 {
-	struct n1_ctx *c = &sc->control;
 	uint16_t slot = c->head % 16;
 	uint8_t *ent = c->buf + c->mtr + 16 * slot;
 	int i;
@@ -1338,12 +1342,12 @@ n1_ctrl_send(struct n1_softc *sc, const void *msg, uint32_t len)
 	memcpy(c->msgs + 0x80 * slot, msg, len);
 	le32enc(ent, len << 8 | 1);
 	le64enc(ent + 4, c->msgs_iova + 0x80 * slot);
-	le32enc(ent + 12, 0);
+	le32enc(ent + 12, db == 0x9000 ? 0 : slot);	/* beta: slot, as macOS */
 	c->head++;
 	le16enc(c->buf + c->index[3], c->head);
 	cpu_dcache_wb_range(c->buf, 32768);
 	cpu_dcache_wb_range(c->msgs, 16384);
-	N1_WR4(sc, 0x9000, c->head);
+	bus_write_4(bar, db, c->head);
 	for (i = 0; i < 100; i++) {
 		cpu_dcache_inv_range(c->buf, PAGE_SIZE);
 		if (le16dec(c->buf + c->index[1]) == c->head) {
@@ -1355,6 +1359,13 @@ n1_ctrl_send(struct n1_softc *sc, const void *msg, uint32_t len)
 		pause("n1msg", hz / 100 + 1);
 	}
 	return (ETIMEDOUT);
+}
+
+static int
+n1_ctrl_send(struct n1_softc *sc, const void *msg, uint32_t len)
+{
+
+	return (n1_msg_send(&sc->control, sc->bar, 0x9000, msg, len));
 }
 
 /*
@@ -1651,6 +1662,140 @@ n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 	    bus_read_4(bar, r->status));
 	n1_dart_errors(sc);
 	return (bus_read_4(bar, r->status) == 2 ? 0 : ETIMEDOUT);
+}
+
+/*
+ * Bluetooth on beta (function 2), as AirshipDK's t2026-CentauriBeta.plist and
+ * the macOS trace show it: rings are created with the control ring message
+ * on beta's message ring (doorbell 0x1000), and each ring's doorbell is
+ * 0x1000 + 4 * id. HCI rings carry the data in place: an entry is a 16-byte
+ * header (u32 length << 8 | type, u64 ~0, u32 slot; the firmware sets 4 in the
+ * last byte when done) followed by a 260-byte footer with the HCI packet,
+ * without the H4 type byte. Host commands go out on ring 1 (hci-tx, 5
+ * entries, type 2); events come back on ring 7 (hci-rx, 17 entries, 16
+ * posted as 0x104-byte buffers).
+ */
+#define	BT_ENT			0x114
+#define	BT_FOOTER		260
+#define	BT_TX			1
+#define	BT_TX_N			5
+#define	BT_RX			7
+#define	BT_RX_N			17
+
+static int
+n1_bt_ring(struct n1_softc *sc, uint16_t id, uint16_t flags, uint16_t n,
+    uint8_t **ring)
+{
+	uint8_t msg[0x34];
+	uint64_t iova;
+
+	if ((*ring = n1_dma_alloc(sc, n * BT_ENT, &iova)) == NULL)
+		return (ENOMEM);
+	memset(msg, 0, sizeof(msg));
+	le16enc(msg, 1);
+	le16enc(msg + 2, flags);
+	le16enc(msg + 4, id);
+	le16enc(msg + 6, id);
+	le64enc(msg + 8, iova);
+	le64enc(msg + 0x10, ~0ul);
+	le16enc(msg + 0x18, n);
+	le16enc(msg + 0x1a, 0xffff);
+	le16enc(msg + 0x1c, id);
+	le16enc(msg + 0x1e, 0x40);
+	return (n1_msg_send(&sc->beta, sc->fnbar[2], 0x1000, msg, sizeof(msg)));
+}
+
+static void
+n1_bt_rx_post(struct n1_softc *sc)
+{
+	uint8_t *e = sc->bt_rx + BT_ENT * (sc->bt_rxpost % BT_RX_N);
+
+	memset(e, 0, BT_ENT);
+	le32enc(e, BT_FOOTER << 8);
+	le64enc(e + 4, ~0ul);
+	le32enc(e + 12, sc->bt_rxpost % BT_RX_N);
+	sc->bt_rxpost++;
+}
+
+static void
+n1_bt_doorbell(struct n1_softc *sc, int ring, uint16_t tail)
+{
+	struct n1_ctx *c = &sc->beta;
+
+	le16enc(c->buf + c->index[3] + 2 * ring, tail);
+	cpu_dcache_wb_range(c->buf, PAGE_SIZE);
+	bus_write_4(sc->fnbar[2], 0x1000 + 4 * ring, tail);
+}
+
+/* Print received HCI events and give their buffers back. */
+static int
+n1_bt_poll(struct n1_softc *sc)
+{
+	uint8_t *e;
+	uint32_t len;
+	int n = 0;
+
+	cpu_dcache_inv_range(sc->bt_rx, BT_RX_N * BT_ENT);
+	for (;;) {
+		e = sc->bt_rx + BT_ENT * (sc->bt_rxseen % BT_RX_N);
+		if (e[15] != 4)
+			break;
+		len = MIN(le32dec(e) >> 8, BT_FOOTER);
+		device_printf(sc->dev, "hci event %u: %*D\n", sc->bt_rxseen,
+		    (int)len, e + 16, " ");
+		sc->bt_rxseen++;
+		n1_bt_rx_post(sc);
+		n++;
+	}
+	if (n != 0) {
+		cpu_dcache_wb_range(sc->bt_rx, BT_RX_N * BT_ENT);
+		n1_bt_doorbell(sc, BT_RX, sc->bt_rxpost % BT_RX_N);
+	}
+	return (n);
+}
+
+static int
+n1_bt_cmd(struct n1_softc *sc, uint16_t op, const void *param, uint8_t plen)
+{
+	uint8_t *e = sc->bt_tx + BT_ENT * (sc->bt_txtail % BT_TX_N);
+	int i;
+
+	memset(e, 0, BT_ENT);
+	le32enc(e, (3 + plen) << 8 | 2);
+	le64enc(e + 4, ~0ul);
+	le32enc(e + 12, sc->bt_txtail % BT_TX_N);
+	le16enc(e + 16, op);
+	e[18] = plen;
+	memcpy(e + 19, param, plen);
+	cpu_dcache_wb_range(sc->bt_tx, BT_TX_N * BT_ENT);
+	sc->bt_txtail++;
+	n1_bt_doorbell(sc, BT_TX, sc->bt_txtail % BT_TX_N);
+	for (i = 0; i < 100; i++) {
+		pause("n1bt", hz / 100 + 1);
+		if (n1_bt_poll(sc) != 0)
+			return (0);
+	}
+	cpu_dcache_inv_range(sc->bt_tx, BT_TX_N * BT_ENT);
+	device_printf(sc->dev, "hci command %#06x: no event (tx done %#x)\n",
+	    op, e[15]);
+	return (ETIMEDOUT);
+}
+
+static int
+n1_bt_start(struct n1_softc *sc)
+{
+	int error, i;
+
+	if ((error = n1_bt_ring(sc, BT_RX, 0x41, BT_RX_N, &sc->bt_rx)) != 0 ||
+	    (error = n1_bt_ring(sc, BT_TX, 0x41, BT_TX_N, &sc->bt_tx)) != 0)
+		return (error);
+	for (i = 0; i < BT_RX_N - 1; i++)
+		n1_bt_rx_post(sc);
+	cpu_dcache_wb_range(sc->bt_rx, BT_RX_N * BT_ENT);
+	n1_bt_doorbell(sc, BT_RX, sc->bt_rxpost % BT_RX_N);
+	(void)n1_bt_cmd(sc, 0x0c03, NULL, 0);	/* Reset */
+	(void)n1_bt_cmd(sc, 0x1001, NULL, 0);	/* Read Local Version */
+	return (n1_bt_cmd(sc, 0x1009, NULL, 0));	/* Read BD_ADDR */
 }
 
 
