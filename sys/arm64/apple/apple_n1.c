@@ -192,6 +192,14 @@ struct n1_softc {
 		uint8_t		mac[6];
 		uint8_t		bss[32][6];
 		int		nbss;
+		/* join target, from hw.apple_n1.ssid / hw.apple_n1.pmk */
+		char		ssid[33];
+		uint8_t		pmk[32];
+		int		have_pmk, found;
+		uint8_t		bssid[6], chan, band;
+		uint16_t	rsn_caps;
+		int		connecting, connect_event, associated;
+		uint16_t	connect_status;
 	}			w;
 };
 
@@ -1097,6 +1105,8 @@ static int n1_ctrl_rings(struct n1_softc *);
 static int n1_fn_start(struct n1_softc *, int, struct n1_ctx *);
 static int n1w_start(struct n1_softc *);
 static int n1_cchi_init(struct n1_softc *);
+static int n1w_join(struct n1_softc *);
+static void n1w_target(struct n1_softc *);
 static int n1_alpha_start(struct n1_softc *);
 static int n1w_scan(struct n1_softc *);
 static int n1_bt_start(struct n1_softc *);
@@ -1410,8 +1420,11 @@ n1_start_ipc(struct n1_softc *sc)
 		device_printf(sc->dev, "CCHI: %d\n", error);
 		return (error);
 	}
+	n1w_target(sc);
 	if ((error = n1_alpha_start(sc)) == 0 && (error = n1w_start(sc)) == 0)
 		error = n1w_scan(sc);
+	if (error == 0 && sc->w.ssid[0] != '\0' && sc->w.have_pmk)
+		error = n1w_join(sc);
 	device_printf(sc->dev, "wifi: %d\n", error);
 	/* Beta as before (btcentauri needs only control booted, beta at 2) */
 	if ((error = n1_fn_start(sc, 2, &sc->beta)) != 0)
@@ -2065,6 +2078,28 @@ n1w_beacon(struct n1_softc *sc, const uint8_t *p, size_t size)
 			chan = ie[2];
 	}
 	rssi = MAX((int8_t)p[0x16], (int8_t)p[0x17]);
+	if (sc->w.ssid[0] != '\0' && strcmp(ssid, sc->w.ssid) == 0 &&
+	    !sc->w.found) {
+		sc->w.found = 1;
+		memcpy(sc->w.bssid, f + 16, 6);
+		sc->w.chan = chan;
+		sc->w.band = chan > 14;
+		/* RSN element: version, group, pairwise and AKM lists, caps */
+		for (ie = f + 36; ie + 2 <= end && ie + 2 + ie[1] <= end;
+		    ie += 2 + ie[1]) {
+			const uint8_t *q = ie + 2, *e = ie + 2 + ie[1];
+
+			if (ie[0] != 48 || ie[1] < 8)
+				continue;
+			q += 2 + 4;
+			if (q + 2 <= e)
+				q += 2 + 4 * le16dec(q);
+			if (q + 2 <= e)
+				q += 2 + 4 * le16dec(q);
+			if (q + 2 <= e)
+				sc->w.rsn_caps = le16dec(q);
+		}
+	}
 	device_printf(sc->dev, "wifi: bss %6D chan %3d rssi %4d \"%s\"\n",
 	    f + 16, ":", chan, rssi, ssid);
 }
@@ -2104,6 +2139,18 @@ n1w_drain(struct n1_softc *sc)
 					sc->w.channels++;
 				else if (cmd == 0x80000005)
 					sc->w.scans++;
+				else if (cmd == 0x80000000 && sc->w.connecting) {
+					sc->w.connect_event = 1;
+					sc->w.connect_status = status;
+				} else if (cmd == 0x80000001) {
+					sc->w.associated = status == 0;
+					device_printf(sc->dev, "wifi: "
+					    "association event status %u\n",
+					    status);
+				} else if (cmd == 0x80000050 && size >= 64)
+					device_printf(sc->dev, "wifi: "
+					    "supplicant result %u phase %u\n",
+					    le32dec(p + 0x18), p[0x1c]);
 				else
 					N1_DPRINTF(sc, "wifi: event %#x status "
 					    "%u size %u\n", cmd, status, size);
@@ -2339,6 +2386,113 @@ n1w_scan(struct n1_softc *sc)
 	    "%d networks\n", error, sc->w.channels - ch0, W_NCHAN,
 	    sc->w.beacons, sc->w.nbss);
 	return (error);
+}
+
+/*
+ * Join a WPA2-PSK network (aurora wifi_connect, host_setup_commands and
+ * connect_worker). The firmware runs the 4-way handshake from the PMK in
+ * the request: a 130-byte block (1, BSSID, channel, band at 8, security 4 at
+ * 0x47 and 0x48, PMK length 32 at 0x4a, PMK at 0x4c), then TLVs 304 {0},
+ * 0xf913 (connection timeouts), 342 (1, 4, SSID length, SSID), 48 (our RSN
+ * element: CCMP/CCMP/PSK with the AP's capabilities), 316 (PMF) and 376 (MLD
+ * defaults). Event 0x80000000 completes the join.
+ */
+static int
+n1w_join(struct n1_softc *sc)
+{
+	static const uint8_t mld[14] = { 1, 0, 1, 0xff, 0xff, 0xff, 0xff,
+	    0xff, 0xff, 0xff, 0xff, 3, 0, 0 };
+	static const uint32_t timeouts[5] = { 260, 6000, 2000, 15000, 300 };
+	static const uint8_t awake[3] = { 0 };
+	static const uint8_t profile[14] = { 0x54, 1, 10, 0, 0, 8, 0, 0,
+	    0xff, 0xff, 0xff, 0xff, 1, 1 };
+	uint8_t rsn[20] = { 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac,
+	    4, 1, 0, 0x00, 0x0f, 0xac, 2 };
+	uint8_t pay[512], lifetime[20], ssid[35], tmo[20], zero = 0, pmf;
+	size_t size = 130, len = strlen(sc->w.ssid);
+	int error, i;
+
+	if (!sc->w.found)
+		return (ENOENT);
+	memset(lifetime, 0, sizeof(lifetime));
+	for (i = 0; i < 4; i++)
+		le32enc(lifetime + 4 + 4 * i, 2000000);
+	device_printf(sc->dev, "wifi: host awake %d, lifetime %d, profile %d\n",
+	    n1w_cmd(sc, 6, awake, sizeof(awake)),
+	    n1w_cmd(sc, 43, lifetime, sizeof(lifetime)),
+	    n1w_cmd(sc, 52, profile, sizeof(profile)));
+	le16enc(rsn + 18, sc->w.rsn_caps);
+	pmf = (sc->w.rsn_caps & 0x80) != 0;
+	memset(pay, 0, sizeof(pay));
+	pay[0] = 1;
+	memcpy(pay + 1, sc->w.bssid, 6);
+	pay[7] = sc->w.chan;
+	pay[8] = sc->w.band;
+	pay[0x47] = 4;
+	le16enc(pay + 0x48, 4);
+	le16enc(pay + 0x4a, 32);
+	memcpy(pay + 0x4c, sc->w.pmk, 32);
+	for (i = 0; i < 5; i++)
+		le32enc(tmo + 4 * i, timeouts[i]);
+	ssid[0] = 1;
+	ssid[1] = 4;
+	ssid[2] = len;
+	memcpy(ssid + 3, sc->w.ssid, len);
+	n1w_tlv(pay, &size, 304, &zero, 1);
+	n1w_tlv(pay, &size, 0xf913, tmo, sizeof(tmo));
+	n1w_tlv(pay, &size, 342, ssid, 3 + len);
+	n1w_tlv(pay, &size, 48, rsn, sizeof(rsn));
+	n1w_tlv(pay, &size, 316, &pmf, 1);
+	n1w_tlv(pay, &size, 376, mld, sizeof(mld));
+	sc->w.connecting = 1;
+	sc->w.connect_event = sc->w.associated = 0;
+	sc->w.connect_status = 0;
+	error = n1w_cmd(sc, 0x20000, pay, size);
+	explicit_bzero(pay, sizeof(pay));
+	explicit_bzero(sc->w.win + W_TX_BUF, w_rsize[1] * W_BUFSZ);
+	cpu_dcache_wb_range(sc->w.win + W_TX_BUF, w_rsize[1] * W_BUFSZ);
+	for (i = 0; error == 0 && !sc->w.connect_event && i < 1500; i++) {
+		n1w_drain(sc);
+		if (!n1w_up(sc))
+			error = EIO;
+		pause("n1wj", hz / 100 + 1);
+	}
+	sc->w.connecting = 0;
+	if (error == 0 && !sc->w.connect_event)
+		error = ETIMEDOUT;
+	device_printf(sc->dev, "wifi: join \"%s\" %6D chan %u: %d, event "
+	    "status %u, associated %d\n", sc->w.ssid, sc->w.bssid, ":",
+	    sc->w.chan, error, sc->w.connect_status, sc->w.associated);
+	if (error == 0 && sc->w.connect_status == 0)
+		device_printf(sc->dev, "wifi: roam scan off %d\n",
+		    n1w_cmd(sc, 0x20016, NULL, 0));
+	return (error != 0 ? error : sc->w.connect_status != 0 ? EIO : 0);
+}
+
+/* Join target from the loader: hw.apple_n1.ssid, hw.apple_n1.pmk (hex) */
+static void
+n1w_target(struct n1_softc *sc)
+{
+	char *v;
+	int i;
+
+	if ((v = kern_getenv("hw.apple_n1.ssid")) != NULL) {
+		strlcpy(sc->w.ssid, v, sizeof(sc->w.ssid));
+		freeenv(v);
+	}
+	if ((v = kern_getenv("hw.apple_n1.pmk")) != NULL) {
+		if (strlen(v) == 64) {
+			for (i = 0; i < 32; i++) {
+				char b[3] = { v[2 * i], v[2 * i + 1], 0 };
+
+				sc->w.pmk[i] = strtoul(b, NULL, 16);
+			}
+			sc->w.have_pmk = 1;
+		}
+		explicit_bzero(v, strlen(v));
+		freeenv(v);
+		kern_unsetenv("hw.apple_n1.pmk");
+	}
 }
 
 /*
