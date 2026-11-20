@@ -188,6 +188,7 @@ struct n1_softc {
 	uint16_t		bt_vwait;	/* vendor opcode in flight */
 	uint8_t			bt_raddr[6];	/* LE static random address */
 	int			bt_vticks;
+	u_int			bt_connects;	/* Connection Complete, status 0 */
 	uint32_t		secondary_size;
 	struct n1_wifi {		/* alpha (Wi-Fi) command rings */
 		uint8_t		*win;
@@ -3251,7 +3252,10 @@ n1_bt_event(struct n1_softc *sc, struct mbuf *m)
 		st = p[2];
 		if (op == N1_BT_VSC_CREATE_CON)
 			le16enc(p + 4, N1_BT_CREATE_CON);
-	} else if (len >= 12 && (p[0] == NG_HCI_EVENT_CON_COMPL ||
+	}
+	if (len >= 3 && p[0] == NG_HCI_EVENT_CON_COMPL && p[2] == 0)
+		sc->bt_connects++;
+	if (len >= 12 && (p[0] == NG_HCI_EVENT_CON_COMPL ||
 	    p[0] == NG_HCI_EVENT_CON_REQ) && (p[11] & 0xfe) == 0xf0) {
 		/*
 		 * The firmware's native ACL link types 0xf0/0xf1 (aurora
@@ -3634,6 +3638,10 @@ n1_bt_start(struct n1_softc *sc)
 	SYSCTL_ADD_INT(device_get_sysctl_ctx(sc->dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
 	    "bt_debug", CTLFLAG_RW, &n1_bt_debug, 0, "print Bluetooth rx/tx");
+	SYSCTL_ADD_UINT(device_get_sysctl_ctx(sc->dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
+	    "bt_connects", CTLFLAG_RD, &sc->bt_connects, 0,
+	    "successful Connection Complete events");
 	mtx_lock(&sc->bt_mtx);
 	n1_bt_postreset(sc);
 	mtx_unlock(&sc->bt_mtx);
