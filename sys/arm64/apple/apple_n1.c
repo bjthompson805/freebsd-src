@@ -1257,12 +1257,12 @@ n1_ctrl_rings(struct n1_softc *sc)
 	static const struct { uint16_t id, flags; } rings[] = {
 		{ 2, 0 }, { 4, 0x4010 }, { 3, 0x4010 },
 	};
-	uint8_t msg[0x34];
-	uint64_t iova;
-	int error, i;
+	uint8_t msg[0x34], *ring[5], *rx, *e;
+	uint64_t iova, rx_iova;
+	int error, i, j, n;
 
 	for (i = 0; i < nitems(rings); i++) {
-		if (n1_dma_alloc(sc, N1_PAGE, &iova) == NULL)
+		if ((ring[rings[i].id] = n1_dma_alloc(sc, N1_PAGE, &iova)) == NULL)
 			return (ENOMEM);
 		memset(msg, 0, sizeof(msg));
 		le16enc(msg, 1);
@@ -1282,6 +1282,40 @@ n1_ctrl_rings(struct n1_softc *sc)
 		if (error != 0)
 			return (error);
 	}
+
+	/*
+	 * Ring 2 receives: 16-byte entries u16 1, u16 size >> 8, u64 buffer,
+	 * u32 index; the firmware fills a buffer, writes the length into bits 8-31
+	 * of the first word and sets 4 in the last byte. macOS posts 15 of 32 KiB.
+	 */
+	if ((rx = n1_dma_alloc(sc, 15 * 0x8000, &rx_iova)) == NULL)
+		return (ENOMEM);
+	for (j = 0; j < 15; j++) {
+		e = ring[2] + 16 * j;
+		le16enc(e, 1);
+		le16enc(e + 2, 0x80);
+		le64enc(e + 4, rx_iova + 0x8000 * j);
+		le32enc(e + 12, j);
+	}
+	cpu_dcache_wb_range(ring[2], N1_PAGE);
+	le16enc(sc->control.buf + sc->control.index[3] + 2 * 2, 15);
+	cpu_dcache_wb_range(sc->control.buf, PAGE_SIZE);
+	N1_WR4(sc, 0x9008, 15);
+	for (n = 0, i = 0; i < 200 && n < 15; i++) {
+		pause("n1rx", hz / 100 + 1);
+		cpu_dcache_inv_range(ring[2], N1_PAGE);
+		for (; n < 15 && ring[2][16 * n + 15] != 0; n++) {
+			e = ring[2] + 16 * n;
+			cpu_dcache_inv_range(rx + 0x8000 * n, 0x8000);
+			device_printf(sc->dev, "rx %d: %02x %02x %02x %02x len %#x\n",
+			    n, e[0], e[1], e[2], e[3], le32dec(e) >> 8);
+			for (j = 0; j < MIN(le32dec(e) >> 8, 0x100); j += 32)
+				device_printf(sc->dev, "rx %d +%#04x: %32D\n", n, j,
+				    rx + 0x8000 * n + j, " ");
+		}
+	}
+	device_printf(sc->dev, "ring 2: %d buffers returned, tr heads %*D\n",
+	    n, 10, sc->control.buf + sc->control.index[1], " ");
 	return (0);
 }
 
