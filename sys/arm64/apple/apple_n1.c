@@ -899,6 +899,7 @@ static const uint32_t n1_img_holes[][2] = {
 #define	N1_CRASH	0
 #define	N1_AOP_RUN	0
 #define	N1_POISON	0
+#define	N1_LTR	0
 static const uint32_t n1_sec_holes[][2] = {
 	/* SECHOLES */
 	{ 0, 0 },
@@ -1028,6 +1029,47 @@ n1_start_ipc(struct n1_softc *sc)
 	}
 	n1_pcie_dump(sc, "before", 1);
 	n1_spmi_dump(sc, "before");
+	{	/* XXX bring-up: VC capability (TC/VC map) on fn0 and the root port */
+		device_t dv[2] = { device_get_parent(device_get_parent(sc->dev)),
+		    sc->dev };
+		int c, k, w;
+
+		for (k = 0; k < 2; k++) {
+			if (pci_find_extcap(dv[k], PCIZ_VC, &c) != 0) {
+				device_printf(sc->dev, "VC %s: none\n", k ? "fn0" : "rp");
+				continue;
+			}
+			for (w = 0; w < 0x30; w += 0x10)
+				device_printf(sc->dev, "VC %s %#x+%#x: %08x %08x %08x %08x\n",
+				    k ? "fn0" : "rp", c, w,
+				    pci_read_config(dv[k], c + w, 4),
+				    pci_read_config(dv[k], c + w + 4, 4),
+				    pci_read_config(dv[k], c + w + 8, 4),
+				    pci_read_config(dv[k], c + w + 12, 4));
+		}
+		for (k = 0x18c; k <= 0x298; k += 0x298 - 0x18c)	/* Apple VSECs */
+			for (w = 0; w < 0x40; w += 0x10)
+				device_printf(sc->dev, "VSEC %#x+%#x: %08x %08x %08x %08x\n",
+				    k, w, pci_read_config(sc->dev, k + w, 4),
+				    pci_read_config(sc->dev, k + w + 4, 4),
+				    pci_read_config(sc->dev, k + w + 8, 4),
+				    pci_read_config(sc->dev, k + w + 12, 4));
+		if (N1_LTR) {	/* LTR as macOS: enable on rp + fn0, max latency from the ADT */
+			for (k = 0; k < 2; k++)
+				if (pci_find_cap(dv[k], PCIY_EXPRESS, &c) == 0)
+					pci_write_config(dv[k], c + 0x28,
+					    pci_read_config(dv[k], c + 0x28, 2) | 0x400, 2);
+			pci_write_config(sc->dev, 0x174 + 4, 0x08100810, 4);
+			device_printf(sc->dev, "LTR on: fn0 ltr %08x\n",
+			    pci_read_config(sc->dev, 0x174 + 4, 4));
+		}
+		for (k = 0x100, c = 0; k && c < 20; c++) {	/* fn0 ext cap list */
+			w = pci_read_config(sc->dev, k, 4);
+			device_printf(sc->dev, "fn0 extcap %#x: id %#x ver %u\n", k,
+			    w & 0xffff, (w >> 16) & 0xf);
+			k = (w >> 20) & 0xffc;
+		}
+	}
 	if (N1_AOP_RUN) {	/* XXX bring-up: start the (iBoot-preloaded) AOP */
 		vm_offset_t a = (vm_offset_t)pmap_mapdev(0x390600000, PAGE_SIZE);
 
