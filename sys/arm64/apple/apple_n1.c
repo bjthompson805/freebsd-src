@@ -1536,6 +1536,25 @@ n1_ctx_dump(struct n1_softc *sc, const char *name, struct n1_ctx *c,
 	}
 }
 
+/* XXX bring-up: print the nonzero words of a function BAR */
+static void
+n1_bar_scan(struct n1_softc *sc, int fn)
+{
+	struct resource *bar = sc->fnbar[fn];
+	bus_size_t o, size = rman_get_size(bar);
+	uint32_t v;
+	int n = 0;
+
+	for (o = 0; o < size && n < 200; o += 4) {
+		v = bus_read_4(bar, o);
+		if (v != 0 && v != 0xffffffff) {
+			printf("n1bar fn%d +0x%04jx = %#x\n", fn, (uintmax_t)o, v);
+			n++;
+		}
+	}
+	printf("n1bar fn%d: %d nonzero words in %#jx\n", fn, n, (uintmax_t)size);
+}
+
 static int
 n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 {
@@ -1547,6 +1566,8 @@ n1_fn_start(struct n1_softc *sc, int fn, struct n1_ctx *c)
 	if (fn == 1) {
 		n1_ctx_dump(sc, "control", &sc->control, 0x200);
 		n1_ctx_dump(sc, "beta", &sc->beta, 0x100);
+		n1_bar_scan(sc, 1);
+		n1_bar_scan(sc, 2);
 	}
 	for (i = 0; i < 200 && bus_read_4(bar, r->stage) != 2; i++)
 		pause("n1fn", hz / 100 + 1);
