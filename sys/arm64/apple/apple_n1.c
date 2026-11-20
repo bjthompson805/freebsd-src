@@ -50,6 +50,14 @@
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
+#include <sys/socket.h>
+#include <sys/sockio.h>
+
+#include <net/bpf.h>
+#include <net/ethernet.h>
+#include <net/if.h>
+#include <net/if_var.h>
+#include <net/if_types.h>
 #include <net/vnet.h>
 
 #include <netgraph/ng_message.h>
@@ -200,6 +208,16 @@ struct n1_softc {
 		uint16_t	rsn_caps;
 		int		connecting, connect_event, associated;
 		uint16_t	connect_status;
+		/* data path (aurora data_probe, drain_data_rx/tx) */
+		uint32_t	data_done;
+		int		connected;
+		uint16_t	tx_len[128];
+		uint8_t		tx_busy[128];
+		uint32_t	rx_pkts, rx_bad, tx_pkts, tx_bad;
+		if_t		ifp;
+		struct mtx	mtx;
+		struct callout	poll;
+		struct mbufq	txq;
 	}			w;
 };
 
@@ -1106,6 +1124,8 @@ static int n1_fn_start(struct n1_softc *, int, struct n1_ctx *);
 static int n1w_start(struct n1_softc *);
 static int n1_cchi_init(struct n1_softc *);
 static int n1w_join(struct n1_softc *);
+static int n1w_attach_if(struct n1_softc *);
+static int n1w_data_ring(struct n1_softc *, unsigned int);
 static void n1w_target(struct n1_softc *);
 static int n1_alpha_start(struct n1_softc *);
 static int n1w_scan(struct n1_softc *);
@@ -1423,8 +1443,9 @@ n1_start_ipc(struct n1_softc *sc)
 	n1w_target(sc);
 	if ((error = n1_alpha_start(sc)) == 0 && (error = n1w_start(sc)) == 0)
 		error = n1w_scan(sc);
-	if (error == 0 && sc->w.ssid[0] != '\0' && sc->w.have_pmk)
-		error = n1w_join(sc);
+	if (error == 0 && sc->w.ssid[0] != '\0' && sc->w.have_pmk &&
+	    (error = n1w_join(sc)) == 0)
+		error = n1w_attach_if(sc);
 	device_printf(sc->dev, "wifi: %d\n", error);
 	/* Beta as before (btcentauri needs only control booted, beta at 2) */
 	if ((error = n1_fn_start(sc, 2, &sc->beta)) != 0)
@@ -2414,6 +2435,13 @@ n1w_join(struct n1_softc *sc)
 
 	if (!sc->w.found)
 		return (ENOENT);
+	for (i = 0; i < 4; i++) {
+		static const unsigned int ids[4] = { 76, 24, 15, 12 };
+
+		if ((error = n1w_data_ring(sc, ids[i])) != 0)
+			device_printf(sc->dev, "wifi: data ring %u: %d\n",
+			    ids[i], error);
+	}
 	memset(lifetime, 0, sizeof(lifetime));
 	for (i = 0; i < 4; i++)
 		le32enc(lifetime + 4 + 4 * i, 2000000);
@@ -2493,6 +2521,401 @@ n1w_target(struct n1_softc *sc)
 		freeenv(v);
 		kern_unsetenv("hw.apple_n1.pmk");
 	}
+}
+
+/*
+ * Wi-Fi data path (aurora data_probe_locked, drain_data_rx, drain_data_tx).
+ * Rings are opened with alpha messages: completion rings 192 (id 76, 2 KiB
+ * entries at window +0x200000, transmit completions) and 207 (id 15, at
+ * +0x240000, receive completions), transfer rings 24, 12 (receive buffers,
+ * descriptors at +0x520000, 4 KiB buffers at +0xe00000) and 25 (transmit,
+ * 32-byte descriptors at +0x540000, 2 KiB buffers at +0xd00000). Frames
+ * are Ethernet: the firmware does the 802.11 side.
+ */
+#define	W_DTX_BUF	0xd00000
+#define	W_DRX_BUF	0xe00000
+#define	W_DTX_SLOTS	128
+
+static int
+n1w_data_ring(struct n1_softc *sc, unsigned int id)
+{
+	uint8_t msg[0x34 + 10];
+	unsigned int vector, offset, size, bit, db, irq;
+	int transfer = 0, error;
+
+	memset(msg, 0, sizeof(msg));
+	switch (id) {
+	case 76:
+		vector = 192; offset = 0x200000; size = 2048; bit = 0;
+		db = 18; irq = 3;
+		break;
+	case 15:
+		vector = 207; offset = 0x240000; size = 128; bit = 2;
+		db = 11; irq = 8;
+		break;
+	case 24: case 25: case 12:
+		transfer = 1;
+		vector = id;
+		offset = id == 12 ? 0x520000 : id == 24 ? 0x500000 : 0x540000;
+		size = 128;
+		bit = id == 12 ? 4 : id == 24 ? 3 : 5;
+		db = id == 12 ? 11 : 18;
+		irq = id == 12 ? 8 : 3;
+		break;
+	default:
+		return (EINVAL);
+	}
+	if (!n1w_up(sc))
+		return (EIO);
+	if (sc->w.data_done & (1u << bit))
+		return (EBUSY);
+	sc->w.data_done |= 1u << bit;
+	memset(sc->w.win + offset, 0, size * 32);
+	cpu_dcache_wb_range(sc->w.win + offset, size * 32);
+	n1w_idx_set(sc, transfer ? 1 : 0, vector, 0);
+	n1w_idx_set(sc, transfer ? 3 : 2, vector, 0);
+	msg[0] = transfer ? 1 : 2;
+	msg[2] = transfer && id == 12 ? 0 : 4;
+	le16enc(msg + 4, id);
+	le16enc(msg + 6, vector);
+	le64enc(msg + 8, sc->w.win_iova + offset);
+	if (transfer) {
+		le64enc(msg + 0x10, ~0ul);
+		le16enc(msg + 0x18, size);
+		le16enc(msg + 0x1a, id == 12 ? 12 : 76);
+		le16enc(msg + 0x1c, db);
+		le16enc(msg + 0x1e, id == 12 ? 0x220 : 0);
+		le32enc(msg + 0x20, 16);
+		le16enc(msg + 0x24, irq);
+	} else {
+		le16enc(msg + 0x10, size);
+		le16enc(msg + 0x12, id == 15 ? 12 : 0xffff);
+		le16enc(msg + 0x14, db);
+		le32enc(msg + 0x18, 1);
+		le16enc(msg + 0x1c, irq);
+	}
+	error = n1w_msg(sc, msg, (transfer ? 0x34 : 0x2c) + 10);
+	pause("n1wd", hz);
+	if (error == 0 && !n1w_up(sc))
+		error = EIO;
+	if (error == 0 && id == 12) {
+		unsigned int slot;
+
+		for (slot = 0; slot < size - 1; slot++) {
+			uint8_t *d = sc->w.win + offset + slot * 16;
+			uint32_t buf = W_DRX_BUF + slot * 4096;
+
+			memset(sc->w.win + buf, 0, 4096);
+			cpu_dcache_wb_range(sc->w.win + buf, 4096);
+			le32enc(d, 1 | 4096 << 8);
+			le64enc(d + 4, sc->w.win_iova + buf);
+			le32enc(d + 12, slot + 1);
+		}
+		cpu_dcache_wb_range(sc->w.win + offset, size * 16);
+		n1w_idx_set(sc, 3, vector, size - 1);
+		bus_write_4(sc->fnbar[1], 0x1050, 1);
+		pause("n1wd", hz / 10);
+	}
+	N1_DPRINTF(sc, "wifi: data ring %u: %d\n", id, error);
+	return (error);
+}
+
+/* Receive completions on 207 name a buffer by cookie; repost it on 12 */
+static void
+n1w_data_rx(struct n1_softc *sc, struct mbufq *in)
+{
+	uint16_t head, tail, post, next, cookie, length;
+	uint32_t hdr, info, footer, buf, pad;
+	uint8_t *c, *d;
+	struct mbuf *m;
+	int n = 0;
+
+	if (!(sc->w.data_done & (1u << 4)) || !n1w_up(sc))
+		return;
+	head = n1w_idx(sc, 0, 207);
+	tail = n1w_idx(sc, 2, 207);
+	post = n1w_idx(sc, 3, 12);
+	if (head >= 128 || tail >= 128 || post >= 128) {
+		sc->w.rx_bad++;
+		return;
+	}
+	while (tail != head && n < 127) {
+		c = sc->w.win + 0x240000 + tail * 32;
+		cpu_dcache_inv_range(c, 32);
+		hdr = le32dec(c);
+		info = le32dec(c + 4);
+		cookie = info & 0xffff;
+		length = info >> 16;
+		next = (post + 1) % 128;
+		if ((hdr >> 16) != 12 || cookie == 0 || cookie > 127 ||
+		    length > 4096 || le32dec(c + 8) != 0) {
+			sc->w.rx_bad++;
+			break;
+		}
+		if (next == n1w_idx(sc, 1, 12))
+			break;
+		buf = W_DRX_BUF + (cookie - 1) * 4096;
+		footer = le32dec(c + 12);
+		pad = (footer >> 12) & 15;
+		cpu_dcache_inv_range(sc->w.win + buf, 4096);
+		sc->w.rx_pkts++;
+		if (sc->w.ifp != NULL && (footer & (1u << 24)) == 0 &&
+		    length >= pad + ETHER_HDR_LEN &&
+		    (m = m_get2(length - pad + ETHER_ALIGN, M_NOWAIT, MT_DATA,
+		    M_PKTHDR)) != NULL) {
+			m->m_data += ETHER_ALIGN;
+			memcpy(mtod(m, void *), sc->w.win + buf + pad,
+			    length - pad);
+			m->m_len = m->m_pkthdr.len = length - pad;
+			m->m_pkthdr.rcvif = sc->w.ifp;
+			if (mbufq_enqueue(in, m) != 0)
+				m_freem(m);
+		} else if (sc->w.ifp != NULL)
+			if_inc_counter(sc->w.ifp, IFCOUNTER_IQDROPS, 1);
+		d = sc->w.win + 0x520000 + post * 16;
+		le32enc(d, 1 | 4096 << 8);
+		le64enc(d + 4, sc->w.win_iova + buf);
+		le32enc(d + 12, cookie);
+		cpu_dcache_wb_range(d, 16);
+		tail = (tail + 1) % 128;
+		post = next;
+		n++;
+	}
+	if (n != 0) {
+		n1w_idx_set(sc, 2, 207, tail);
+		n1w_idx_set(sc, 3, 12, post);
+		bus_write_4(sc->fnbar[1], 0x1050, 1);
+	}
+}
+
+/*
+ * Transmit completions on 192 (ring 25, cookie of the last of count
+ * transfers), then queued frames into ring 25: entry u32 (len << 8 | 3),
+ * u64 buffer, u16 slot + 1 at 12, metadata 6 << 27 | 4 << 15 at 16 (TID,
+ * native packet preparation), lifetime 2000000 at 24.
+ */
+static void
+n1w_data_tx(struct n1_softc *sc)
+{
+	uint16_t head, tail, post, next, ring, cookie, count;
+	uint8_t *e, *d, status;
+	unsigned int first, i, slot;
+	struct mbuf *m;
+	int posted = 0, completed = 0, budget = 256;
+
+	if (!(sc->w.data_done & (1u << 5)) || !n1w_up(sc))
+		return;
+	head = n1w_idx(sc, 0, 192);
+	tail = n1w_idx(sc, 2, 192);
+	post = n1w_idx(sc, 3, 25);
+	if (head >= 2048 || tail >= 2048 || post >= W_DTX_SLOTS)
+		return;
+	while (tail != head && budget--) {
+		e = sc->w.win + 0x200000 + tail * 32;
+		cpu_dcache_inv_range(e, 32);
+		ring = le32dec(e) >> 16;
+		cookie = le16dec(e + 4);
+		count = le16dec(e + 9);
+		status = e[12];
+		if (ring == 25) {
+			if (cookie == 0 || cookie > W_DTX_SLOTS || count == 0 ||
+			    count >= W_DTX_SLOTS || !(e[1] & 1)) {
+				sc->w.tx_bad++;
+				break;
+			}
+			first = (cookie + W_DTX_SLOTS - count) % W_DTX_SLOTS;
+			for (i = 0; i < count; i++)
+				if (!sc->w.tx_busy[(first + i) % W_DTX_SLOTS])
+					break;
+			if (i != count) {
+				sc->w.tx_bad++;
+				break;
+			}
+			for (i = 0; i < count; i++) {
+				slot = (first + i) % W_DTX_SLOTS;
+				if (status == 0 || status == 0x83) {
+					sc->w.tx_pkts++;
+					if_inc_counter(sc->w.ifp,
+					    IFCOUNTER_OPACKETS, 1);
+					if_inc_counter(sc->w.ifp,
+					    IFCOUNTER_OBYTES, sc->w.tx_len[slot]);
+				} else
+					if_inc_counter(sc->w.ifp,
+					    IFCOUNTER_OERRORS, 1);
+				sc->w.tx_busy[slot] = 0;
+			}
+		}
+		tail = (tail + 1) % 2048;
+		completed = 1;
+	}
+	if (completed)
+		n1w_idx_set(sc, 2, 192, tail);
+	for (budget = W_DTX_SLOTS - 1; sc->w.connected && budget--; ) {
+		uint32_t buf = W_DTX_BUF + post * W_BUFSZ;
+
+		next = (post + 1) % W_DTX_SLOTS;
+		if (sc->w.tx_busy[post] || next == n1w_idx(sc, 1, 25))
+			break;
+		if ((m = mbufq_dequeue(&sc->w.txq)) == NULL)
+			break;
+		if (m->m_pkthdr.len > W_BUFSZ) {
+			if_inc_counter(sc->w.ifp, IFCOUNTER_OERRORS, 1);
+			m_freem(m);
+			continue;
+		}
+		m_copydata(m, 0, m->m_pkthdr.len, sc->w.win + buf);
+		cpu_dcache_wb_range(sc->w.win + buf, m->m_pkthdr.len);
+		d = sc->w.win + 0x540000 + post * 32;
+		memset(d, 0, 32);
+		le32enc(d, 3 | m->m_pkthdr.len << 8);
+		le64enc(d + 4, sc->w.win_iova + buf);
+		le16enc(d + 12, post + 1);
+		le64enc(d + 16, 6ull << 27 | 4ull << 15);
+		le64enc(d + 24, 2000000);
+		cpu_dcache_wb_range(d, 32);
+		sc->w.tx_len[post] = m->m_pkthdr.len;
+		sc->w.tx_busy[post] = 1;
+		m_freem(m);
+		post = next;
+		posted = 1;
+	}
+	if (posted)
+		n1w_idx_set(sc, 3, 25, post);
+	if (posted || completed)
+		bus_write_4(sc->fnbar[1], 0x1030, 1);
+}
+
+static void
+n1w_poll(void *arg)
+{
+	struct n1_softc *sc = arg;
+	struct mbufq in;
+	struct mbuf *m;
+
+	mtx_assert(&sc->w.mtx, MA_OWNED);
+	mbufq_init(&in, 256);
+	n1w_drain(sc);
+	n1w_data_rx(sc, &in);
+	n1w_data_tx(sc);
+	if (n1w_up(sc))
+		callout_reset(&sc->w.poll, hz / 100 + 1, n1w_poll, sc);
+	else
+		device_printf(sc->dev, "wifi: alpha left stage 2 (%#x)\n",
+		    bus_read_4(sc->fnbar[1], 0x8));
+	if (mbufq_len(&in) == 0)
+		return;
+	mtx_unlock(&sc->w.mtx);
+	while ((m = mbufq_dequeue(&in)) != NULL) {
+		if_inc_counter(sc->w.ifp, IFCOUNTER_IPACKETS, 1);
+		if_input(sc->w.ifp, m);
+	}
+	mtx_lock(&sc->w.mtx);
+}
+
+static int
+n1w_transmit(if_t ifp, struct mbuf *m)
+{
+	struct n1_softc *sc = if_getsoftc(ifp);
+	int error;
+
+	BPF_MTAP(ifp, m);
+	mtx_lock(&sc->w.mtx);
+	if (!sc->w.connected) {
+		mtx_unlock(&sc->w.mtx);
+		m_freem(m);
+		return (ENETDOWN);
+	}
+	if ((error = mbufq_enqueue(&sc->w.txq, m)) != 0) {
+		mtx_unlock(&sc->w.mtx);
+		if_inc_counter(ifp, IFCOUNTER_OQDROPS, 1);
+		m_freem(m);
+		return (error);
+	}
+	n1w_data_tx(sc);
+	mtx_unlock(&sc->w.mtx);
+	return (0);
+}
+
+static void
+n1w_qflush(if_t ifp)
+{
+	struct n1_softc *sc = if_getsoftc(ifp);
+
+	mtx_lock(&sc->w.mtx);
+	mbufq_drain(&sc->w.txq);
+	mtx_unlock(&sc->w.mtx);
+}
+
+static void
+n1w_init(void *arg)
+{
+	struct n1_softc *sc = arg;
+
+	if_setdrvflagbits(sc->w.ifp, IFF_DRV_RUNNING, 0);
+}
+
+static int
+n1w_ioctl(if_t ifp, u_long cmd, caddr_t data)
+{
+	switch (cmd) {
+	case SIOCSIFFLAGS:
+		if (if_getflags(ifp) & IFF_UP)
+			if_setdrvflagbits(ifp, IFF_DRV_RUNNING, 0);
+		else
+			if_setdrvflagbits(ifp, 0, IFF_DRV_RUNNING);
+		return (0);
+	case SIOCADDMULTI:
+	case SIOCDELMULTI:
+		return (0);
+	default:
+		return (ether_ioctl(ifp, cmd, data));
+	}
+}
+
+/* After a join: transmit ring 25, the n1w0 Ethernet interface, polling */
+static int
+n1w_attach_if(struct n1_softc *sc)
+{
+	if_t ifp;
+	int error;
+
+	if ((error = n1w_data_ring(sc, 25)) != 0)
+		return (error);
+	mtx_init(&sc->w.mtx, "n1w", NULL, MTX_DEF);
+	callout_init_mtx(&sc->w.poll, &sc->w.mtx, 0);
+	mbufq_init(&sc->w.txq, 64);
+	sc->w.connected = 1;
+	ifp = sc->w.ifp = if_alloc(IFT_ETHER);
+	if_setsoftc(ifp, sc);
+	if_initname(ifp, "n1w", 0);
+	if_setflags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST);
+	if_setinitfn(ifp, n1w_init);
+	if_setioctlfn(ifp, n1w_ioctl);
+	if_settransmitfn(ifp, n1w_transmit);
+	if_setqflushfn(ifp, n1w_qflush);
+	CURVNET_SET(vnet0);	/* from the boot task */
+	ether_ifattach(ifp, sc->w.mac);
+	if_link_state_change(ifp, LINK_STATE_UP);
+	CURVNET_RESTORE();
+	{
+		struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->dev);
+		struct sysctl_oid_list *kids =
+		    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev));
+
+		SYSCTL_ADD_U32(ctx, kids, OID_AUTO, "wifi_rx", CTLFLAG_RD,
+		    &sc->w.rx_pkts, 0, "frames received");
+		SYSCTL_ADD_U32(ctx, kids, OID_AUTO, "wifi_rx_bad", CTLFLAG_RD,
+		    &sc->w.rx_bad, 0, "bad receive completions");
+		SYSCTL_ADD_U32(ctx, kids, OID_AUTO, "wifi_tx", CTLFLAG_RD,
+		    &sc->w.tx_pkts, 0, "frames sent");
+		SYSCTL_ADD_U32(ctx, kids, OID_AUTO, "wifi_tx_bad", CTLFLAG_RD,
+		    &sc->w.tx_bad, 0, "bad transmit completions");
+	}
+	mtx_lock(&sc->w.mtx);
+	callout_reset(&sc->w.poll, hz / 100 + 1, n1w_poll, sc);
+	mtx_unlock(&sc->w.mtx);
+	device_printf(sc->dev, "wifi: n1w0 up, %6D\n", sc->w.mac, ":");
+	return (0);
 }
 
 /*
