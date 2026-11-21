@@ -43,6 +43,7 @@ struct apple_smc_softc {
 	uint64_t		shmem_pa;
 	void			*shmem;
 	u_int			msgid;
+	u_int			wait_id;	/* ID of the pending command */
 	bool			pending;
 	uint64_t		reply;
 };
@@ -62,6 +63,11 @@ apple_smc_recv(void *arg, uint32_t ep, uint64_t msg)
 	}
 	if (SMC_RESULT(msg) == SMC_NOTIFICATION)
 		return;
+	/* A late reply to an earlier command is not this one's. */
+	if (!sc->pending || SMC_RESULT_ID(msg) != sc->wait_id) {
+		device_printf(sc->dev, "stray reply %#jx\n", (uintmax_t)msg);
+		return;
+	}
 	sc->reply = msg;
 	sc->pending = false;
 }
@@ -138,9 +144,10 @@ apple_smc_write_u32(uint32_t key, uint32_t value)
 		error = apple_smc_start(sc);
 	if (error == 0) {
 		memcpy(sc->shmem, &value, sizeof(value));
+		sc->wait_id = sc->msgid++ & 0xf;
 		sc->pending = true;
 		error = apple_rtkit_send(sc->rtk, SMC_ENDPOINT, SMC_WRITE_KEY |
-		    SMC_MSG_ID(sc->msgid++) | (uint64_t)sizeof(value) << 16 |
+		    SMC_MSG_ID(sc->wait_id) | (uint64_t)sizeof(value) << 16 |
 		    (uint64_t)key << 32);
 	}
 	if (error == 0)
