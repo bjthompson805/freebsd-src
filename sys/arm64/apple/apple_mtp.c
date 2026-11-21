@@ -64,6 +64,7 @@
 
 #include <arm64/apple/apple_dart.h>
 #include <arm64/apple/apple_rtkit.h>
+#include <arm64/apple/apple_smc.h>
 
 #include "hid_if.h"
 
@@ -105,7 +106,19 @@ struct mtp_fw_header {
 };
 #define	MTP_FW_MAGIC		0x46444948	/* "HIDF" */
 #define	INIT_BLK_DESCRIPTOR	0
+#define	INIT_BLK_GPIO		1	/* u16 unk, u16 id, char name[32] */
 #define	INIT_BLK_END		2
+
+/*
+ * The trackpad AFE reset: SMC GPIO 28, key gP1c, driven with pKW4 payloads
+ * (0x10000 | asserted), as aurora's dchid_reset_interface. Active low.
+ */
+#define	SMC_KEY_GP1C		0x67503163
+#define	AFE_RESET_PAYLOAD(on)	(0x10000u | ((on) ? 1 : 0))
+
+/* GPIO command from the MTP: a0 <iface> <gpio> <unk> <cmd> */
+#define	GPIO_CMD_PULSE		3
+#define	GPIO_RET_ERROR		0xe000f00d	/* as aurora's dchid */
 
 #define	MTP_MAX_IFACES		8
 
@@ -118,6 +131,10 @@ struct mtp_iface {
 	bool			want_enable;
 	bool			ready;
 	uint8_t			tx_seq;
+	/* the GPIO the interface announced, if any */
+	bool			gpio_announced;
+	uint16_t		gpio_id;
+	char			gpio_name[33];
 
 	device_t		hidbus;
 	struct hid_device_info	hw;
@@ -159,6 +176,9 @@ struct apple_mtp_softc {
 	uint32_t		ctl_retcode;
 	uint8_t			gpio_ack[16];	/* GPIO request to ack, if len */
 	size_t			gpio_ack_len;
+	uint8_t			gpio_req[11];	/* GPIO request to carry out */
+	size_t			gpio_req_len;
+	struct task		gpio_task;	/* carries out gpio_req */
 	struct task		tp_task;	/* trackpad bring-up */
 	eventhandler_tag	mountroot_tag;
 	u_long			reports;	/* input reports delivered */
@@ -187,9 +207,78 @@ mtp_buf_map(void *arg, vm_paddr_t pa, size_t size, uint64_t *iova)
 	return (0);
 }
 
+/* A buffer the firmware placed itself: find it in the DART table. */
+static int
+mtp_buf_lookup(void *arg, uint64_t iova, size_t size, vm_paddr_t *pa)
+{
+
+	return (apple_dart_lookup(iova, size, pa));
+}
+
 static const struct apple_rtkit_ops mtp_rtkit_ops = {
 	.buf_map = mtp_buf_map,
+	.buf_lookup = mtp_buf_lookup,
 };
+
+/* Drive the trackpad AFE reset (sleepable: an SMC key write). */
+static int
+mtp_afe_reset(struct apple_mtp_softc *sc, bool assert)
+{
+	int error;
+
+	error = apple_smc_write_u32(SMC_KEY_GP1C, AFE_RESET_PAYLOAD(assert));
+	if (error != 0)
+		device_printf(sc->dev, "AFE reset %s failed: %d\n",
+		    assert ? "assert" : "release", error);
+	return (error);
+}
+
+/*
+ * Carry out a GPIO command from the MTP and queue its ack: a pulse on the
+ * GPIO the interface announced, as aurora's dchid_handle_gpio. Only the
+ * AFE reset is wired up; anything else is acked as failed.
+ */
+static void
+mtp_gpio_task(void *arg, int pending)
+{
+	struct apple_mtp_softc *sc = arg;
+	struct mtp_iface *ifc;
+	uint8_t req[sizeof(sc->gpio_req)];
+	size_t len;
+	uint32_t ret;
+
+	mtx_lock(&sc->mtx);
+	len = sc->gpio_req_len;
+	memcpy(req, sc->gpio_req, len);
+	sc->gpio_req_len = 0;
+	mtx_unlock(&sc->mtx);
+	if (len < 5)
+		return;
+
+	ret = GPIO_RET_ERROR;
+	ifc = req[1] < MTP_MAX_IFACES ? &sc->ifaces[req[1]] : NULL;
+	if (ifc == NULL || !ifc->gpio_announced || req[2] != ifc->gpio_id)
+		device_printf(sc->dev, "GPIO command for unannounced GPIO "
+		    "%u on interface %u\n", req[2], req[1]);
+	else if (strcmp(ifc->gpio_name, "afe-reset") != 0)
+		device_printf(sc->dev, "%s: GPIO %s not wired up\n",
+		    ifc->name, ifc->gpio_name);
+	else if (req[4] != GPIO_CMD_PULSE)
+		device_printf(sc->dev, "%s: unknown GPIO command %u\n",
+		    ifc->name, req[4]);
+	else if (mtp_afe_reset(sc, true) == 0) {
+		pause("mtpgpio", MAX(1, hz / 100));
+		if (mtp_afe_reset(sc, false) == 0)
+			ret = 0;
+	}
+
+	mtx_lock(&sc->mtx);
+	sc->gpio_ack[0] = CMD_ACK_GPIO;
+	le32enc(sc->gpio_ack + 1, ret);
+	memcpy(sc->gpio_ack + 5, req, len);
+	sc->gpio_ack_len = 5 + len;
+	mtx_unlock(&sc->mtx);
+}
 
 /* The IOVA window the firmware accepts: <&dart>'s "apple,dma-range". */
 static int
@@ -346,10 +435,19 @@ mtp_comm_init_msg(struct apple_mtp_softc *sc, const uint8_t *m, size_t len)
 				ifc->rdesc_len = blen;
 			}
 		}
+		if (type == INIT_BLK_GPIO && blen >= 4 && !ifc->gpio_announced) {
+			ifc->gpio_id = le16dec(m + off + 4 + 2);
+			memcpy(ifc->gpio_name, m + off + 8,
+			    MIN(blen - 4, sizeof(ifc->gpio_name) - 1));
+			ifc->gpio_announced = true;
+			if (bootverbose)
+				device_printf(sc->dev, "%s: GPIO %u \"%s\"\n",
+				    ifc->name, ifc->gpio_id, ifc->gpio_name);
+		}
 		if (type == INIT_BLK_END)
 			break;
 	}
-	if (le16dec(m + 20) == 0)		/* no more init packets */
+	if (m[20] == 0)				/* no more init packets */
 		ifc->want_enable = true;
 }
 
@@ -476,6 +574,9 @@ mtp_packet(struct apple_mtp_softc *sc, uint8_t iface, uint8_t *p, size_t len)
 	ifc = &sc->ifaces[iface];
 
 	if (flags == MSG_FLAGS_CONTROL) {
+		/* Our commands all go through comm; ignore other acks. */
+		if (iface != 0)
+			return;
 		sc->ctl_retcode = le32dec(p - 4);
 		sc->ctl_pending = false;
 		return;
@@ -491,14 +592,15 @@ mtp_packet(struct apple_mtp_softc *sc, uint8_t iface, uint8_t *p, size_t len)
 			if (bootverbose)
 				device_printf(sc->dev, "%s ready\n",
 				    sc->ifaces[p[1]].name);
-		} else if (p[0] == NOTIFY_GPIO && mlen <= 11) {
-			/* XXX no SMC GPIO yet: log the request, ack success. */
-			device_printf(sc->dev, "GPIO request %*D\n", (int)mlen,
-			    p, " ");
-			sc->gpio_ack[0] = CMD_ACK_GPIO;
-			le32enc(sc->gpio_ack + 1, 0);
-			memcpy(sc->gpio_ack + 5, p, mlen);
-			sc->gpio_ack_len = 5 + mlen;
+		} else if (p[0] == NOTIFY_GPIO && mlen >= 5 &&
+		    mlen <= sizeof(sc->gpio_req) && sc->gpio_req_len == 0) {
+			/* SMC writes sleep: carry it out in a task. */
+			if (bootverbose)
+				device_printf(sc->dev, "GPIO request %*D\n",
+				    (int)mlen, p, " ");
+			memcpy(sc->gpio_req, p, mlen);
+			sc->gpio_req_len = mlen;
+			taskqueue_enqueue(taskqueue_thread, &sc->gpio_task);
 		}
 		return;
 	}
@@ -537,8 +639,10 @@ mtp_receive(struct apple_mtp_softc *sc)
 		return (false);
 	}
 	if (mtp_checksum(pkt, PKT_HDR_LEN + plen) !=
-	    le32dec(pkt + PKT_HDR_LEN + plen))
-		device_printf(sc->dev, "packet checksum mismatch\n");
+	    le32dec(pkt + PKT_HDR_LEN + plen)) {
+		device_printf(sc->dev, "packet checksum mismatch, dropped\n");
+		return (true);
+	}
 	mtp_packet(sc, pkt[5], pkt + PKT_HDR_LEN, plen);
 	return (true);
 }
@@ -668,7 +772,12 @@ mtp_comm_cmd(struct apple_mtp_softc *sc, const void *cmd, size_t len)
 	return (error);
 }
 
-/* Power method 2 transition: announce, (AFE reset), wait, confirm. */
+/*
+ * Power method 2 transition: announce it (WillChange), drive the AFE reset
+ * to the new state, give it 50 ms, confirm it (HasChanged). The reset is
+ * asserted for a power-off and released for a power-on, as aurora's
+ * dchid_pm2_set_power.
+ */
 static int
 mtp_pm2_set_power(struct apple_mtp_softc *sc, uint8_t iface, uint8_t state)
 {
@@ -678,7 +787,9 @@ mtp_pm2_set_power(struct apple_mtp_softc *sc, uint8_t iface, uint8_t state)
 	error = mtp_comm_cmd(sc, cmd, sizeof(cmd));
 	if (error != 0)
 		return (error);
-	/* XXX the AFE reset line (SMC gP1c) should be driven here. */
+	error = mtp_afe_reset(sc, state == POWER_OFF);
+	if (error != 0)
+		return (error);
 	pause("mtpafe", hz / 20);
 	cmd[4] = 1;				/* has changed */
 	return (mtp_comm_cmd(sc, cmd, sizeof(cmd)));
@@ -824,6 +935,7 @@ apple_mtp_attach(device_t dev)
 	node = ofw_bus_get_node(dev);
 	mtx_init(&sc->mtx, "apple_mtp", NULL, MTX_DEF);
 	callout_init(&sc->poll, 1);
+	TASK_INIT(&sc->gpio_task, 0, mtp_gpio_task, sc);
 
 	/* The HID FIFO pair is in the DockChannel node naming us as helper. */
 	xref = OF_xref_from_node(node);
