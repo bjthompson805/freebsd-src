@@ -568,7 +568,14 @@ static int
 apple_aic_teardown_intr(device_t dev, struct intr_irqsrc *isrc,
     struct resource *res, struct intr_map_data *data)
 {
-	panic("%s\n", __func__);
+	struct apple_aic_irqsrc *ai = (struct apple_aic_irqsrc *)isrc;
+
+	/* INTRNG has already masked the source if its last handler left. */
+	if (isrc->isrc_handlers == 0) {
+		ai->ai_pol = INTR_POLARITY_CONFORM;
+		ai->ai_trig = INTR_TRIGGER_CONFORM;
+	}
+	return (0);
 }
 
 static void
