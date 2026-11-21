@@ -49,6 +49,7 @@ struct dev_pm_domain {
 
 struct dev_pm_info {
 	atomic_t usage_count;
+	int runtime_error;	/* m5: drm/apple */
 };
 
 #define	PM_EVENT_FREEZE		0x0001

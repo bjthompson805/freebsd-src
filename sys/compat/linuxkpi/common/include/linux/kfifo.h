@@ -47,7 +47,7 @@
 	})
 
 #define	DECLARE_KFIFO(_name, _type, _size)				\
-	struct kfifo_ ## _name {					\
+	struct {							\
 		size_t		total;					\
 		size_t		count;					\
 		size_t		first;					\
@@ -56,7 +56,7 @@
 	} _name
 
 #define	DECLARE_KFIFO_PTR(_name, _type)					\
-	struct kfifo_ ## _name {					\
+	struct {							\
 		size_t		total;					\
 		size_t		count;					\
 		size_t		first;					\

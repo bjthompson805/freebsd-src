@@ -41,6 +41,7 @@
 #include <linux/compiler.h>
 #include <linux/module.h>
 #include <linux/workqueue.h>
+#include <linux/mutex.h>	/* m5: struct device.lock */
 #include <linux/kdev_t.h>
 #include <linux/backlight.h>
 #include <linux/pm.h>
@@ -87,9 +88,15 @@ struct dev_pm_ops {
 	int (*runtime_idle)(struct device *dev);
 };
 
+struct of_device_id;
+struct attribute_group;
 struct device_driver {
 	const char	*name;
 	const struct dev_pm_ops *pm;
+	const struct of_device_id *of_match_table;	/* m5: drm/apple */
+	const struct attribute_group **dev_groups;	/* m5: drm/apple */
+	struct module	*owner;	/* m5: drm/apple */
+	bool		suppress_bind_attrs;	/* m5: drm/apple */
 
 	void (*shutdown) (struct device *);
 	void (*coredump) (struct device *);
@@ -98,6 +105,9 @@ struct device_driver {
 struct device_type {
 	const char	*name;
 };
+
+struct device_node;
+struct dev_iommu;
 
 struct device {
 	struct device	*parent;
@@ -125,6 +135,9 @@ struct device {
 	unsigned int	irq_end;
 	const struct attribute_group **groups;
 	struct fwnode_handle *fwnode;
+	struct device_node *of_node;	/* m5: drm/apple OF layer */
+	struct mutex	lock;		/* m5: device_lock() for drm/apple */
+	struct dev_iommu *iommu;	/* m5: drm/apple IOMMU core */
 	struct cdev	*backlight_dev;
 	struct backlight_device	*bd;
 
