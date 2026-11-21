@@ -158,6 +158,8 @@ enum nvme_recovery {
 #define	NVME_APPLE_IOSQ			0x1200	/* nvme: I/O SQ base */
 #define	NVME_APPLE_IOCQ			0x1208	/* nvme: I/O CQ base */
 #define	NVME_APPLE_MAX_PEND		0x1210	/* nvme: I/O queue sizes */
+#define	NVME_APPLE_LSQ_CTRL		0x24908	/* nvmmu */
+#define	 NVME_APPLE_LSQ_CTRL_EN		0x1
 #define	NVME_APPLE_LSQ_ASQ_DB		0x2490c	/* nvmmu */
 #define	NVME_APPLE_LSQ_IOSQ_DB		0x24910
 #define	NVME_APPLE_NVMMU_NUM		0x28100

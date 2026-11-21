@@ -214,6 +214,12 @@ nvme_ctrlr_construct_io_qpairs(struct nvme_controller *ctrlr)
 		 *  hence the 'i+1' here.
 		 */
 		qpair->id = i + 1;
+		/*
+		 * ANS: tags index the NVMMU and must be unique across both
+		 * queues; the admin queue has the first ones.
+		 */
+		if (ctrlr->quirks & QUIRK_APPLE_ANS)
+			qpair->cid_base = NVME_APPLE_ADMIN_TRACKERS;
 		if (ctrlr->num_io_queues > 1) {
 			/* Find number of CPUs served by this queue. */
 			for (n = 1; QP(ctrlr, c + n) == i; n++)
@@ -378,9 +384,33 @@ nvme_ctrlr_enable(struct nvme_controller *ctrlr)
 
 	if (ctrlr->quirks & QUIRK_APPLE_ANS) {
 		/* Zero-based sizes, as AQA; then both queues' TCB arrays. */
+		uint32_t lsq;
+
+		/*
+		 * Linear submission queues, beside the doorbells we ring.
+		 * Earlier stages leave them on; turn them on if not.
+		 */
+		lsq = bus_read_4(ctrlr->apple_nvmmu, NVME_APPLE_LSQ_CTRL);
+		if ((lsq & NVME_APPLE_LSQ_CTRL_EN) == 0) {
+			bus_write_4(ctrlr->apple_nvmmu, NVME_APPLE_LSQ_CTRL,
+			    NVME_APPLE_LSQ_CTRL_EN);
+			lsq = bus_read_4(ctrlr->apple_nvmmu,
+			    NVME_APPLE_LSQ_CTRL);
+			if ((lsq & NVME_APPLE_LSQ_CTRL_EN) == 0) {
+				nvme_printf(ctrlr, "can't enable linear "
+				    "submission queues: %#x\n", lsq);
+				return (ENXIO);
+			}
+		}
+
 		qsize = NVME_APPLE_QUEUE_ENTRIES - 1;
 		bus_write_4(ctrlr->resource, NVME_APPLE_MAX_PEND,
 		    qsize | qsize << 16);
+		if (bus_read_4(ctrlr->resource, NVME_APPLE_MAX_PEND) !=
+		    (qsize | qsize << 16)) {
+			nvme_printf(ctrlr, "can't set the I/O queue size\n");
+			return (ENXIO);
+		}
 		bus_write_4(ctrlr->apple_nvmmu, NVME_APPLE_NVMMU_NUM, qsize);
 		for (int i = 0; i < 2; i++) {
 			bus_size_t off = i == 0 ? NVME_APPLE_NVMMU_ASQ_TCB :
