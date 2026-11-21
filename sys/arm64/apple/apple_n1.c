@@ -1039,26 +1039,6 @@ n1_pcie_dump(struct n1_softc *sc, const char *when, int ep)
 		    pci_read_config(rp, cap + 0x20, 4));
 }
 
-/* XXX bring-up: aop-spmi0 controller state (the N1 is spmi-wifibt at 0x0e) */
-static void
-n1_spmi_dump(struct n1_softc *sc, const char *when)
-{
-	static const uint64_t base[] = { 0x390914000, 0x390904000, 0x390900000 };
-	vm_offset_t va;
-	int i, j;
-
-	for (i = 0; i < nitems(base); i++) {
-		va = (vm_offset_t)pmap_mapdev(base[i], PAGE_SIZE);
-		for (j = 0; j < 0x40; j += 0x10)
-			N1_DPRINTF(sc, "spmi %s %#lx+%#x: %08x %08x %08x %08x\n",
-			    when, base[i], j, *(volatile uint32_t *)(va + j),
-			    *(volatile uint32_t *)(va + j + 4),
-			    *(volatile uint32_t *)(va + j + 8),
-			    *(volatile uint32_t *)(va + j + 12));
-		pmap_unmapdev((void *)va, PAGE_SIZE);
-	}
-}
-
 /*
  * Per-function memswap: after the control handshake each function gets its
  * own copy of its segment of the secondary ftab (mswc control, mswb beta,
@@ -1261,7 +1241,6 @@ n1_start_ipc(struct n1_softc *sc)
 			    pci_read_config(rp, c + 8, 2) & ~0x10, 2);
 	}
 	n1_pcie_dump(sc, "before", 1);
-	n1_spmi_dump(sc, "before");
 	{	/* XXX bring-up: VC capability (TC/VC map) on fn0 and the root port */
 		device_t dv[2] = { device_get_parent(device_get_parent(sc->dev)),
 		    sc->dev };
@@ -1380,7 +1359,6 @@ n1_start_ipc(struct n1_softc *sc)
 		written = memcchr((const uint8_t *)sc->secondary + 0x200300, 0xa5,
 		    0x180000);
 		n1_pcie_dump(sc, "after", 0);
-		n1_spmi_dump(sc, "after");
 		if (N1_CRASH) {	/* XXX bring-up: TriggerChipCrash, then look for a crashlog */
 			const uint8_t *b = sc->secondary;
 			uint32_t o, k;
