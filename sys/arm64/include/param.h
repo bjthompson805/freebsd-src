@@ -91,7 +91,12 @@
 #define	PAGE_SHIFT_64K	16
 #define	PAGE_SIZE_64K	(1 << PAGE_SHIFT_64K)
 
+/* m5: Apple DART/DCP (and AGX) want the kernel's page to match their 16K granule. */
+#if defined(_KERNEL) && defined(ARM64_16K_PAGES)
+#define	PAGE_SHIFT	PAGE_SHIFT_16K
+#else
 #define	PAGE_SHIFT	PAGE_SHIFT_4K
+#endif
 #define	PAGE_SIZE	(1 << PAGE_SHIFT)
 #define	PAGE_MASK	(PAGE_SIZE - 1)
 
