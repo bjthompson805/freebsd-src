@@ -16,6 +16,8 @@
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
 #include <sys/rman.h>
 #include <sys/sysctl.h>
 
@@ -73,6 +75,13 @@
 #define	AGX_MSG_ADDR_MASK	((1ull << 44) - 1)
 #define	AGX_FW_LOG_SIZE		0x8000
 #define	AGX_MSG_CONTROL_NOTIFY	((0x84ull << 48) | 0x11)
+#define	AGX_MSG_EVENTS		(0x42ull << 48)
+/* Event ring in each role's status block (fw/initdata.rs status, channels.rs). */
+#define	AGX_STATUS_EVENT_STATE	0x40
+#define	AGX_STATUS_EVENT_RING	0x2c0
+#define	AGX_RX_PRODUCER_OFFSET	0x20
+#define	AGX_EVENT_SLOTS		256
+#define	AGX_EVENT_WORDS		18
 /* Device control (g17/fw/channels.rs). */
 #define	AGX_CONTROL_SLOTS	256
 #define	AGX_CONTROL_RECORD_SIZE	0x40
@@ -202,10 +211,17 @@ struct agx_role {
 	struct apple_rtkit	*rtk;
 	u_int			msgs;
 	bool			init_ack;
+	int			irq_rid;
+	struct resource		*irq;
+	void			*irq_tag;
+	u_long			irqs;
+	u_long			events;
 };
 
 struct apple_agx_softc {
 	device_t		dev;
+	struct mtx		mtx;	/* both RTKits and the rings */
+	bool			running;	/* stage 3 done */
 	uint64_t		data_base;
 	uint64_t		data_size;
 	struct agx_role		roles[2];	/* GFX, GFX1 */
@@ -587,14 +603,20 @@ agx_buf_map(void *arg, vm_paddr_t pa, size_t size, uint64_t *iova)
 	return (EOPNOTSUPP);
 }
 
+static void agx_drain_events(struct agx_role *r);
+
 static void
 agx_recv(void *arg, uint32_t ep, uint64_t msg)
 {
 	struct agx_role *r = arg;
 
-	/* recv_message_early: the InitData acknowledgment. */
-	if (ep == AGX_EP_FIRMWARE && msg >> 48 == AGX_MSG_INITDATA_ACK)
+	/* recv_message_early: the InitData acknowledgment, then events. */
+	if (ep == AGX_EP_FIRMWARE && msg >> 48 == AGX_MSG_INITDATA_ACK) {
 		r->init_ack = true;
+	} else if (ep == AGX_EP_FIRMWARE && msg == AGX_MSG_EVENTS) {
+		agx_drain_events(r);
+		return;
+	}
 	if (r->msgs++ < 16)
 		device_printf(r->sc->dev, "%s: ep %#x msg %#018lx\n", r->name,
 		    ep, msg);
@@ -930,6 +952,7 @@ agx_stage3(struct apple_agx_softc *sc)
 	}
 	device_printf(sc->dev, "M5 firmware opening records retired after "
 	    "%d ms\n", i);
+	sc->running = true;
 	return (0);
 }
 
@@ -1008,6 +1031,168 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 	return (0);
 }
 
+/*
+ * Events::next, logging each record: no event is acted on yet. Stamp and
+ * fault handling come with the queues.
+ */
+static void
+agx_drain_events(struct agx_role *r)
+{
+	struct apple_agx_softc *sc = r->sc;
+	int idx = r == &sc->roles[0] ? 0 : 1;
+	uint8_t *status;
+	volatile uint32_t *cons, *prod, *rec;
+	uint32_t c, p;
+	int n;
+
+	if (sc->graph_va[0] == NULL)
+		return;
+	status = sc->graph_va[0] + agx_graph_status_a[idx];
+	cons = (volatile uint32_t *)(status + AGX_STATUS_EVENT_STATE);
+	prod = (volatile uint32_t *)(status + AGX_STATUS_EVENT_STATE +
+	    AGX_RX_PRODUCER_OFFSET);
+	for (n = 0; n < AGX_EVENT_SLOTS; n++) {
+		c = *cons;
+		p = *prod;
+		if (c >= AGX_EVENT_SLOTS || p >= AGX_EVENT_SLOTS) {
+			device_printf(sc->dev, "%s: bad event cursors %u/%u\n",
+			    r->name, c, p);
+			return;
+		}
+		if (c == p)
+			break;
+		dsb(sy);
+		rec = (volatile uint32_t *)(status + AGX_STATUS_EVENT_RING +
+		    c * AGX_EVENT_WORDS * 4);
+		if (r->events++ < 32)
+			device_printf(sc->dev, "%s: event %u tag %u: %#x %#x %#x "
+			    "%#x %#x\n", r->name, c, rec[0], rec[1], rec[2],
+			    rec[3], rec[4], rec[5]);
+		dsb(sy);
+		*cons = (c + 1) & (AGX_EVENT_SLOTS - 1);
+		dsb(sy);
+	}
+}
+
+static void
+agx_intr(void *arg)
+{
+	struct agx_role *r = arg;
+	struct apple_agx_softc *sc = r->sc;
+
+	mtx_lock(&sc->mtx);
+	r->irqs++;
+	apple_rtkit_poll(r->rtk);
+	mtx_unlock(&sc->mtx);
+}
+
+/* The mailbox node's "recv-not-empty" interrupt, as one of ours. */
+static int
+agx_setup_irq(struct apple_agx_softc *sc, int idx)
+{
+	struct agx_role *r = &sc->roles[idx];
+	pcell_t mboxes[2], *cells;
+	phandle_t mb, iparent;
+	int n, which, ncells, error;
+	u_int irq;
+
+	if (OF_getencprop(ofw_bus_get_node(sc->dev), "mboxes", mboxes,
+	    sizeof(mboxes)) != sizeof(mboxes))
+		return (ENXIO);
+	mb = OF_node_from_xref(mboxes[idx]);
+	if (ofw_bus_find_string_index(mb, "interrupt-names", "recv-not-empty",
+	    &which) != 0)
+		return (ENXIO);
+	iparent = ofw_bus_find_iparent(mb);	/* an xref */
+	if (OF_searchencprop(OF_node_from_xref(iparent), "#interrupt-cells",
+	    &ncells, sizeof(ncells)) == -1 || ncells < 1 || ncells > 4)
+		return (ENXIO);
+	n = OF_getencprop_alloc_multi(mb, "interrupts", sizeof(*cells),
+	    (void **)&cells);
+	if (n < (which + 1) * ncells) {
+		OF_prop_free(cells);
+		return (ENXIO);
+	}
+	irq = ofw_bus_map_intr(sc->dev, iparent, ncells,
+	    &cells[which * ncells]);
+	OF_prop_free(cells);
+	r->irq_rid = idx;
+	if ((error = bus_set_resource(sc->dev, SYS_RES_IRQ, r->irq_rid, irq,
+	    1)) != 0)
+		return (error);
+	r->irq = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ, &r->irq_rid,
+	    RF_ACTIVE);
+	if (r->irq == NULL)
+		return (ENXIO);
+	return (bus_setup_intr(sc->dev, r->irq, INTR_TYPE_MISC | INTR_MPSAFE,
+	    NULL, agx_intr, r, &r->irq_tag));
+}
+
+/* Publish IdlePowerOff(policy) from userland: exercises doorbell and IRQ. */
+static int
+agx_sysctl_idle(SYSCTL_HANDLER_ARGS)
+{
+	struct apple_agx_softc *sc = arg1;
+	uint32_t record[AGX_CONTROL_RECORD_SIZE / 4] = {
+		AGX_CTL_IDLE_POWER_OFF,
+	};
+	uint32_t target;
+	int error, policy = -1;
+
+	error = sysctl_handle_int(oidp, &policy, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (policy != AGX_IDLE_KEEP_POWERED && policy != AGX_IDLE_ALLOW_POWER_OFF)
+		return (EINVAL);
+	record[1] = policy;
+	mtx_lock(&sc->mtx);
+	error = sc->running ? agx_publish_control(sc, record, true, &target) :
+	    ENXIO;
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
+static int
+agx_sysctl_control(SYSCTL_HANDLER_ARGS)
+{
+	struct apple_agx_softc *sc = arg1;
+	volatile uint32_t *st;
+	char buf[48];
+
+	if (!sc->running)
+		return (ENXIO);
+	st = agx_control_state(sc);
+	snprintf(buf, sizeof(buf), "%u %u %u", st[0], st[0x10 / 4],
+	    st[0x20 / 4]);
+	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+}
+
+static void
+agx_sysctls(struct apple_agx_softc *sc)
+{
+	struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->dev);
+	struct sysctl_oid_list *t = SYSCTL_CHILDREN(
+	    device_get_sysctl_tree(sc->dev));
+	int i;
+
+	SYSCTL_ADD_PROC(ctx, t, OID_AUTO, "idle_policy",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
+	    agx_sysctl_idle, "I", "Publish IdlePowerOff (0 keep, 1 allow)");
+	SYSCTL_ADD_PROC(ctx, t, OID_AUTO, "control",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    agx_sysctl_control, "A", "Control ring consumer, unk_10, producer");
+	for (i = 0; i < 2; i++) {
+		struct agx_role *r = &sc->roles[i];
+
+		SYSCTL_ADD_ULONG(ctx, t, OID_AUTO, i == 0 ? "gfx_irqs" :
+		    "gfx1_irqs", CTLFLAG_RD, &r->irqs, "Mailbox interrupts");
+		SYSCTL_ADD_ULONG(ctx, t, OID_AUTO, i == 0 ? "gfx_events" :
+		    "gfx1_events", CTLFLAG_RD, &r->events, "Firmware events");
+		SYSCTL_ADD_UINT(ctx, t, OID_AUTO, i == 0 ? "gfx_msgs" :
+		    "gfx1_msgs", CTLFLAG_RD, &r->msgs, 0, "Endpoint messages");
+	}
+}
+
 static int
 apple_agx_probe(device_t dev)
 {
@@ -1041,6 +1226,7 @@ apple_agx_attach(device_t dev)
 	int error;
 
 	sc->dev = dev;
+	mtx_init(&sc->mtx, "apple_agx", NULL, MTX_DEF);
 
 	/* Check the firmware before touching any GPU register. */
 	if ((error = agx_identify_fw(sc, node)) != 0)
@@ -1075,8 +1261,21 @@ apple_agx_attach(device_t dev)
 	 * Once a coprocessor runs, nothing it was given may go away: keep
 	 * the device attached whatever happens from here on.
 	 */
-	if ((error = agx_stage2(sc, node)) != 0)
+	mtx_lock(&sc->mtx);
+	error = agx_stage2(sc, node);
+	mtx_unlock(&sc->mtx);
+	if (error != 0) {
 		device_printf(dev, "stage 2 stopped: %d\n", error);
+		return (0);
+	}
+	if (sc->running) {
+		for (int i = 0; i < 2; i++)
+			if ((error = agx_setup_irq(sc, i)) != 0)
+				device_printf(dev, "%s: no interrupt: %d\n",
+				    sc->roles[i].name, error);
+		agx_sysctls(sc);
+		device_printf(dev, "interrupts on; firmware running\n");
+	}
 	return (0);
 fail:
 	apple_agx_detach(dev);
