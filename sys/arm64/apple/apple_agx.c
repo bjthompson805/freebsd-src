@@ -41,6 +41,7 @@
 #include <arm64/apple/apple_agx.h>
 #include <arm64/apple/apple_agx_graph.h>
 #include <arm64/apple/apple_agx_queue.h>
+#include <arm64/apple/apple_agx_job.h>
 #include <arm64/apple/apple_pmgr.h>
 #include <arm64/apple/apple_rtkit.h>
 
@@ -220,6 +221,21 @@ struct agx_role {
 	u_long			events;
 };
 
+/* g17/qos.rs Accounting, for the one compute owner this driver has. */
+#define	AGX_QOS_QUEUES		128
+#define	AGX_QOS_DATA_MASTERS	4
+#define	AGX_QOS_CLOCK_HZ	24000000ul	/* hw/t8140.rs qos::CLOCK_HZ */
+struct agx_qos {
+	uint32_t	in_flight[AGX_QOS_QUEUES];
+	uint64_t	dm_in_flight[AGX_QOS_DATA_MASTERS];
+	uint8_t		dm_by_qid[AGX_QOS_QUEUES];
+	uint8_t		rows[AGX_QOS_QUEUES][8];
+	uint32_t	queue_submitted[AGX_QOS_QUEUES];
+	uint32_t	owner_submitted[AGX_QOS_QUEUES];
+	uint64_t	intervals;
+	uint64_t	times_and_counts[7];
+};
+
 struct apple_agx_softc {
 	device_t		dev;
 	struct mtx		mtx;	/* both RTKits and the rings */
@@ -235,6 +251,23 @@ struct apple_agx_softc {
 	uint8_t			*q_work;
 	uint8_t			*q_graph;
 	uint8_t			*q_kick;
+	/* The first kick, stage 6. */
+	uint8_t			*q_pool;
+	uint8_t			*q_pool_control;
+	uint8_t			*q_pool_state;
+	uint8_t			*q_preempt;
+	uint8_t			*q_usage;
+	uint8_t			*q_support;
+	uint8_t			*q_timestamps;
+	uint8_t			*q_records;
+	uint8_t			*q_cached_records;
+	uint8_t			*q_desc;
+	uint8_t			*q_operand;
+	uint8_t			*job_cdm;
+	uint8_t			*job_usc;
+	uint8_t			*job_out;
+	uint32_t		q_reclaimed;	/* Graph::reclaimed */
+	struct agx_qos		qos;
 	uint8_t			*asc;
 	uint8_t			*sgx;
 	bus_size_t		asc_size;
@@ -979,6 +1012,294 @@ agx_publish_work(struct apple_agx_softc *sc, const uint8_t *slot)
 	return (0);
 }
 
+/* An alias of an object at va in root (KernelObject::alias_in, map_alias). */
+static int
+agx_queue_alias(struct apple_agx_softc *sc, const char *name, uint8_t *kva,
+    vm_size_t size, vm_paddr_t root, uint64_t va, int prot)
+{
+	int error;
+
+	if ((error = agx_uat_map(&sc->uat, root, va,
+	    pmap_kextract((vm_offset_t)kva), size, prot)) != 0)
+		device_printf(sc->dev, "queue: alias %s: %d\n", name, error);
+	return (error);
+}
+
+static void
+agx_put_words(uint8_t *base, const struct agx_queue_word *w, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		*(volatile uint32_t *)(base + w[i].off) = w[i].val;
+}
+
+/* qos.rs time_from_host: the 24 MHz firmware domain. */
+static uint64_t
+agx_qos_time(void)
+{
+	uint64_t counter = READ_SPECIALREG(cntpct_el0);
+	uint64_t frequency = READ_SPECIALREG(cntfrq_el0);
+
+	return ((counter / frequency) * AGX_QOS_CLOCK_HZ +
+	    (counter % frequency) * AGX_QOS_CLOCK_HZ / frequency);
+}
+
+/*
+ * qos.rs Accounting::publish_owners for one owner: the row, scheduler and
+ * share, a barrier on the first, then the submission counts and, when the
+ * data master starts busy, its start time and the interval count.
+ */
+static int
+agx_qos_publish(struct apple_agx_softc *sc, u_int qid, u_int qos, u_int dm,
+    uint64_t scheduler, uint8_t class, uint32_t share)
+{
+	struct agx_qos *a = &sc->qos;
+	uint8_t *t;
+	uint64_t time;
+	bool busy, first;
+	int q;
+
+	if ((q = agx_graph_find("qos")) < 0 || qid >= AGX_QOS_QUEUES ||
+	    qos >= AGX_QOS_QUEUES || dm >= AGX_QOS_DATA_MASTERS ||
+	    scheduler == 0)
+		return (EINVAL);
+	t = sc->graph_va[q];
+	if (a->in_flight[qid] != 0 &&
+	    (a->rows[qid][0] != qos || a->dm_by_qid[qid] != dm))
+		return (EBUSY);
+	busy = a->dm_in_flight[dm] == 0;
+	time = busy ? agx_qos_time() : 0;
+	*(volatile uint8_t *)(t + qid * 8) = qos;
+	*(volatile uint8_t *)(t + qid * 8 + 1) = class;
+	a->rows[qid][0] = qos;
+	a->rows[qid][1] = class;
+	*(volatile uint64_t *)(t + 0x800 + qos * 8) = scheduler;
+	*(volatile uint32_t *)(t + 0xc00 + qos * 4) = share;
+	first = a->in_flight[qid] == 0;
+	if (first)
+		dsb(sy);
+	a->queue_submitted[qid]++;
+	*(volatile uint32_t *)(t + 0x400 + qid * 4) = a->queue_submitted[qid];
+	a->owner_submitted[qos]++;
+	*(volatile uint32_t *)(t + 0x600 + qos * 4) = a->owner_submitted[qos];
+	if (busy) {
+		*(volatile uint64_t *)(t + 0xe08 + dm * 8) = time;
+		a->times_and_counts[dm] = time;
+	}
+	a->times_and_counts[3 + dm]++;
+	*(volatile uint64_t *)(t + 0xe08 + (3 + dm) * 8) =
+	    a->times_and_counts[3 + dm];
+	if (busy) {
+		a->intervals++;
+		*(volatile uint64_t *)(t + 0xe00) = a->intervals;
+	}
+	a->in_flight[qid]++;
+	a->dm_in_flight[dm]++;
+	a->dm_by_qid[qid] = dm;
+	dsb(sy);
+	return (0);
+}
+
+/* Graph::append_to: the item, barrier, producer. */
+static int
+agx_queue_append(struct apple_agx_softc *sc, uint32_t *producer,
+    uint32_t consumer, uint64_t va)
+{
+	volatile uint32_t *cursors = (volatile uint32_t *)(sc->q_graph +
+	    AGX_Q_CURSORS);
+	volatile uint64_t *items = (volatile uint64_t *)(sc->q_graph +
+	    AGX_Q_ITEMS);
+	uint32_t next;
+
+	if (*producer >= AGX_Q_ITEM_ENTRIES)
+		return (EBUSY);
+	next = (*producer + 1) % AGX_Q_ITEM_ENTRIES;
+	if (next == consumer || items[*producer] != 0)
+		return (EBUSY);
+	items[*producer] = va;
+	dsb(sy);
+	cursors[(AGX_Q_PRODUCER - AGX_Q_CURSORS) / 4] = next;
+	*producer = next;
+	return (0);
+}
+
+/* Graph::record: clear the record's window, then write the record. */
+static uint64_t
+agx_queue_record(uint8_t *kva, uint64_t va, size_t off, size_t window,
+    const uint8_t *rec, size_t len)
+{
+	memset(kva + off, 0, window);
+	memcpy(kva + off, rec, len);
+	dsb(sy);
+	return (va + off);
+}
+
+/*
+ * Stage 6: the queue's first kick, as publish_with_native_waits publishes
+ * it on the J813: the Graph::new objects the kick names, the work-state
+ * node, the M5 descriptor, the pool submission, QoS, the configuration
+ * and descriptor items, the kick entry, the announcement, the work slot
+ * and the doorbell. The job (apple_agx_job.h, Aurora Mesa) stores
+ * AGX_JOB_STORE_BASE + i to out[i] for AGX_JOB_THREADS invocations.
+ */
+static int
+agx_stage6(struct apple_agx_softc *sc)
+{
+	volatile uint32_t *cursors = (volatile uint32_t *)(sc->q_graph +
+	    AGX_Q_CURSORS);
+	volatile uint32_t *out, *counter, *node, *stamp;
+	uint64_t va;
+	uint32_t consumer, producer, v;
+	u_int i, good;
+	int error;
+
+#define	OBJ(name, field, size, root, va, prot)				\
+	if ((error = agx_queue_object(sc, name, &sc->field, size,	\
+	    sc->uat.root, va, prot)) != 0)				\
+		return (error)
+#define	ALIAS(name, field, size, root, va, prot)			\
+	if ((error = agx_queue_alias(sc, name, sc->field, size,		\
+	    sc->uat.root, va, prot)) != 0)				\
+		return (error)
+	/* Graph::new and the binding's client aliases. */
+	OBJ("preempt", q_preempt, AGX_UAT_PGSZ, upper_root, AGX_Q_PREEMPT_VA,
+	    AGX_PROT_GPU_FW_SHARED_RW);
+	OBJ("usage", q_usage, AGX_UAT_PGSZ, upper_root, AGX_Q_USAGE_VA,
+	    AGX_PROT_GPU_FW_SHARED_RW);
+	OBJ("operand", q_operand, AGX_Q_OPERAND_SIZE, lower_root,
+	    AGX_Q_OPERAND_LOW_VA, AGX_PROT_GPU_FW_SHARED_RW);
+	OBJ("support", q_support, AGX_UAT_PGSZ, upper_root, AGX_Q_SUPPORT_VA,
+	    AGX_PROT_FW_SHARED_RW);
+	OBJ("timestamps", q_timestamps, AGX_Q_TIMESTAMPS_SIZE, upper_root,
+	    AGX_Q_M5_TIMESTAMPS_VA, AGX_PROT_GPU_FW_SHARED_RW);
+	OBJ("records", q_records, AGX_Q_RECORDS_SIZE, upper_root,
+	    AGX_Q_RECORDS_VA, AGX_PROT_GPU_FW_SHARED_RW);
+	OBJ("cached records", q_cached_records, AGX_Q_CACHED_RECORDS_SIZE,
+	    upper_root, AGX_Q_CACHED_RECORDS_VA, AGX_PROT_GPU_FW_SHARED_RW);
+	OBJ("descriptors", q_desc, AGX_Q_DESC_RING_SIZE, upper_root,
+	    AGX_Q_DESC_HIGH_VA, AGX_PROT_FW_SHARED_RW);
+	ALIAS("descriptors", q_desc, AGX_Q_DESC_RING_SIZE, lower_root,
+	    AGX_Q_DESC_LOW_VA, AGX_PROT_GPU_SHARED_RW);
+	ALIAS("preempt", q_preempt, AGX_UAT_PGSZ, lower_root,
+	    AGX_Q_CLIENT_PREEMPT_VA, AGX_PROT_GPU_SHARED_RW);
+	ALIAS("usage", q_usage, AGX_UAT_PGSZ, lower_root,
+	    AGX_Q_CLIENT_USAGE_VA, AGX_PROT_GPU_SHARED_RW);
+	ALIAS("operand", q_operand, AGX_Q_OPERAND_SIZE, lower_root,
+	    AGX_Q_CLIENT_OPERAND_VA, AGX_PROT_GPU_SHARED_RW);
+	/* The job's buffers in the client VM. */
+	OBJ("cdm", job_cdm, AGX_UAT_PGSZ, lower_root, AGX_JOB_CDM_VA,
+	    AGX_PROT_GPU_SHARED_RW);
+	OBJ("usc", job_usc, AGX_UAT_PGSZ, lower_root, AGX_JOB_PROGRAM_VA,
+	    AGX_PROT_GPU_SHARED_RW);
+	OBJ("out", job_out, AGX_UAT_PGSZ, lower_root, AGX_JOB_OUT_VA,
+	    AGX_PROT_GPU_SHARED_RW);
+#undef OBJ
+#undef ALIAS
+	memcpy(sc->job_cdm, agx_job_cdm, sizeof(agx_job_cdm));
+	memcpy(sc->job_usc, agx_job_program, sizeof(agx_job_program));
+	memcpy(sc->job_usc + (AGX_JOB_SHADER_VA - AGX_JOB_PROGRAM_VA),
+	    agx_job_shader, sizeof(agx_job_shader));
+	memset(sc->job_out, 0xa5, AGX_JOB_THREADS * 4);
+	dsb(sy);
+	agx_uat_tlbi_all();
+
+	/* WorkStorage::initialize and add_submitted_kicks(1). */
+	node = (volatile uint32_t *)(sc->q_work + (AGX_Q_NODE_VA -
+	    AGX_Q_WORK_VA));
+	counter = (volatile uint32_t *)(sc->q_work + (AGX_Q_COUNTER_VA -
+	    AGX_Q_WORK_VA));
+	memcpy(__DEVOLATILE(void *, node), agx_q_node, sizeof(agx_q_node));
+	*counter = 0;
+	dsb(sy);
+	*counter = 1;
+	dsb(sy);
+
+	/* The descriptor of kick slot 1. */
+	agx_put_words(sc->q_desc + (AGX_Q_KICK_DESC_HIGH_VA -
+	    AGX_Q_DESC_HIGH_VA), agx_q_descriptor, nitems(agx_q_descriptor));
+	dsb(sy);
+
+	/* One read of the cursors serves the publication. */
+	consumer = cursors[0];
+	producer = cursors[(AGX_Q_PRODUCER - AGX_Q_CURSORS) / 4];
+	if (cursors[0x60 / 4] != AGX_Q_ITEM_ENTRIES ||
+	    producer != AGX_Q_INSTALL_END || consumer != AGX_Q_INSTALL_END) {
+		device_printf(sc->dev, "kick: cursors %u/%u\n", consumer,
+		    producer);
+		return (EIO);
+	}
+	/* Graph::recycle: clear the consumed items. */
+	while (sc->q_reclaimed != consumer) {
+		((volatile uint64_t *)(sc->q_graph + AGX_Q_ITEMS))
+		    [sc->q_reclaimed] = 0;
+		sc->q_reclaimed = (sc->q_reclaimed + 1) % AGX_Q_ITEM_ENTRIES;
+	}
+	dsb(sy);
+	va = agx_queue_record(sc->q_cached_records, AGX_Q_CACHED_RECORDS_VA,
+	    0, 0xc0, agx_q_kick_config, sizeof(agx_q_kick_config));
+
+	/* ComputePool::reserve_submission, then QoS. */
+	(*(volatile uint64_t *)sc->q_pool_state)++;
+	dsb(sy);
+	if ((error = agx_qos_publish(sc, AGX_Q_QID, AGX_Q_QOS, 2,
+	    AGX_Q_SCHED_VA, AGX_Q_QOS_CLASS, AGX_Q_QOS_SHARE)) != 0)
+		return (error);
+	/* The configuration, then (J813) the descriptor. */
+	if ((error = agx_queue_append(sc, &producer, consumer, va)) != 0 ||
+	    (error = agx_queue_append(sc, &producer, consumer,
+	    AGX_Q_KICK_DESC_HIGH_VA)) != 0)
+		return (error);
+	/* prepare_compute_install, then PreparedKick::commit. */
+	agx_uat_tlbi_all();
+	memcpy(sc->q_kick + AGX_Q_KICK_ENTRY, agx_q_kick_entry,
+	    sizeof(agx_q_kick_entry));
+	dsb(sy);
+	va = agx_queue_record(sc->q_records, AGX_Q_RECORDS_VA, 0x800, 0x40,
+	    agx_q_kick_announce, sizeof(agx_q_kick_announce));
+	if ((error = agx_queue_append(sc, &producer, consumer, va)) != 0)
+		return (error);
+	dsb(sy);
+	if (producer != AGX_Q_KICK_END)
+		return (EIO);
+	if ((error = agx_publish_work(sc, agx_q_kick_slot)) != 0) {
+		device_printf(sc->dev, "kick: work slot: %d\n", error);
+		return (error);
+	}
+	dsb(sy);
+	if ((error = apple_rtkit_send(sc->roles[0].rtk, AGX_EP_DOORBELL,
+	    AGX_MSG_WORK_NOTIFY | 0x02 | AGX_Q_PRIORITY << 2)) != 0)
+		return (error);
+
+	out = (volatile uint32_t *)sc->job_out;
+	stamp = (volatile uint32_t *)(sc->q_support +
+	    (AGX_Q_STAMP_VA - AGX_Q_SUPPORT_VA));
+	for (i = 0; i <= 2000; i++) {
+		agx_poll_both(sc);
+		if (apple_rtkit_crashed(sc->roles[0].rtk) ||
+		    apple_rtkit_crashed(sc->roles[1].rtk))
+			break;
+		if (node[AGX_Q_NODE_COMPLETED / 4] >= 1 &&
+		    cursors[0] == AGX_Q_KICK_END)
+			break;
+		DELAY(1000);
+	}
+	memcpy(&v, sc->q_pool_control + AGX_Q_POOL_COMPLETED, 4);
+	device_printf(sc->dev, "kick: %u ms: consumer %u (end %u), node "
+	    "completed %u, stamp %#x (want %#x), pool completed %u, work ring "
+	    "%u/%u\n", i, cursors[0], AGX_Q_KICK_END,
+	    node[AGX_Q_NODE_COMPLETED / 4], *stamp, AGX_Q_STAMP_VALUE, v,
+	    ((volatile uint32_t *)(sc->graph_va[0] + agx_graph_state_grids[0] +
+	    AGX_Q_WORK_STATE))[0],
+	    ((volatile uint32_t *)(sc->graph_va[0] + agx_graph_state_grids[0] +
+	    AGX_Q_WORK_STATE))[0x20 / 4]);
+	for (i = 0, good = 0; i < AGX_JOB_THREADS; i++)
+		good += out[i] == AGX_JOB_STORE_BASE + i;
+	device_printf(sc->dev, "job: %u/%u stores; out[0..3] %#x %#x %#x "
+	    "%#x\n", good, AGX_JOB_THREADS, out[0], out[1], out[2], out[3]);
+	return (good == AGX_JOB_THREADS ? 0 : EIO);
+}
+
 /*
  * Stage 5: one compute queue, installed as install_m5 does on the J813
  * (no host-port registers): Context::new's scheduler and work pages, the
@@ -994,6 +1315,30 @@ agx_stage5(struct apple_agx_softc *sc, phandle_t node)
 	uint64_t *items;
 	u_int i;
 	int error;
+
+	volatile uint64_t *row;
+	int pp;
+
+	/* ComputePool::new and InitData::install_compute_pool (J813 row). */
+	if ((error = agx_queue_object(sc, "pool", &sc->q_pool, AGX_Q_POOL_SIZE,
+	    sc->uat.lower_root, AGX_Q_POOL_LOW_VA, AGX_PROT_GPU_SHARED_RW)) != 0 ||
+	    (error = agx_queue_object(sc, "pool control", &sc->q_pool_control,
+	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_Q_POOL_CONTROL_VA,
+	    AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
+	    (error = agx_queue_object(sc, "pool state", &sc->q_pool_state,
+	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_Q_POOL_STATE_VA,
+	    AGX_PROT_GPU_FW_SHARED_RW)) != 0)
+		return (error);
+	agx_put_words(sc->q_pool, agx_q_pool_tables, nitems(agx_q_pool_tables));
+	agx_put_words(sc->q_pool_control, agx_q_pool_control,
+	    nitems(agx_q_pool_control));
+	dsb(sy);
+	if ((pp = agx_graph_find("page_pool")) < 0)
+		return (EINVAL);
+	row = (volatile uint64_t *)(sc->graph_va[pp] + AGX_Q_POOL_ROW);
+	for (i = 0; i < nitems(agx_q_pool_row); i++)
+		row[i] = agx_q_pool_row[i];
+	dsb(sy);
 
 	if ((error = agx_queue_object(sc, "scheduler", &sc->q_sched,
 	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_Q_SCHED_VA,
@@ -1013,14 +1358,10 @@ agx_stage5(struct apple_agx_softc *sc, phandle_t node)
 		device_printf(sc->dev, "queue: map kick alias: %d\n", error);
 		return (error);
 	}
-	for (i = 0; i < nitems(agx_q_sched); i++)
-		*(volatile uint32_t *)(sc->q_sched + agx_q_sched[i].off) =
-		    agx_q_sched[i].val;
+	agx_put_words(sc->q_sched, agx_q_sched, nitems(agx_q_sched));
 	memcpy(sc->q_work + (AGX_Q_WORK_HEAD_VA - AGX_Q_WORK_VA),
 	    agx_q_work_head, sizeof(agx_q_work_head));
-	for (i = 0; i < nitems(agx_q_graph); i++)
-		*(volatile uint32_t *)(sc->q_graph + agx_q_graph[i].off) =
-		    agx_q_graph[i].val;
+	agx_put_words(sc->q_graph, agx_q_graph, nitems(agx_q_graph));
 	dsb(sy);
 	if ((error = agx_publish_context(sc, node, AGX_Q_CONTEXT)) != 0) {
 		device_printf(sc->dev, "queue: context %u: %d\n",
@@ -1161,6 +1502,11 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 			0x7201848000ul, 0x7201870000ul,	/* completion rings */
 			0x7201898000ul, 0x72018c0000ul,
 			0x8000000000ul,			/* canonical arena */
+			/* The first job's client VM ranges (stage 6). */
+			0x1000100000ul,			/* driver: CDM stream */
+			0x4000000000ul,			/* data heap */
+			0x9000000000ul,			/* client-private aliases */
+			0x10000000000ul,		/* USC window */
 		};
 		for (i = 0; i < (int)nitems(links); i++)
 			if ((error = agx_uat_alloc_tables(&sc->uat,
@@ -1204,6 +1550,13 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 		else
 			device_printf(sc->dev, "stage 5: compute queue %u "
 			    "installed\n", AGX_Q_QID);
+	}
+	if (error == 0 && agx_stage >= 6) {
+		if ((error = agx_stage6(sc)) != 0)
+			device_printf(sc->dev, "stage 6 failed: %d\n", error);
+		else
+			device_printf(sc->dev, "stage 6: first compute job "
+			    "done\n");
 	}
 
 	/* Listen for a while; no InitData yet. */
