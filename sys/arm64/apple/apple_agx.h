@@ -51,6 +51,8 @@ int	agx_uat_alloc_tables(struct agx_uat *uat, vm_paddr_t root,
 	    uint64_t start, uint64_t end);
 int	agx_uat_map(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
 	    vm_paddr_t pa, vm_size_t size, int prot);
+int	agx_uat_unmap(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
+	    vm_size_t size);
 int	agx_uat_lookup(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
 	    uint64_t *pte);
 int	agx_uat_adopt_roots(struct agx_uat *uat, uint64_t snapshot[3]);

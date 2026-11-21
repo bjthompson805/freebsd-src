@@ -43,6 +43,7 @@
 #include <arm64/apple/apple_agx_queue.h>
 #include <arm64/apple/apple_agx_job.h>
 #include <arm64/apple/apple_agx_fw.h>
+#include <arm64/apple/apple_agx_api.h>
 #include <arm64/apple/apple_pmgr.h>
 #include <arm64/apple/apple_rtkit.h>
 
@@ -79,6 +80,18 @@
 #define	AGX_FW_LOG_SIZE		0x8000
 #define	AGX_MSG_CONTROL_NOTIFY	((0x84ull << 48) | 0x11)
 #define	AGX_MSG_WORK_NOTIFY	(0x83ull << 48)	/* | pipe | priority << 2 */
+
+/*
+ * The client VM's windows (Aurora Mesa agx_m5_va.h): the driver window and
+ * data heap below the canonical arena, and the USC window. The canonical
+ * (0x80_..) and client-private (0x90_..) arenas are the driver's.
+ */
+#define	AGX_LOWER_TOP_SPAN	(1ul << 36)	/* one lower root entry */
+#define	AGX_CLIENT_START	0x4000ul
+#define	AGX_CLIENT_LOW_END	0x8000000000ul	/* AGX_M5_DATA_END */
+#define	AGX_CLIENT_SHADER	0x10000000000ul	/* AGX_M5_SHADER_BASE */
+#define	AGX_CLIENT_SHADER_END	(AGX_CLIENT_SHADER + 0x100000000ul)
+
 #define	AGX_MSG_EVENTS		(0x42ull << 48)
 /* Event ring in each role's status block (fw/initdata.rs status, channels.rs). */
 #define	AGX_STATUS_EVENT_STATE	0x40
@@ -1440,6 +1453,98 @@ agx_retire(struct apple_agx_softc *sc, u_int *ms)
  * AGX_JOB_STORE_BASE + i to out[i] for AGX_JOB_THREADS invocations; the
  * output is cleared before every kick and checked after it retires.
  */
+static struct apple_agx_softc *apple_agx_sc;	/* queue installed */
+
+device_t
+apple_agx_device(void)
+{
+
+	return (apple_agx_sc != NULL ? apple_agx_sc->dev : NULL);
+}
+
+void
+apple_agx_get_params(device_t dev, struct apple_agx_params *p)
+{
+	struct apple_agx_softc *sc = device_get_softc(dev);
+
+	memset(p, 0, sizeof(*p));
+	p->chip_id = 0x8142;
+	p->generation = 17;
+	p->variant = 'G';
+	p->revision = sc->id.rev;
+	p->num_dies = sc->id.num_dies;
+	p->num_clusters = sc->id.num_clusters;
+	p->num_cores_per_cluster = sc->id.num_cores;
+	for (int i = 0; i < 3 && i < (int)nitems(sc->id.core_masks); i++)
+		p->core_masks[i] = sc->id.core_masks[i];
+	p->vm_start = AGX_CLIENT_START;
+	p->vm_end = AGX_CLIENT_SHADER_END;
+	p->usc_base = AGX_CLIENT_SHADER;
+}
+
+static bool
+agx_client_range(uint64_t va, vm_size_t size)
+{
+	uint64_t end = va + size;
+
+	if (end < va || ((va | size) & AGX_UAT_PGMSK) != 0 || size == 0)
+		return (false);
+	return ((va >= AGX_CLIENT_START && end <= AGX_CLIENT_LOW_END) ||
+	    (va >= AGX_CLIENT_SHADER && end <= AGX_CLIENT_SHADER_END));
+}
+
+int
+apple_agx_vm_map(device_t dev, uint64_t va, vm_paddr_t pa, vm_size_t size,
+    bool writable)
+{
+	struct apple_agx_softc *sc = device_get_softc(dev);
+	int error;
+
+	(void)writable;		/* PROT_GPU_RW only, as yet */
+	if (!agx_client_range(va, size) || (pa & AGX_UAT_PGMSK) != 0)
+		return (EINVAL);
+	mtx_lock(&sc->mtx);
+	error = agx_uat_map(&sc->uat, sc->uat.lower_root, va, pa, size,
+	    AGX_PROT_GPU_SHARED_RW);
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
+int
+apple_agx_vm_unmap(device_t dev, uint64_t va, vm_size_t size)
+{
+	struct apple_agx_softc *sc = device_get_softc(dev);
+	int error;
+
+	if (!agx_client_range(va, size))
+		return (EINVAL);
+	mtx_lock(&sc->mtx);
+	error = agx_uat_unmap(&sc->uat, sc->uat.lower_root, va, size);
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
+int
+apple_agx_submit_compute(device_t dev, uint64_t cdm_va, uint64_t cdm_end,
+    u_int timeout_ms)
+{
+	struct apple_agx_softc *sc = device_get_softc(dev);
+	u_int ms;
+	int error;
+
+	(void)timeout_ms;	/* agx_retire waits 2 s */
+	if (cdm_end <= cdm_va || cdm_end - cdm_va < 4 || (cdm_va & 7) != 0)
+		return (EINVAL);
+	mtx_lock(&sc->mtx);
+	if ((error = agx_kick(sc, cdm_va, cdm_end)) == 0)
+		error = agx_retire(sc, &ms);
+	mtx_unlock(&sc->mtx);
+	if (error != 0)
+		device_printf(sc->dev, "submit: compute at %#lx: %d\n", cdm_va,
+		    error);
+	return (error);
+}
+
 /* Stage 6 runs the job this many times, one kick at a time. */
 #define	AGX_STAGE6_KICKS	16
 
@@ -1742,6 +1847,15 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 				    links[i], error);
 				return (error);
 			}
+		/* Every top-level entry of the client windows (apple_agx_api.h). */
+		for (u_long va = 0; va < AGX_CLIENT_SHADER_END;
+		    va += AGX_LOWER_TOP_SPAN)
+			if ((error = agx_uat_alloc_tables(&sc->uat,
+			    sc->uat.lower_root, va, va + AGX_UAT_PGSZ)) != 0) {
+				device_printf(sc->dev, "lower link %#lx: %d\n",
+				    va, error);
+				return (error);
+			}
 		device_printf(sc->dev, "UAT: %d lower links, %d tables\n",
 		    (int)nitems(links), sc->uat.ntables);
 	}
@@ -1783,6 +1897,16 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 		else
 			device_printf(sc->dev, "stage 6: %d compute jobs "
 			    "done\n", AGX_STAGE6_KICKS);
+	}
+	if (error == 0 && agx_stage >= 6) {
+		/* The self-test's buffers leave the client windows. */
+		agx_uat_unmap(&sc->uat, sc->uat.lower_root, AGX_JOB_CDM_VA,
+		    AGX_UAT_PGSZ);
+		agx_uat_unmap(&sc->uat, sc->uat.lower_root, AGX_JOB_PROGRAM_VA,
+		    AGX_UAT_PGSZ);
+		agx_uat_unmap(&sc->uat, sc->uat.lower_root, AGX_JOB_OUT_VA,
+		    AGX_UAT_PGSZ);
+		apple_agx_sc = sc;
 	}
 
 	/* Listen for a while; no InitData yet. */

@@ -246,6 +246,27 @@ agx_uat_map(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
 	return (0);
 }
 
+/* unmap_pages: clear the leaves of [iova, iova + size); tables stay. */
+int
+agx_uat_unmap(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
+    vm_size_t size)
+{
+	volatile uint64_t *leaf;
+	uint64_t off;
+	int error;
+
+	if (((iova | size) & AGX_UAT_PGMSK) != 0 || size == 0)
+		return (EINVAL);
+	for (off = 0; off < size; off += AGX_UAT_PGSZ) {
+		if ((error = agx_walk(uat, root, iova + off, false, &leaf)) != 0)
+			return (error);
+		*leaf = 0;
+	}
+	dsb(sy);
+	agx_uat_tlbi_all();
+	return (0);
+}
+
 int
 agx_uat_lookup(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
     uint64_t *pte)
