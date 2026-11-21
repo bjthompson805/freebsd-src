@@ -72,6 +72,13 @@
 #define	AGX_MSG_POWER_ON_DONE	(0x89ull << 48)
 #define	AGX_MSG_ADDR_MASK	((1ull << 44) - 1)
 #define	AGX_FW_LOG_SIZE		0x8000
+#define	AGX_MSG_CONTROL_NOTIFY	((0x84ull << 48) | 0x11)
+/* Device control (g17/fw/channels.rs). */
+#define	AGX_CONTROL_SLOTS	256
+#define	AGX_CONTROL_RECORD_SIZE	0x40
+#define	AGX_CTL_IDLE_POWER_OFF	0x0a
+#define	AGX_IDLE_KEEP_POWERED	0
+#define	AGX_IDLE_ALLOW_POWER_OFF 1
 /* abi CONTROL_STATE_OFFSET (12 work channels x 0x40) and OPENING_PRODUCER. */
 #define	AGX_CONTROL_STATE	0x300
 #define	AGX_OPENING_PRODUCER	1
@@ -119,7 +126,7 @@ MALLOC_DEFINE(M_AGX, "apple_agx", "Apple GPU");
 
 static SYSCTL_NODE(_hw, OID_AUTO, apple_agx, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Apple M5 GPU");
-/* 1: identify; 2: start both coprocessors; 3: InitData. */
+/* 1: identify; 2: start both coprocessors; 3: InitData; 4: control. */
 static int agx_stage = 1;
 SYSCTL_INT(_hw_apple_agx, OID_AUTO, stage, CTLFLAG_RDTUN, &agx_stage, 0,
     "Bring-up stage to run at attach");
@@ -779,6 +786,85 @@ agx_opening_retired(struct apple_agx_softc *sc, int idx)
 	    st[0x20 / 4] == AGX_OPENING_PRODUCER);
 }
 
+static volatile uint32_t *
+agx_control_state(struct apple_agx_softc *sc)
+{
+
+	return ((volatile uint32_t *)(sc->graph_va[0] +
+	    agx_graph_state_grids[0] + AGX_CONTROL_STATE));
+}
+
+/*
+ * Rings::publish_control and InitData::publish_control: the record, the
+ * power-assert tally, barrier, producer, barrier; then the primary's
+ * doorbell. Returns the consumer value that retires the record.
+ */
+static int
+agx_publish_control(struct apple_agx_softc *sc, const uint32_t *record,
+    bool asserts_power, uint32_t *target)
+{
+	volatile uint32_t *st = agx_control_state(sc);
+	uint8_t *bundle, *tally;
+	uint32_t consumer, producer, next, v;
+	int b, rc;
+
+	if ((b = agx_graph_find("bundle")) < 0 ||
+	    (rc = agx_graph_find("region_c")) < 0)
+		return (EINVAL);
+	dsb(sy);
+	consumer = st[0];
+	producer = st[0x20 / 4];
+	if (consumer >= AGX_CONTROL_SLOTS || producer >= AGX_CONTROL_SLOTS)
+		return (EIO);
+	next = (producer + 1) & (AGX_CONTROL_SLOTS - 1);
+	if (next == consumer)
+		return (EAGAIN);
+	bundle = sc->graph_va[b] + AGX_GRAPH_CONTROL_RING +
+	    producer * AGX_CONTROL_RECORD_SIZE;
+	memcpy(bundle, record, AGX_CONTROL_RECORD_SIZE);
+	if (asserts_power) {
+		/* An unaligned word: copy it as four bytes. */
+		tally = sc->graph_va[rc] + AGX_GRAPH_POWER_TALLY;
+		memcpy(&v, tally, 4);
+		v = htole32(le32toh(v) + 1);
+		memcpy(tally, &v, 4);
+	}
+	dsb(sy);
+	st[0x20 / 4] = next;
+	dsb(sy);
+	*target = next;
+	return (apple_rtkit_send(sc->roles[0].rtk, AGX_EP_DOORBELL,
+	    AGX_MSG_CONTROL_NOTIFY));
+}
+
+/* Stage 4: one device-control record, IdlePowerOff(KeepPowered). */
+static int
+agx_stage4(struct apple_agx_softc *sc)
+{
+	volatile uint32_t *st = agx_control_state(sc);
+	uint32_t record[AGX_CONTROL_RECORD_SIZE / 4] = {
+		AGX_CTL_IDLE_POWER_OFF, AGX_IDLE_KEEP_POWERED,
+	};
+	uint32_t target;
+	int error, i;
+
+	device_printf(sc->dev, "control counters before: %u %u %u\n", st[0],
+	    st[0x10 / 4], st[0x20 / 4]);
+	if ((error = agx_publish_control(sc, record, true, &target)) != 0)
+		return (error);
+	for (i = 0; i <= 1000; i++) {
+		agx_poll_both(sc);
+		if (apple_rtkit_crashed(sc->roles[0].rtk))
+			return (EIO);
+		if (st[0] == target)
+			break;
+		DELAY(1000);
+	}
+	device_printf(sc->dev, "control counters after %d ms: %u %u %u "
+	    "(target %u)\n", i, st[0], st[0x10 / 4], st[0x20 / 4], target);
+	return (st[0] == target ? 0 : ETIMEDOUT);
+}
+
 /*
  * Stage 3: boot_m5 after both coprocessors run. Adopt the roots, build
  * the graph, hand out the log buffers (GFX1, GFX), InitData (GFX1, GFX),
@@ -905,6 +991,10 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 
 	if (agx_stage >= 3 && (error = agx_stage3(sc)) != 0)
 		device_printf(sc->dev, "stage 3 failed: %d\n", error);
+	else if (agx_stage >= 4 && (error = agx_stage4(sc)) != 0)
+		device_printf(sc->dev, "stage 4 failed: %d\n", error);
+	else if (agx_stage >= 4)
+		device_printf(sc->dev, "stage 4: control record retired\n");
 
 	/* Listen for a while; no InitData yet. */
 	for (i = 0; i < 200; i++) {

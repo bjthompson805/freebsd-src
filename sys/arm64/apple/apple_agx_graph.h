@@ -63,6 +63,8 @@ static const struct agx_graph_window agx_graph_windows[] = {
 
 static const uint64_t agx_graph_roots[2] = { 0xfffffc20001a8000ul, 0xfffffc20001b0000ul };
 static const uint32_t agx_graph_state_grids[2] = { 0x0, 0x177400 };
+#define	AGX_GRAPH_CONTROL_RING	0x1fa00	/* in bundle */
+#define	AGX_GRAPH_POWER_TALLY	0xe75	/* in region_c */
 
 static const struct agx_graph_word agx_graph_words[] = {
 	{ 0, 0x320, 0x1 },
