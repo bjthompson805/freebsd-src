@@ -18,6 +18,8 @@
 #define	AGX_PROT_FW_PRIV_RW		3
 #define	AGX_PROT_GPU_FW_SHARED_RW	4
 #define	AGX_PROT_GPU_SHARED_RW		5
+#define	AGX_PROT_GPU_SHARED_RO		6
+#define	AGX_PROT_GPU_SHARED_WO		7
 
 /* Kernel window base the M5 graph lives in (initdata/m5.rs BASE). */
 #define	AGX_M5_BASE		0xfffffc2000000000ul
@@ -39,18 +41,26 @@ struct agx_uat {
 		uint8_t		*va;
 	} regions[AGX_UAT_MAX_REGIONS];
 	int		nregions;
-	/* Tables this driver allocated (reached through the DMAP). */
-	vm_paddr_t	tables[AGX_UAT_MAX_TABLES];
+	/* Tables this driver allocated and their original allocation addresses. */
+	struct {
+		vm_paddr_t	pa;
+		void		*va;
+	} tables[AGX_UAT_MAX_TABLES];
 	int		ntables;
 };
 
 int	agx_uat_attach(struct agx_uat *uat, device_t dev, vm_paddr_t lower,
 	    vm_paddr_t upper, vm_paddr_t secondary);
 int	agx_uat_add_region(struct agx_uat *uat, vm_paddr_t pa, vm_size_t size);
+int	agx_uat_new_client_root(struct agx_uat *uat, vm_paddr_t *root,
+	    unsigned int shared_start, unsigned int shared_end);
 int	agx_uat_alloc_tables(struct agx_uat *uat, vm_paddr_t root,
 	    uint64_t start, uint64_t end);
 int	agx_uat_map(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
 	    vm_paddr_t pa, vm_size_t size, int prot);
+int	agx_uat_map_pages(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
+	    vm_paddr_t pa, vm_size_t size, int prot, bool single_page,
+	    bool replace);
 int	agx_uat_unmap(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
 	    vm_size_t size);
 int	agx_uat_lookup(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,

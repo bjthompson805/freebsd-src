@@ -65,6 +65,8 @@ static const uint64_t agx_prot_bits[] = {
 	[AGX_PROT_GPU_FW_SHARED_RW] = PROT(AP_FW_GPU, 1, 1, MEMATTR_UNCACHED),
 	/* PROT_GPU_RW (AP_GPU 2, uxn 1, pxn 0), stored as is. */
 	[AGX_PROT_GPU_SHARED_RW] = PROT(2, 1, 0, MEMATTR_UNCACHED),
+	[AGX_PROT_GPU_SHARED_RO] = PROT(2, 0, 0, MEMATTR_UNCACHED),
+	[AGX_PROT_GPU_SHARED_WO] = PROT(2, 0, 1, MEMATTR_UNCACHED),
 };
 
 /* IOVA_KERN_TOP_LEVEL_INDEX: root entries 0..2 are the firmware's. */
@@ -92,7 +94,8 @@ agx_uat_attach(struct agx_uat *uat, device_t dev, vm_paddr_t lower,
 	uat->lower_root = lower;
 	uat->upper_root = upper;
 	uat->secondary_root = secondary;
-	uat->tables[uat->ntables++] = lower;
+	uat->tables[uat->ntables].pa = lower;
+	uat->tables[uat->ntables++].va = (void *)PHYS_TO_DMAP(lower);
 	return (0);
 }
 
@@ -125,8 +128,8 @@ agx_table(struct agx_uat *uat, vm_paddr_t pa)
 			return ((volatile uint64_t *)(uat->regions[i].va +
 			    (pa - uat->regions[i].pa)));
 	for (i = 0; i < uat->ntables; i++)
-		if (uat->tables[i] == pa)
-			return ((volatile uint64_t *)PHYS_TO_DMAP(pa));
+		if (uat->tables[i].pa == pa)
+			return (uat->tables[i].va);
 	return (NULL);
 }
 
@@ -137,12 +140,53 @@ agx_new_table(struct agx_uat *uat, vm_paddr_t *pa)
 
 	if (uat->ntables == AGX_UAT_MAX_TABLES)
 		return (ENOSPC);
-	p = contigmalloc(AGX_UAT_PGSZ, M_AGX, M_WAITOK | M_ZERO, 0,
+	p = contigmalloc(AGX_UAT_PGSZ, M_AGX, M_NOWAIT | M_ZERO, 0,
 	    uat->oas_mask, AGX_UAT_PGSZ, 0);
 	if (p == NULL)
 		return (ENOMEM);
 	*pa = pmap_kextract((vm_offset_t)p);
-	uat->tables[uat->ntables++] = *pa;
+	uat->tables[uat->ntables].pa = *pa;
+	uat->tables[uat->ntables++].va = p;
+	return (0);
+}
+
+/*
+ * The firmware can sample top-level pointers when it adopts a context.
+ * Keep those pointers stable across later user mappings and VM reuse.
+ */
+int
+agx_uat_new_client_root(struct agx_uat *uat, vm_paddr_t *root,
+    unsigned int shared_start, unsigned int shared_end)
+{
+	volatile uint64_t *source, *target;
+	vm_paddr_t child;
+	unsigned int i;
+	int error, checkpoint;
+
+	source = agx_table(uat, uat->lower_root);
+	if (source == NULL || shared_start > shared_end || shared_end >= UAT_NPTE)
+		return (EINVAL);
+	checkpoint = uat->ntables;
+	error = agx_new_table(uat, root);
+	if (error != 0)
+		return (error);
+	target = agx_table(uat, *root);
+	for (i = 0; i <= shared_end; i++) {
+		if (i >= shared_start && i < shared_end) {
+			target[i] = source[i];
+			continue;
+		}
+		error = agx_new_table(uat, &child);
+		if (error != 0) {
+			while (uat->ntables > checkpoint)
+				contigfree(uat->tables[--uat->ntables].va,
+				    AGX_UAT_PGSZ, M_AGX);
+			*root = 0;
+			return (error);
+		}
+		target[i] = child | PTE_TYPE_LEAF_TABLE;
+	}
+	dsb(sy);
 	return (0);
 }
 
@@ -215,32 +259,53 @@ agx_uat_alloc_tables(struct agx_uat *uat, vm_paddr_t root, uint64_t start,
 }
 
 /*
- * map_pages: never replace a live leaf. Driver-owned roots hold user
- * (non-global) leaves, the firmware's kernel root global ones.
+ * Driver-owned roots hold non-global leaves, the firmware root global ones.
+ * Prepare every table before changing leaves. For replacements, invalidate
+ * the old translations before publishing the new entries.
  */
 int
 agx_uat_map(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
     vm_paddr_t pa, vm_size_t size, int prot)
 {
+	return (agx_uat_map_pages(uat, root, iova, pa, size, prot, false,
+	    false));
+}
+
+int
+agx_uat_map_pages(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
+    vm_paddr_t pa, vm_size_t size, int prot, bool single_page, bool replace)
+{
 	volatile uint64_t *leaf;
 	uint64_t bits, off;
+	bool mapped = false;
 	int error;
 
 	if (((iova | pa | size) & AGX_UAT_PGMSK) != 0 || size == 0 ||
 	    prot < 0 || prot >= (int)nitems(agx_prot_bits))
 		return (EINVAL);
 	bits = agx_prot_bits[prot] | PTE_TYPE_LEAF_TABLE;
-	if (root == uat->lower_root)
+	if (root != uat->upper_root && root != uat->secondary_root)
 		bits |= UAT_NON_GLOBAL;
 	for (off = 0; off < size; off += AGX_UAT_PGSZ) {
-		if ((error = agx_walk(uat, root, iova + off, true, &leaf)) != 0)
+		error = agx_walk(uat, root, iova + off, true, &leaf);
+		if (error != 0)
 			return (error);
-		if (*leaf != 0) {
+		if (*leaf == 0)
+			continue;
+		if (!replace) {
 			device_printf(uat->dev, "UAT: page at iova %#lx is "
 			    "mapped (PTE %#lx)\n", iova + off, *leaf);
 			return (EBUSY);
 		}
-		*leaf = (pa + off) | bits;
+		mapped = true;
+	}
+	if (mapped && (error = agx_uat_unmap(uat, root, iova, size)) != 0)
+		return (error);
+	for (off = 0; off < size; off += AGX_UAT_PGSZ) {
+		error = agx_walk(uat, root, iova + off, false, &leaf);
+		if (error != 0)
+			return (error);
+		*leaf = (pa + (single_page ? 0 : off)) | bits;
 	}
 	agx_uat_tlbi_all();
 	return (0);

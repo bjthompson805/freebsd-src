@@ -2,9 +2,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  *
  * Apple M5 GPU: the interface apple_agx exports to its DRM driver (the
- * drm-kmod "agx" module). One client VM (execution context 5, the driver's
- * lower root) and one compute queue serve every client for now; submission
- * is synchronous, as Aurora's 25G76 M5 backend submits.
+ * drm-kmod "agx" module). Each client VM has a lower root and a tagged
+ * execution context. The DRM driver leases an installed compute queue.
  */
 
 #ifndef	_ARM64_APPLE_APPLE_AGX_API_H_
@@ -27,15 +26,27 @@ struct apple_agx_params {
 /* The attached GPU whose firmware runs and whose queue is installed. */
 device_t apple_agx_device(void);
 void	apple_agx_get_params(device_t dev, struct apple_agx_params *p);
-/* Map pa..pa+size at va in the client VM; refuses driver-owned ranges. */
-int	apple_agx_vm_map(device_t dev, uint64_t va, vm_paddr_t pa,
-	    vm_size_t size, bool writable);
-int	apple_agx_vm_unmap(device_t dev, uint64_t va, vm_size_t size);
+#define	APPLE_AGX_VM_READ	0x1
+#define	APPLE_AGX_VM_WRITE	0x2
+#define	APPLE_AGX_VM_SINGLE	0x4
+
+bool	apple_agx_vm_valid(device_t dev, uint64_t va, vm_size_t size);
+int	apple_agx_vm_create(device_t dev, u_int *context);
+void	apple_agx_vm_destroy(device_t dev, u_int context);
+u_int	apple_agx_queue_count(device_t dev);
+int	apple_agx_queue_create(device_t dev, u_int *slot);
+void	apple_agx_queue_destroy(device_t dev, u_int slot);
+
+/* Map physical pages at va in the client VM. SINGLE repeats the first page. */
+int	apple_agx_vm_map(device_t dev, u_int context, uint64_t va, vm_paddr_t pa,
+	    vm_size_t size, u_int flags);
+int	apple_agx_vm_unmap(device_t dev, u_int context, uint64_t va, vm_size_t size);
 /*
  * Run one compute command (its CDM stream at cdm_va..cdm_end, terminator
  * included) on the queue and wait for it to retire.
  */
-int	apple_agx_submit_compute(device_t dev, uint64_t cdm_va,
+int	apple_agx_submit_compute(device_t dev, u_int slot, u_int context,
+	    uint64_t cdm_va,
 	    uint64_t cdm_end, u_int timeout_ms);
 
 #endif /* _ARM64_APPLE_APPLE_AGX_API_H_ */
