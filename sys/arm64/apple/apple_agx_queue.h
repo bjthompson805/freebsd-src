@@ -50,6 +50,14 @@ struct agx_queue_word { uint32_t off; uint32_t val; };
 #define	AGX_Q_POOL_ROW	0x60
 #define	AGX_Q_POOL_COMPLETED	0x54
 #define	AGX_Q_NODE_COMPLETED	0xc
+#define	AGX_Q_BOARD_CLUSTERS	0x1
+#define	AGX_Q_BOARD_J813	0x1
+#define	AGX_Q_BOARD_COMPLETION_INPUTS	0x0
+#define	AGX_Q_BOARD_G17D	0x0
+#define	AGX_Q_BOARD_COMMON26	0x1
+#define	AGX_Q_OPERAND_BANK	0xf000
+#define	AGX_Q_OPERAND_TAIL	0x1f000
+#define	AGX_Q_POLICY	0x0
 #define	AGX_Q_KICKS	0x4
 #define	AGX_Q_QOS	0x2
 #define	AGX_Q_QOS_CLASS	0x14
