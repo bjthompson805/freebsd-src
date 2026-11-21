@@ -1,5 +1,5 @@
 /*-
- * SPDX-License-Identifier: GPL-2.0-only OR MIT
+ * SPDX-License-Identifier: MIT
  *
  * Apple M5 GPU: firmware record encoders for compute kicks, translated from
  * Aurora's drm/asahi g17/fw (m5/compute.rs, kick.rs, queue.rs, channels.rs).
@@ -154,6 +154,15 @@ int	agx_scratch_new(uint64_t layout, struct agx_scratch *s);
 int	agx_intersection_new(uint64_t pool, uint64_t pool_bytes, uint32_t first,
 	    uint32_t count, uint64_t default_program, uint64_t default_control,
 	    struct agx_intersection *t);
+
+bool	agx_scratch_enabled(const struct agx_scratch *s);
+uint64_t agx_scratch_size_word(const struct agx_scratch *s);
+uint64_t agx_scratch_window_word(const struct agx_scratch *s);
+uint64_t agx_scratch_stack_word(const struct agx_scratch *s);
+uint64_t agx_scratch_driver_word(const struct agx_scratch *s);
+void	agx_intersection_words(const struct agx_intersection *t, uint64_t w[6]);
+int	agx_register_array_binding(uint64_t array_va, unsigned checkpoint,
+	    uint64_t *word);
 
 uint64_t agx_m5_dispatch_control(const struct agx_board *b, uint64_t base);
 uint8_t	agx_m5_explicit_dependency(const struct agx_board *b);

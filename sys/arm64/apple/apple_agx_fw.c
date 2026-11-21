@@ -1,5 +1,5 @@
 /*-
- * SPDX-License-Identifier: GPL-2.0-only OR MIT
+ * SPDX-License-Identifier: MIT
  *
  * Apple M5 GPU: firmware record encoders for compute kicks, translated from
  * Aurora's drm/asahi g17/fw (m5/compute.rs, kick.rs, queue.rs, channels.rs).
@@ -99,42 +99,42 @@ agx_scratch_new(uint64_t layout, struct agx_scratch *s)
 	return (0);
 }
 
-static bool
-scratch_enabled(const struct agx_scratch *s)
+bool
+agx_scratch_enabled(const struct agx_scratch *s)
 {
 
 	return (s->pages != 0);
 }
 
-static uint64_t
-scratch_size_word(const struct agx_scratch *s)
+uint64_t
+agx_scratch_size_word(const struct agx_scratch *s)
 {
 	uint64_t pages = s->pages;
 
 	return (pages | (((pages + 255) / 256) << 16));
 }
 
-static uint64_t
-scratch_window_word(const struct agx_scratch *s)
+uint64_t
+agx_scratch_window_word(const struct agx_scratch *s)
 {
 
-	return (scratch_enabled(s) ?
+	return (agx_scratch_enabled(s) ?
 	    (1u << 24) | (((s->layout >> 24) & 0xff) << 16) : 0xff0000);
 }
 
-static uint64_t
-scratch_stack_word(const struct agx_scratch *s)
+uint64_t
+agx_scratch_stack_word(const struct agx_scratch *s)
 {
 
-	return (scratch_enabled(s) ? s->layout & 0xfff8 : 8);
+	return (agx_scratch_enabled(s) ? s->layout & 0xfff8 : 8);
 }
 
-static uint64_t
-scratch_driver_word(const struct agx_scratch *s)
+uint64_t
+agx_scratch_driver_word(const struct agx_scratch *s)
 {
 	uint64_t levels;
 
-	if (!scratch_enabled(s))
+	if (!agx_scratch_enabled(s))
 		return (0);
 	levels = (s->layout >> 16) & 0xff;
 	return (s->driver_end | ((levels + (levels > 1)) << 24));
@@ -144,7 +144,7 @@ static uint16_t
 scratch_checkpoint(const struct agx_scratch *s, int i)
 {
 
-	return (checkpoints[i] + (scratch_enabled(s) ? 2 : 0));
+	return (checkpoints[i] + (agx_scratch_enabled(s) ? 2 : 0));
 }
 
 int
@@ -184,8 +184,8 @@ agx_intersection_new(uint64_t pool, uint64_t pool_bytes, uint32_t first,
 	return (0);
 }
 
-static void
-intersection_words(const struct agx_intersection *t, uint64_t w[6])
+void
+agx_intersection_words(const struct agx_intersection *t, uint64_t w[6])
 {
 
 	if (t->pool == 0) {
@@ -324,8 +324,8 @@ packed_va(uint64_t va, uint64_t *out)
 	return (0);
 }
 
-static int
-register_array_binding(uint64_t array_va, unsigned checkpoint, uint64_t *word)
+int
+agx_register_array_binding(uint64_t array_va, unsigned checkpoint, uint64_t *word)
 {
 	uint64_t packed;
 	int error;
@@ -347,11 +347,11 @@ agx_m5_bindings(uint64_t descriptor_va, const struct agx_scratch *s,
 
 	words[2] = words[3] = 0;
 	if ((error = offset_va(descriptor_va, 0x40, &va)) != 0 ||
-	    (error = register_array_binding(va,
+	    (error = agx_register_array_binding(va,
 	    (uint8_t)(scratch_checkpoint(s, 0) + (matrix_ops ? 2 : 0)),
 	    &words[0])) != 0 ||
 	    (error = offset_va(descriptor_va, 0x760, &va)) != 0 ||
-	    (error = register_array_binding(va, ALTERNATE_COUNT,
+	    (error = agx_register_array_binding(va, ALTERNATE_COUNT,
 	    &words[1])) != 0)
 		return (error);
 	return (0);
@@ -404,7 +404,7 @@ main_program(const struct agx_m5_compute_args *a, struct regw w[MAIN_COUNT])
 } while (0)
 	if ((error = validate(a)) != 0)
 		return (error);
-	intersection_words(&a->intersection, is);
+	agx_intersection_words(&a->intersection, is);
 	W(0x1a510, preempt);
 	W(0x1a420, a->cdm_va);
 	WO(0x1a4d0, preempt, state);
@@ -423,11 +423,11 @@ main_program(const struct agx_m5_compute_args *a, struct regw w[MAIN_COUNT])
 	W(0x1a061, is[3]);
 	W(0x1a0b9, is[4]);
 	W(0x1a0c1, is[5]);
-	W(0x101d1, scratch_size_word(&a->scratch));
+	W(0x101d1, agx_scratch_size_word(&a->scratch));
 	W(0x0d479, a->auxiliary_allocation);
-	W(0x1a0e9, scratch_stack_word(&a->scratch));
-	W(0x1a141, scratch_driver_word(&a->scratch));
-	W(0x107a1, scratch_window_word(&a->scratch) |
+	W(0x1a0e9, agx_scratch_stack_word(&a->scratch));
+	W(0x1a141, agx_scratch_driver_word(&a->scratch));
+	W(0x107a1, agx_scratch_window_word(&a->scratch) |
 	    ((uint64_t)a->matrix_ops << 25));
 	W(0x1a540, ids);
 	W(0x014a9, ids);
@@ -455,7 +455,7 @@ program(const struct agx_m5_compute_args *a, struct regw w[MAIN_COUNT + 4],
     int *count)
 {
 	struct regw m[MAIN_COUNT];
-	bool scs = scratch_enabled(&a->scratch);
+	bool scs = agx_scratch_enabled(&a->scratch);
 	int error, i, n = 0;
 
 	if ((error = main_program(a, m)) != 0)
