@@ -15,6 +15,13 @@ struct apple_rtkit_ops {
 	 */
 	int	(*buf_map)(void *arg, vm_paddr_t pa, size_t size,
 		    uint64_t *iova);
+	/*
+	 * The physical address of a buffer the IOP brought at an address of
+	 * its own. Without this hook that address is taken as physical
+	 * (SART: no translation).
+	 */
+	int	(*buf_lookup)(void *arg, uint64_t iova, size_t size,
+		    vm_paddr_t *pa);
 	/* A message on an application endpoint (>= 0x20). */
 	void	(*recv)(void *arg, uint32_t ep, uint64_t msg);
 };

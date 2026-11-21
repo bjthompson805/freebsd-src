@@ -85,6 +85,7 @@ struct rtkit_buffer {
 	vm_paddr_t	pa;
 	uint64_t	iova;		/* what the IOP was given */
 	size_t		size;
+	bool		iop_owned;	/* the IOP's buffer, mapped as device */
 };
 
 struct rtkit_syslog_entry {
@@ -198,14 +199,45 @@ static int
 rtkit_buffer(struct apple_rtkit *rtk, uint32_t ep, struct rtkit_buffer *buf,
     size_t size, uint64_t addr)
 {
+	vm_paddr_t pa;
 	int error;
 
 	if (addr != 0) {
-		/* The IOP brought its own buffer (SRAM or filtered DRAM). */
+		/*
+		 * The IOP brought its own buffer (SRAM or filtered DRAM) at
+		 * an address of its choosing. A repeat of the same request
+		 * keeps it; a different one would retire a live buffer.
+		 */
+		if (buf->va != NULL) {
+			if (buf->iova == addr && buf->size == size)
+				return (0);
+			device_printf(rtk->dev, "ep %u: buffer request for "
+			    "%#zx at %#jx while %#zx at %#jx is live\n", ep,
+			    size, (uintmax_t)addr, buf->size,
+			    (uintmax_t)buf->iova);
+			return (EBUSY);
+		}
+		pa = addr;
+		if (rtk->ops->buf_lookup != NULL) {
+			error = rtk->ops->buf_lookup(rtk->arg, addr, size, &pa);
+			if (error != 0) {
+				device_printf(rtk->dev, "ep %u: can't find "
+				    "buffer at %#jx: %d\n", ep,
+				    (uintmax_t)addr, error);
+				return (error);
+			}
+		}
 		buf->size = size;
-		buf->pa = buf->iova = addr;
-		buf->va = pmap_mapdev(addr, size);
+		buf->iova = addr;
+		buf->pa = pa;
+		buf->va = pmap_mapdev(pa, size);
+		buf->iop_owned = true;
 		return (0);
+	}
+	if (buf->size != 0 && buf->size < roundup2(size, 16384)) {
+		device_printf(rtk->dev, "ep %u: buffer request for %#zx while "
+		    "%#zx is live\n", ep, size, buf->size);
+		return (EBUSY);
 	}
 	if (buf->va == NULL) {
 		buf->size = roundup2(size, 16384);
@@ -261,14 +293,24 @@ static void
 rtkit_syslog(struct apple_rtkit *rtk, uint64_t msg)
 {
 	struct rtkit_syslog_entry *e;
-	size_t idx = msg & 0xff, len, stride;
+	size_t idx = msg & 0xff, len, stride, i;
+	uint32_t ebuf[(sizeof(*e) + 0xff + 3) / 4 + 1];
+	const volatile uint32_t *src;
 	uint32_t hash;
 
 	stride = rtk->syslog_size + sizeof(*e);
 	if (!rtk->syslog_on || rtk->syslog.va == NULL ||
-	    (idx + 1) * stride > rtk->syslog.size)
+	    idx >= rtk->syslog_count || (idx + 1) * stride > rtk->syslog.size)
 		return;
-	e = (struct rtkit_syslog_entry *)((char *)rtk->syslog.va + idx * stride);
+	/*
+	 * Copy the entry out in aligned words: the buffer may be the IOP's,
+	 * mapped as device memory, where string routines can fault.
+	 */
+	src = (const volatile uint32_t *)((char *)rtk->syslog.va +
+	    rounddown2(idx * stride, 4));
+	for (i = 0; i < howmany(stride + 3, 4) && i < nitems(ebuf); i++)
+		ebuf[i] = src[i];
+	e = (struct rtkit_syslog_entry *)((char *)ebuf + (idx * stride) % 4);
 	len = strnlen(e->msg, rtk->syslog_size);
 	if (len > 0 && e->msg[len - 1] == '\n')
 		len--;
@@ -338,8 +380,8 @@ rtkit_handle(struct apple_rtkit *rtk, uint32_t ep, uint64_t msg)
 		if (type == MSG_BUFFER_REQUEST)
 			return (rtkit_buffer_request(rtk, ep, msg, &rtk->syslog));
 		if (type == MSG_SYSLOG_INIT) {
-			rtk->syslog_count = msg & 0xffff;
-			rtk->syslog_size = (msg >> 24) & 0xffff;
+			rtk->syslog_count = msg & 0xff;
+			rtk->syslog_size = (msg >> 24) & 0xff;
 			return (0);
 		}
 		if (type == MSG_SYSLOG_LOG) {
@@ -446,7 +488,7 @@ apple_rtkit_boot(struct apple_rtkit *rtk)
 			return (error);
 	}
 
-	for (i = 0; rtk->iop_power != PWR_ON; i++) {
+	for (i = 0; (rtk->iop_power & 0xff) != PWR_ON; i++) {
 		if (rtk->crashed)
 			return (EIO);
 		if (i == 100000) {
