@@ -40,6 +40,7 @@
 
 #include <arm64/apple/apple_agx.h>
 #include <arm64/apple/apple_agx_graph.h>
+#include <arm64/apple/apple_agx_queue.h>
 #include <arm64/apple/apple_pmgr.h>
 #include <arm64/apple/apple_rtkit.h>
 
@@ -75,6 +76,7 @@
 #define	AGX_MSG_ADDR_MASK	((1ull << 44) - 1)
 #define	AGX_FW_LOG_SIZE		0x8000
 #define	AGX_MSG_CONTROL_NOTIFY	((0x84ull << 48) | 0x11)
+#define	AGX_MSG_WORK_NOTIFY	(0x83ull << 48)	/* | pipe | priority << 2 */
 #define	AGX_MSG_EVENTS		(0x42ull << 48)
 /* Event ring in each role's status block (fw/initdata.rs status, channels.rs). */
 #define	AGX_STATUS_EVENT_STATE	0x40
@@ -228,6 +230,11 @@ struct apple_agx_softc {
 	void			*lower_root;
 	struct agx_uat		uat;
 	uint8_t			*graph_va[nitems(agx_graph_objects)];
+	/* The compute queue (apple_agx_queue.h), stage 5. */
+	uint8_t			*q_sched;
+	uint8_t			*q_work;
+	uint8_t			*q_graph;
+	uint8_t			*q_kick;
 	uint8_t			*asc;
 	uint8_t			*sgx;
 	bus_size_t		asc_size;
@@ -887,6 +894,179 @@ agx_stage4(struct apple_agx_softc *sc)
 	return (st[0] == target ? 0 : ETIMEDOUT);
 }
 
+/* A write-combined, zeroed, page-aligned object mapped at va in root. */
+static int
+agx_queue_object(struct apple_agx_softc *sc, const char *name, uint8_t **kva,
+    vm_size_t size, vm_paddr_t root, uint64_t va, int prot)
+{
+	int error;
+
+	*kva = (uint8_t *)kmem_alloc_contig(size, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, AGX_UAT_PGSZ, 0, VM_MEMATTR_WRITE_COMBINING);
+	if (*kva == NULL)
+		return (ENOMEM);
+	if ((error = agx_uat_map(&sc->uat, root, va,
+	    pmap_kextract((vm_offset_t)*kva), size, prot)) != 0)
+		device_printf(sc->dev, "queue: map %s: %d\n", name, error);
+	return (error);
+}
+
+/*
+ * Uat::new_execution_context: publish context id's TTBAT pair, the client
+ * VM's root below (here the kernel lower root) and the kernel root above.
+ */
+static int
+agx_publish_context(struct apple_agx_softc *sc, phandle_t node, u_int id)
+{
+	volatile struct agx_handoff *h;
+	volatile struct agx_slot_ttbs *ttbs;
+	uint64_t hbase, hsize, tbase, tsize;
+	int error;
+
+	if ((error = agx_region(node, "handoff", &hbase, &hsize)) != 0 ||
+	    (error = agx_region(node, "ttbs", &tbase, &tsize)) != 0)
+		return (error);
+	h = pmap_mapdev_attr(hbase, hsize, VM_MEMATTR_WRITE_BACK);
+	ttbs = pmap_mapdev_attr(tbase, tsize, VM_MEMATTR_WRITE_BACK);
+	agx_handoff_lock(h);
+	if (ttbs[id].ttb0 != 0 || ttbs[id].ttb1 != 0)
+		error = EBUSY;
+	else {
+		ttbs[id].ttb0 = sc->uat.lower_root | AGX_TTBR_VALID |
+		    (uint64_t)id << AGX_TTBR_ASID_SHIFT;
+		ttbs[id].ttb1 = sc->uat.upper_root | AGX_TTBR_VALID |
+		    (uint64_t)id << AGX_TTBR_ASID_SHIFT;
+	}
+	dsb(sy);
+	agx_handoff_unlock(h);
+	pmap_unmapdev(__DEVOLATILE(void *, ttbs), tsize);
+	pmap_unmapdev(__DEVOLATILE(void *, h), hsize);
+	agx_uat_tlbi_all();
+	return (error);
+}
+
+/*
+ * InitData::publish_work_at on the M5 compute ring of the queue's priority:
+ * the work slot, barrier, producer, barrier.
+ */
+static int
+agx_publish_work(struct apple_agx_softc *sc, const uint8_t *slot)
+{
+	volatile uint32_t *st;
+	uint32_t consumer, consumer_b, producer, next;
+	int b;
+
+	if ((b = agx_graph_find("bundle")) < 0)
+		return (EINVAL);
+	st = (volatile uint32_t *)(sc->graph_va[0] + agx_graph_state_grids[0] +
+	    AGX_Q_WORK_STATE);
+	dsb(sy);
+	consumer = st[0];
+	consumer_b = st[0x10 / 4];
+	producer = st[0x20 / 4];
+	if (consumer >= AGX_Q_WORK_RING_SLOTS ||
+	    consumer_b >= AGX_Q_WORK_RING_SLOTS ||
+	    producer >= AGX_Q_WORK_RING_SLOTS)
+		return (EIO);
+	next = (producer + 1) % AGX_Q_WORK_RING_SLOTS;
+	if (next == consumer || next == consumer_b)
+		return (EAGAIN);
+	memcpy(sc->graph_va[b] + AGX_Q_WORK_RING + producer * 0x18, slot,
+	    0x18);
+	dsb(sy);
+	st[0x20 / 4] = next;
+	dsb(sy);
+	return (0);
+}
+
+/*
+ * Stage 5: one compute queue, installed as install_m5 does on the J813
+ * (no host-port registers): Context::new's scheduler and work pages, the
+ * kick ring (kick.rs Queue::compute), the queue graph (Graph::new), the
+ * execution context, then the installation's configuration record, its
+ * item, its work slot and the pipe-2 doorbell. The firmware consumes the
+ * item: the graph's consumer reaches AGX_Q_INSTALL_END.
+ */
+static int
+agx_stage5(struct apple_agx_softc *sc, phandle_t node)
+{
+	volatile uint32_t *cursors;
+	uint64_t *items;
+	u_int i;
+	int error;
+
+	if ((error = agx_queue_object(sc, "scheduler", &sc->q_sched,
+	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_Q_SCHED_VA,
+	    AGX_PROT_FW_SHARED_RW)) != 0 ||
+	    (error = agx_queue_object(sc, "work", &sc->q_work, AGX_Q_WORK_SIZE,
+	    sc->uat.upper_root, AGX_Q_WORK_VA, AGX_PROT_FW_SHARED_RW)) != 0 ||
+	    (error = agx_queue_object(sc, "graph", &sc->q_graph,
+	    AGX_Q_QGRAPH_SIZE, sc->uat.upper_root, AGX_Q_QGRAPH_VA,
+	    AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
+	    (error = agx_queue_object(sc, "kick", &sc->q_kick, AGX_Q_KICK_SIZE,
+	    sc->uat.lower_root, AGX_Q_KICK_LOW_VA,
+	    AGX_PROT_GPU_SHARED_RW)) != 0)
+		return (error);
+	if ((error = agx_uat_map(&sc->uat, sc->uat.upper_root,
+	    AGX_Q_KICK_HIGH_VA, pmap_kextract((vm_offset_t)sc->q_kick),
+	    AGX_Q_KICK_SIZE, AGX_PROT_FW_SHARED_RW)) != 0) {
+		device_printf(sc->dev, "queue: map kick alias: %d\n", error);
+		return (error);
+	}
+	for (i = 0; i < nitems(agx_q_sched); i++)
+		*(volatile uint32_t *)(sc->q_sched + agx_q_sched[i].off) =
+		    agx_q_sched[i].val;
+	memcpy(sc->q_work + (AGX_Q_WORK_HEAD_VA - AGX_Q_WORK_VA),
+	    agx_q_work_head, sizeof(agx_q_work_head));
+	for (i = 0; i < nitems(agx_q_graph); i++)
+		*(volatile uint32_t *)(sc->q_graph + agx_q_graph[i].off) =
+		    agx_q_graph[i].val;
+	dsb(sy);
+	if ((error = agx_publish_context(sc, node, AGX_Q_CONTEXT)) != 0) {
+		device_printf(sc->dev, "queue: context %u: %d\n",
+		    AGX_Q_CONTEXT, error);
+		return (error);
+	}
+
+	/* Graph::record(None, CONFIG) and Graph::append at item 0. */
+	cursors = (volatile uint32_t *)(sc->q_graph + AGX_Q_CURSORS);
+	items = (uint64_t *)(sc->q_graph + AGX_Q_ITEMS);
+	if (cursors[0] != 0 || cursors[(AGX_Q_PRODUCER - AGX_Q_CURSORS) / 4] != 0 ||
+	    cursors[0x60 / 4] != AGX_Q_ITEM_ENTRIES || items[0] != 0)
+		return (EIO);
+	memcpy(sc->q_graph + AGX_Q_CONFIG, agx_q_install_config,
+	    sizeof(agx_q_install_config));
+	dsb(sy);
+	*(volatile uint64_t *)&items[0] = AGX_Q_QGRAPH_VA + AGX_Q_CONFIG;
+	dsb(sy);
+	cursors[(AGX_Q_PRODUCER - AGX_Q_CURSORS) / 4] = AGX_Q_INSTALL_END;
+	dsb(sy);
+	if ((error = agx_publish_work(sc, agx_q_install_slot)) != 0) {
+		device_printf(sc->dev, "queue: work slot: %d\n", error);
+		return (error);
+	}
+	if ((error = apple_rtkit_send(sc->roles[0].rtk, AGX_EP_DOORBELL,
+	    AGX_MSG_WORK_NOTIFY | 0x02 | AGX_Q_PRIORITY << 2)) != 0)
+		return (error);
+	for (i = 0; i <= 1000; i++) {
+		agx_poll_both(sc);
+		if (apple_rtkit_crashed(sc->roles[0].rtk) ||
+		    apple_rtkit_crashed(sc->roles[1].rtk))
+			return (EIO);
+		if (cursors[0] == AGX_Q_INSTALL_END)
+			break;
+		DELAY(1000);
+	}
+	device_printf(sc->dev, "queue %u: consumer %u producer %u after %u ms "
+	    "(install end %u); work ring %u/%u\n", AGX_Q_QID, cursors[0],
+	    cursors[(AGX_Q_PRODUCER - AGX_Q_CURSORS) / 4], i, AGX_Q_INSTALL_END,
+	    ((volatile uint32_t *)(sc->graph_va[0] + agx_graph_state_grids[0] +
+	    AGX_Q_WORK_STATE))[0],
+	    ((volatile uint32_t *)(sc->graph_va[0] + agx_graph_state_grids[0] +
+	    AGX_Q_WORK_STATE))[0x20 / 4]);
+	return (cursors[0] == AGX_Q_INSTALL_END ? 0 : ETIMEDOUT);
+}
+
 /*
  * Stage 3: boot_m5 after both coprocessors run. Adopt the roots, build
  * the graph, hand out the log buffers (GFX1, GFX), InitData (GFX1, GFX),
@@ -1018,6 +1198,13 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 		device_printf(sc->dev, "stage 4 failed: %d\n", error);
 	else if (agx_stage >= 4)
 		device_printf(sc->dev, "stage 4: control record retired\n");
+	if (error == 0 && agx_stage >= 5) {
+		if ((error = agx_stage5(sc, node)) != 0)
+			device_printf(sc->dev, "stage 5 failed: %d\n", error);
+		else
+			device_printf(sc->dev, "stage 5: compute queue %u "
+			    "installed\n", AGX_Q_QID);
+	}
 
 	/* Listen for a while; no InitData yet. */
 	for (i = 0; i < 200; i++) {
