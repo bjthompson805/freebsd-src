@@ -17,9 +17,13 @@
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/rman.h>
+#include <sys/sysctl.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+
+#include <machine/atomic.h>
+#include <machine/cpufunc.h>
 
 #include <machine/bus.h>
 
@@ -31,6 +35,7 @@
 #include <dev/ofw/ofw_subr.h>
 
 #include <arm64/apple/apple_pmgr.h>
+#include <arm64/apple/apple_rtkit.h>
 
 /* SGX ID registers (regs.rs). */
 #define	AGX_ID_VERSION		0xd04000
@@ -47,7 +52,59 @@
 #define	AGX_T8142_FAMILY	0xb
 #define	AGX_T8142_VARIANT	2
 
+/* Stage 2: M5 start control and gating (regs.rs). */
+#define	AGX_M5_START_CONTROL	0xe90000
+#define	AGX_G17_GATING_CONTROL	0xd06030
+#define	AGX_G17_GATING_DISABLE	0x6
+
+/* ASCWrap v6 (soc/apple/mailbox.c). */
+#define	AGX_ASC_CPU_CONTROL	0x44
+#define	AGX_ASC_CPU_RUN		0x10
+#define	AGX_ASC_MBOX_OFFSET	0x8000
+
+/* UAT handoff (mmu.rs Handoff, SlotTTBS). */
+#define	AGX_PPL_MAGIC		0x4b1d000000000002ull
+#define	AGX_UAT_NUM_CTX		64
+#define	AGX_UAT_PGSZ		0x4000
+#define	AGX_TTBR_VALID		0x1ull
+#define	AGX_TTBR_ASID_SHIFT	48
+#define	AGX_KERNEL_ALIAS_CTX	1
+
+struct agx_flush_info {
+	uint64_t	state;
+	uint64_t	addr;
+	uint64_t	size;
+};
+
+struct agx_handoff {
+	uint64_t	magic_ap;
+	uint64_t	magic_fw;
+	uint8_t		lock_ap;
+	uint8_t		lock_fw;
+	uint8_t		pad0[2];
+	uint32_t	turn;
+	uint32_t	cur_slot;
+	uint8_t		pad1[4];
+	struct agx_flush_info flush[AGX_UAT_NUM_CTX + 1];
+	uint8_t		unk2;
+	uint8_t		pad2[7];
+	uint64_t	unk3;
+};
+_Static_assert(sizeof(struct agx_handoff) == 1608, "handoff layout");
+
+struct agx_slot_ttbs {
+	uint64_t	ttb0;
+	uint64_t	ttb1;
+};
+
 static MALLOC_DEFINE(M_AGX, "apple_agx", "Apple GPU");
+
+static SYSCTL_NODE(_hw, OID_AUTO, apple_agx, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "Apple M5 GPU");
+/* 1: identify only; 2: also start both coprocessors' RTKit. */
+static int agx_stage = 1;
+SYSCTL_INT(_hw_apple_agx, OID_AUTO, stage, CTLFLAG_RDTUN, &agx_stage, 0,
+    "Bring-up stage to run at attach");
 
 struct agx_fw_build {
 	const char	*name;
@@ -112,8 +169,21 @@ struct agx_id {
 	uint32_t	perf_map;
 };
 
+struct agx_role {
+	struct apple_agx_softc	*sc;
+	const char		*name;
+	uint8_t			*wrapper;
+	bus_size_t		wrapper_size;
+	struct apple_rtkit	*rtk;
+	u_int			msgs;
+};
+
 struct apple_agx_softc {
 	device_t		dev;
+	uint64_t		data_base;
+	uint64_t		data_size;
+	struct agx_role		roles[2];	/* GFX, GFX1 */
+	void			*lower_root;
 	uint8_t			*asc;
 	uint8_t			*sgx;
 	bus_size_t		asc_size;
@@ -302,6 +372,8 @@ agx_identify_fw(struct apple_agx_softc *sc, phandle_t node)
 	}
 	device_printf(sc->dev, "fw-text %#lx+%#lx, fw-data %#lx+%#lx\n",
 	    tbase, tsize, dbase, dsize);
+	sc->data_base = dbase;
+	sc->data_size = dsize;
 	if (tsize > 16 * 1024 * 1024)
 		return (EINVAL);
 
@@ -337,6 +409,260 @@ agx_identify_fw(struct apple_agx_softc *sc, phandle_t node)
 	free(copy, M_AGX);
 	free(text, M_AGX);
 	return (error);
+}
+
+static inline void
+agx_sgx_write(struct apple_agx_softc *sc, bus_size_t off, uint32_t v)
+{
+
+	*(volatile uint32_t *)(sc->sgx + off) = v;
+}
+
+/* Handoff::lock: Peterson lock against the firmware's half. */
+static void
+agx_handoff_lock(volatile struct agx_handoff *h)
+{
+
+	h->lock_ap = 1;
+	dsb(sy);
+	while (h->lock_fw != 0) {
+		if (h->turn != 0) {
+			h->lock_ap = 0;
+			while (h->turn != 0)
+				cpu_spinwait();
+			h->lock_ap = 1;
+			dsb(sy);
+		}
+	}
+	dsb(sy);
+}
+
+static void
+agx_handoff_unlock(volatile struct agx_handoff *h)
+{
+
+	h->turn = 1;
+	dsb(sy);
+	h->lock_ap = 0;
+	dsb(sy);
+}
+
+/*
+ * Uat::new for UatFirmware::PublishedRoots with UatQuirks::DEFAULT: the AP
+ * half of the handoff, then context 0 (a new kernel lower root and the
+ * iBoot "pagetables" upper root) and its context-1 alias.
+ */
+static int
+agx_uat_init(struct apple_agx_softc *sc, phandle_t node)
+{
+	volatile struct agx_handoff *h;
+	volatile struct agx_slot_ttbs *ttbs;
+	uint64_t hbase, hsize, tbase, tsize, pbase, psize, ttb0, ttb1;
+	int error, i;
+
+	if ((error = agx_region(node, "handoff", &hbase, &hsize)) != 0 ||
+	    (error = agx_region(node, "ttbs", &tbase, &tsize)) != 0 ||
+	    (error = agx_region(node, "pagetables", &pbase, &psize)) != 0) {
+		device_printf(sc->dev, "missing UAT regions\n");
+		return (error);
+	}
+	/* secondary_root_offset 0x40000: both published roots must fit. */
+	if (hsize < sizeof(*h) ||
+	    tsize < AGX_UAT_NUM_CTX * sizeof(struct agx_slot_ttbs) ||
+	    psize < 0x40000 + AGX_UAT_PGSZ) {
+		device_printf(sc->dev, "UAT regions too small\n");
+		return (EINVAL);
+	}
+
+	sc->lower_root = contigmalloc(AGX_UAT_PGSZ, M_AGX, M_WAITOK | M_ZERO,
+	    0, ~(vm_paddr_t)0, AGX_UAT_PGSZ, 0);
+	if (sc->lower_root == NULL)
+		return (ENOMEM);
+	cpu_dcache_wb_range(sc->lower_root, AGX_UAT_PGSZ);
+	ttb0 = pmap_kextract((vm_offset_t)sc->lower_root);
+	ttb1 = pbase;
+
+	h = pmap_mapdev_attr(hbase, hsize, VM_MEMATTR_WRITE_BACK);
+	ttbs = pmap_mapdev_attr(tbase, tsize, VM_MEMATTR_WRITE_BACK);
+	device_printf(sc->dev, "handoff before: magic ap %#lx fw %#lx lock "
+	    "%u/%u turn %u slot %u; ttb[0] %#lx/%#lx ttb[1] %#lx/%#lx\n",
+	    h->magic_ap, h->magic_fw, h->lock_ap, h->lock_fw, h->turn,
+	    h->cur_slot, ttbs[0].ttb0, ttbs[0].ttb1, ttbs[1].ttb0,
+	    ttbs[1].ttb1);
+
+	/* Handoff::init */
+	h->magic_ap = AGX_PPL_MAGIC;
+	h->cur_slot = 0;
+	h->unk2 = 0;
+	h->unk3 = 0;
+	dsb(sy);
+	for (i = 0; i <= AGX_UAT_NUM_CTX; i++) {
+		h->flush[i].state = 0;
+		h->flush[i].addr = 0;
+		h->flush[i].size = 0;
+	}
+	dsb(sy);
+
+	agx_handoff_lock(h);
+	ttbs[0].ttb0 = ttb0 | AGX_TTBR_VALID;
+	ttbs[0].ttb1 = ttb1 | AGX_TTBR_VALID;
+	for (i = 1; i < AGX_UAT_NUM_CTX; i++) {
+		ttbs[i].ttb0 = 0;
+		ttbs[i].ttb1 = 0;
+	}
+	ttbs[AGX_KERNEL_ALIAS_CTX].ttb0 = ttb0 | AGX_TTBR_VALID |
+	    (uint64_t)AGX_KERNEL_ALIAS_CTX << AGX_TTBR_ASID_SHIFT;
+	ttbs[AGX_KERNEL_ALIAS_CTX].ttb1 = ttb1 | AGX_TTBR_VALID |
+	    (uint64_t)AGX_KERNEL_ALIAS_CTX << AGX_TTBR_ASID_SHIFT;
+	dsb(sy);
+	agx_handoff_unlock(h);
+
+	device_printf(sc->dev, "UAT: ttb0 %#lx (new lower root), ttb1 %#lx\n",
+	    ttb0, ttb1);
+	pmap_unmapdev(__DEVOLATILE(void *, ttbs), tsize);
+	pmap_unmapdev(__DEVOLATILE(void *, h), hsize);
+	return (0);
+}
+
+/* The firmware places its RTKit buffers in its data segment, by PA. */
+static int
+agx_buf_lookup(void *arg, uint64_t iova, size_t size, vm_paddr_t *pa)
+{
+	struct agx_role *r = arg;
+	struct apple_agx_softc *sc = r->sc;
+
+	if (iova < sc->data_base || size == 0 ||
+	    iova - sc->data_base > sc->data_size ||
+	    sc->data_size - (iova - sc->data_base) < size) {
+		device_printf(sc->dev, "%s: buffer %#lx+%#zx outside fw-data\n",
+		    r->name, iova, size);
+		return (EINVAL);
+	}
+	*pa = iova;
+	return (0);
+}
+
+static int
+agx_buf_map(void *arg, vm_paddr_t pa, size_t size, uint64_t *iova)
+{
+	struct agx_role *r = arg;
+
+	device_printf(r->sc->dev, "%s: refusing host buffer of %#zx\n",
+	    r->name, size);
+	return (EOPNOTSUPP);
+}
+
+static void
+agx_recv(void *arg, uint32_t ep, uint64_t msg)
+{
+	struct agx_role *r = arg;
+
+	if (r->msgs++ < 16)
+		device_printf(r->sc->dev, "%s: ep %#x msg %#018lx\n", r->name,
+		    ep, msg);
+}
+
+static const struct apple_rtkit_ops agx_rtkit_ops = {
+	.buf_map = agx_buf_map,
+	.buf_lookup = agx_buf_lookup,
+	.recv = agx_recv,
+};
+
+static int
+agx_roles_init(struct apple_agx_softc *sc, phandle_t node)
+{
+	static const char *const names[2] = { "GFX", "GFX1" };
+	pcell_t mboxes[2];
+	phandle_t mb;
+	char role[8];
+	int error, i;
+
+	if (OF_getencprop(node, "mboxes", mboxes, sizeof(mboxes)) !=
+	    sizeof(mboxes))
+		return (ENXIO);
+	for (i = 0; i < 2; i++) {
+		struct agx_role *r = &sc->roles[i];
+
+		mb = OF_node_from_xref(mboxes[i]);
+		if (OF_getprop(mb, "apple,firmware-role", role,
+		    sizeof(role)) <= 0 || strcmp(role, names[i]) != 0) {
+			device_printf(sc->dev, "mailbox %d is not %s\n", i,
+			    names[i]);
+			return (ENXIO);
+		}
+		if ((error = agx_map(mb, 0, &r->wrapper,
+		    &r->wrapper_size)) != 0)
+			return (error);
+		r->sc = sc;
+		r->name = names[i];
+		r->rtk = apple_rtkit_create(sc->dev, (vm_offset_t)r->wrapper,
+		    (vm_offset_t)r->wrapper + AGX_ASC_MBOX_OFFSET,
+		    &agx_rtkit_ops, r, 0);
+		if (r->rtk == NULL)
+			return (ENOMEM);
+	}
+	return (0);
+}
+
+/* Coprocessor::boot: start the CPU, then wait for RTKit. */
+static int
+agx_role_boot(struct apple_agx_softc *sc, struct agx_role *r)
+{
+	volatile uint32_t *cpu;
+	uint32_t v;
+	int error;
+
+	cpu = (volatile uint32_t *)(r->wrapper + AGX_ASC_CPU_CONTROL);
+	v = *cpu;
+	device_printf(sc->dev, "%s: CPU control %#x, starting\n", r->name, v);
+	*cpu = v | AGX_ASC_CPU_RUN;
+	error = apple_rtkit_boot(r->rtk);
+	device_printf(sc->dev, "%s: RTKit boot %s (%d)\n", r->name,
+	    error == 0 ? "done" : "failed", error);
+	return (error);
+}
+
+static int
+agx_stage2(struct apple_agx_softc *sc, phandle_t node)
+{
+	uint32_t v;
+	int error, i;
+
+	if ((error = agx_roles_init(sc, node)) != 0) {
+		device_printf(sc->dev, "cannot set up mailboxes: %d\n", error);
+		return (error);
+	}
+	if ((error = agx_uat_init(sc, node)) != 0)
+		return (error);
+
+	/* set_m5_start_control, before the coprocessors (macOS 27.0). */
+	v = agx_sgx_read(sc, AGX_M5_START_CONTROL);
+	device_printf(sc->dev, "M5 start control %#x\n", v);
+	if (v != 0x30000 && v != 0x30001)
+		return (EIO);
+	agx_sgx_write(sc, AGX_M5_START_CONTROL, v | 1);
+
+	/* T8142: GFX1 first, then GFX. */
+	if ((error = agx_role_boot(sc, &sc->roles[1])) != 0 ||
+	    (error = agx_role_boot(sc, &sc->roles[0])) != 0)
+		return (error);
+
+	/* Both run: clear the gating, where macOS clears it. */
+	v = agx_sgx_read(sc, AGX_G17_GATING_CONTROL);
+	agx_sgx_write(sc, AGX_G17_GATING_CONTROL, v & ~AGX_G17_GATING_DISABLE);
+	device_printf(sc->dev, "G17 gating %#x -> %#x\n", v,
+	    agx_sgx_read(sc, AGX_G17_GATING_CONTROL));
+
+	/* Listen for a while; no InitData yet. */
+	for (i = 0; i < 200; i++) {
+		apple_rtkit_poll(sc->roles[1].rtk);
+		apple_rtkit_poll(sc->roles[0].rtk);
+		DELAY(10000);
+	}
+	device_printf(sc->dev, "stage 2: GFX %s, GFX1 %s after 2 s\n",
+	    apple_rtkit_crashed(sc->roles[0].rtk) ? "crashed" : "alive",
+	    apple_rtkit_crashed(sc->roles[1].rtk) ? "crashed" : "alive");
+	return (0);
 }
 
 static int
@@ -399,7 +725,15 @@ apple_agx_attach(device_t dev)
 	if ((error = agx_read_id(sc)) != 0)
 		goto fail;
 
-	device_printf(dev, "stage 1 done; coprocessors not started\n");
+	device_printf(dev, "stage 1 done\n");
+	if (agx_stage < 2)
+		return (0);
+	/*
+	 * Once a coprocessor runs, nothing it was given may go away: keep
+	 * the device attached whatever happens from here on.
+	 */
+	if ((error = agx_stage2(sc, node)) != 0)
+		device_printf(dev, "stage 2 stopped: %d\n", error);
 	return (0);
 fail:
 	apple_agx_detach(dev);
