@@ -33,7 +33,8 @@
 #ifndef	_ARM64_IOMMU_IOMMU_H_
 #define	_ARM64_IOMMU_IOMMU_H_
 
-#define	IOMMU_PAGE_SIZE		4096
+/* The GAS and busdma page arrays use one entry per kernel VM page. */
+#define	IOMMU_PAGE_SIZE		PAGE_SIZE
 #define	IOMMU_PAGE_MASK		(IOMMU_PAGE_SIZE - 1)
 
 int iommu_unregister(struct iommu_unit *unit);

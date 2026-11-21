@@ -1554,6 +1554,12 @@ smmu_attach(device_t dev)
 	struct smmu_softc *sc;
 	int error;
 
+	/* The SMMU translation tables use a fixed 4 KiB granule. */
+	if (PAGE_SIZE != PAGE_SIZE_4K) {
+		device_printf(dev, "requires 4 KiB kernel pages\n");
+		return (ENXIO);
+	}
+
 	sc = device_get_softc(dev);
 	sc->dev = dev;
 
