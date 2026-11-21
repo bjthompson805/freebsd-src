@@ -21,6 +21,10 @@
 #include <arm64/apple/apple_pmgr.h>
 
 #define	PMGR_RESET		(1u << 31)
+#define	PMGR_AUTO_ENABLE	(1u << 28)
+#define	PMGR_PS_RESET		(1u << 12)
+#define	PMGR_BUSY		(1u << 11)	/* hardware's; never written back */
+#define	PMGR_DEV_DISABLE	(1u << 10)
 #define	PMGR_WAS_CLKGATED	(1u << 9)
 #define	PMGR_WAS_PWRGATED	(1u << 8)
 #define	PMGR_FLAGS		(PMGR_WAS_CLKGATED | PMGR_WAS_PWRGATED)
@@ -55,8 +59,11 @@ apple_pmgr_enable_one(device_t dev, phandle_t ps, int depth)
 	va = (vm_offset_t)pmap_mapdev(pa, sizeof(uint32_t));
 	old = *(volatile uint32_t *)va;
 	if (PMGR_PS_ACTUAL(old) != PMGR_PS_ACTIVE ||
-	    (old & PMGR_RESET) != 0) {
-		val = old & ~(PMGR_FLAGS | PMGR_RESET | PMGR_PS_TARGET);
+	    (old & (PMGR_RESET | PMGR_PS_RESET | PMGR_DEV_DISABLE)) != 0) {
+		/* As aurora's apple_pmgr_ps_set for the active state. */
+		val = old & ~(PMGR_FLAGS | PMGR_RESET | PMGR_PS_TARGET |
+		    PMGR_AUTO_ENABLE | PMGR_PS_RESET | PMGR_BUSY |
+		    PMGR_DEV_DISABLE);
 		*(volatile uint32_t *)va = val | PMGR_PS_ACTIVE;
 		for (i = 0; i < 100000; i++) {
 			val = *(volatile uint32_t *)va;
