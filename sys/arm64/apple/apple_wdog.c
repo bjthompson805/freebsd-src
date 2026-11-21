@@ -86,7 +86,8 @@ struct apple_wdog_softc {
  * hw.apple_wdog.keepalive=<secs> (M5 bring-up dev loop): the host arms WD1
  * with a short alarm before boot; keep that alarm armed and restart its count
  * every second for <secs>, so a hung or frozen machine resets within the
- * alarm and an abandoned one resets once the time is up.
+ * alarm and an abandoned one resets once the time is up. It stops when
+ * watchdog(9) arms WD1, so its kicks never hide a hang from watchdogd.
  */
 static int apple_wdog_keepalive;
 TUNABLE_INT("hw.apple_wdog.keepalive", &apple_wdog_keepalive);
@@ -169,8 +170,10 @@ apple_wdog_attach(device_t dev)
 	/* Reset the watchdog timers. */
 	WRITE(sc, APPLE_WDOG_WD0_CNTL, 0);
 	if (apple_wdog_keepalive) {
-		callout_init(&sc->keepalive, 1);
+		callout_init_mtx(&sc->keepalive, &sc->mtx, 0);
+		mtx_lock(&sc->mtx);
 		apple_wdog_kick(sc);
+		mtx_unlock(&sc->mtx);
 		device_printf(dev, "keepalive: WD1 alarm %u s\n",
 		    (u_int)(READ(sc, APPLE_WDOG_WD1_RESET) / sc->clk_freq));
 	} else
@@ -196,6 +199,8 @@ apple_wdog_watchdog_fn(void *private, u_int cmd, int *error)
 	mtx_lock(&sc->mtx);
 
 	cmd &= WD_INTERVAL;
+	if (apple_wdog_keepalive && cmd > 0)
+		callout_stop(&sc->keepalive);
 
 	if (cmd > 0) {
 		sec = ((uint64_t)1 << (cmd & WD_INTERVAL)) / 1000000000;
