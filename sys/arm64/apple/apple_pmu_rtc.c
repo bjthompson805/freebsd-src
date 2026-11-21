@@ -35,6 +35,7 @@
 #define	SPMI_CMD_PARITY		(1u << 15)
 #define	SPMI_REPLY_CMD(r)	((r) & 0xff)
 #define	SPMI_REPLY_SID(r)	(((r) >> 8) & 0x7f)
+#define	SPMI_REPLY_PARITY(r)	((r) >> 16)	/* a bit per frame: good */
 
 #define	PMU_ABBEY_COUNTER	0x2002	/* 48 bits, 65536 Hz */
 #define	PMU_HZ_SHIFT		16
@@ -95,6 +96,11 @@ spmi_readl(struct apple_pmu_rtc_softc *sc, uint16_t addr, uint8_t *buf,
 			return (EIO);
 		word = SPMI_RD4(sc, sc->regs->reply);
 		memcpy(buf + i, &word, MIN(4, len - i));
+	}
+	if ((~SPMI_REPLY_PARITY(reply) & ((1u << len) - 1)) != 0) {
+		device_printf(sc->dev, "SPMI read %#x: parity error %#x\n",
+		    addr, reply);
+		return (EIO);
 	}
 	return (0);
 }
