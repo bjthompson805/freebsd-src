@@ -284,12 +284,14 @@ iommu_get_ctx_ofw(device_t dev, int channel)
 
 	iommu_dev = OF_device_from_xref(parent);
 	if (iommu_dev == NULL) {
+		OF_prop_free(cells);
 		device_printf(dev, "%s can't get iommu device.\n", __func__);
 		return (NULL);
 	}
 
 	iommu = iommu_lookup(iommu_dev);
 	if (iommu == NULL) {
+		OF_prop_free(cells);
 		device_printf(dev, "%s can't lookup iommu.\n", __func__);
 		return (NULL);
 	}
@@ -300,12 +302,14 @@ iommu_get_ctx_ofw(device_t dev, int channel)
 	 */
 	iodom = iommu_domain_alloc(iommu);
 	if (iodom == NULL) {
+		OF_prop_free(cells);
 		device_printf(dev, "%s can't allocate domain.\n", __func__);
 		return (NULL);
 	}
 
 	ioctx = iommu_ctx_alloc(dev, iodom, false);
 	if (ioctx == NULL) {
+		OF_prop_free(cells);
 		iommu_domain_free(iodom);
 		return (NULL);
 	}
@@ -313,6 +317,7 @@ iommu_get_ctx_ofw(device_t dev, int channel)
 	ioctx->domain = iodom;
 
 	error = IOMMU_OFW_MD_DATA(iommu->dev, ioctx, cells, ncells);
+	OF_prop_free(cells);
 	if (error) {
 		device_printf(dev, "%s can't set MD data\n", __func__);
 		return (NULL);
@@ -373,11 +378,13 @@ void
 iommu_free_ctx_locked(struct iommu_unit *iommu, struct iommu_ctx *ioctx)
 {
 	struct bus_dma_tag_iommu *tag;
+	struct iommu_domain *iodom;
 	int error;
 
 	IOMMU_ASSERT_LOCKED(iommu);
 
 	tag = ioctx->tag;
+	iodom = ioctx->domain;
 
 	IOMMU_CTX_FREE(iommu->dev, ioctx);
 	IOMMU_UNLOCK(iommu);
@@ -385,7 +392,7 @@ iommu_free_ctx_locked(struct iommu_unit *iommu, struct iommu_ctx *ioctx)
 	free(tag, M_IOMMU);
 
 	/* Since we have a domain per each ctx, remove the domain too. */
-	error = iommu_domain_free(ioctx->domain);
+	error = iommu_domain_free(iodom);
 	if (error)
 		device_printf(iommu->dev, "Could not free a domain\n");
 }

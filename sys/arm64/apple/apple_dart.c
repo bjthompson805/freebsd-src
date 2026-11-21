@@ -160,7 +160,7 @@ apple_dart_build_identity(void)
  * Flush one stream's TLB. From revision 2.2 the stream flush is the V2
  * command (aurora's apple_dart_t8110_hw_tlb_command).
  */
-static void
+static int
 apple_dart_tlb_flush(device_t dev, vm_offset_t va, u_int sid)
 {
 	uint32_t cmd;
@@ -169,6 +169,11 @@ apple_dart_tlb_flush(device_t dev, vm_offset_t va, u_int sid)
 	for (i = 0; i < 1000 &&
 	    (DART_RD4(va, DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY); i++)
 		DELAY(1);
+	if (i == 1000) {
+		device_printf(dev, "DART TLB command busy before sid %u flush\n",
+		    sid);
+		return (ETIMEDOUT);
+	}
 	cmd = DART_T8110_TLB_CMD_FLUSH_SID | sid;
 	if (DART_PARAMS3_VERSION(DART_RD4(va, DART_PARAMS3)) >= 0x0202)
 		cmd |= DART_T8110_TLB_CMD_V2;
@@ -177,8 +182,11 @@ apple_dart_tlb_flush(device_t dev, vm_offset_t va, u_int sid)
 	for (i = 0; i < 1000 &&
 	    (DART_RD4(va, DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY); i++)
 		DELAY(1);
-	if (i == 1000)
+	if (i == 1000) {
 		device_printf(dev, "DART TLB flush of sid %u timed out\n", sid);
+		return (ETIMEDOUT);
+	}
+	return (0);
 }
 
 /* The PA that iova maps to in the shared table, or ~0. */
@@ -270,7 +278,9 @@ apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1)
 	DART_WR4(va, DART_T8110_TCR(sid), 0);
 	DART_WR4(va, DART_T8110_TTBR(sid),
 	    (l1pa >> DART_PAGE_SHIFT) << 2 | DART_T8110_TTBR_VALID);
-	apple_dart_tlb_flush(dev, va, sid);
+	error = apple_dart_tlb_flush(dev, va, sid);
+	if (error != 0)
+		goto out;
 	DART_WR4(va, DART_T8110_TCR(sid),
 	    DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL);
 	streams = DART_T8110_ENABLE_STREAMS + 4 * (sid / 32);
@@ -287,19 +297,21 @@ out:
 	return (error);
 }
 
-static void
+static int
 apple_dart_flush_sid(device_t dev, phandle_t dart, u_int sid)
 {
 	bus_addr_t pa;
 	bus_size_t size;
 	vm_offset_t va;
+	int error;
 
 	if (sid >= DART_T8110_MAX_SID ||
 	    ofw_reg_to_paddr(dart, 0, &pa, &size, NULL) != 0)
-		return;
+		return (ENXIO);
 	va = (vm_offset_t)pmap_mapdev(pa, size);
-	apple_dart_tlb_flush(dev, va, sid);
+	error = apple_dart_tlb_flush(dev, va, sid);
 	pmap_unmapdev((void *)va, size);
+	return (error);
 }
 
 /*
@@ -312,7 +324,7 @@ apple_dart_map(device_t dev, uint64_t iova, vm_paddr_t pa, size_t size)
 	phandle_t node;
 	pcell_t *cells;
 	uint64_t *l2, *l3, end;
-	int i, n;
+	int error, i, n, stream_error;
 
 	if (((iova | pa | size) & (DART_PAGE_SIZE - 1)) != 0 ||
 	    iova + size > (1ul << DART_IOVA_BITS))
@@ -335,13 +347,17 @@ apple_dart_map(device_t dev, uint64_t iova, vm_paddr_t pa, size_t size)
 	node = ofw_bus_get_node(dev);
 	n = OF_getencprop_alloc_multi(node, "iommus", sizeof(*cells),
 	    (void **)&cells);
-	for (i = 0; i + 1 < n; i += 2)
-		apple_dart_flush_sid(dev, OF_node_from_xref(cells[i]),
-		    cells[i + 1]);
+	error = 0;
+	for (i = 0; i + 1 < n; i += 2) {
+		stream_error = apple_dart_flush_sid(dev,
+		    OF_node_from_xref(cells[i]), cells[i + 1]);
+		if (error == 0)
+			error = stream_error;
+	}
 	sx_xunlock(&apple_dart_lock);
 	if (n > 0)
 		OF_prop_free(cells);
-	return (0);
+	return (error);
 }
 
 /*
@@ -386,6 +402,7 @@ apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid, uint64_t iova,
     vm_paddr_t pa, size_t size)
 {
 	uint64_t *l2, *l3, *tbl, end;
+	int error;
 
 	if (((iova | pa | size) & (DART_PAGE_SIZE - 1)) != 0 ||
 	    iova + size > (1ul << DART_IOVA_BITS))
@@ -405,9 +422,9 @@ apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid, uint64_t iova,
 	}
 	apple_dart_flush_tables(tbl, 1);
 	dsb(sy);
-	apple_dart_flush_sid(dev, dart, sid);
+	error = apple_dart_flush_sid(dev, dart, sid);
 	sx_xunlock(&apple_dart_lock);
-	return (0);
+	return (error);
 }
 
 /* XXX bring-up: walk the shared table; returns the PA an IOVA maps to, or ~0 */
@@ -450,8 +467,7 @@ apple_dart_pte_bits(device_t dev, phandle_t dart, u_int sid, uint64_t iova,
 		if (shift == 14) {
 			t[(iova >> shift) & 0x7ff] = pte | bits;
 			cpu_dcache_wb_range(&t[(iova >> shift) & 0x7ff], 8);
-			apple_dart_flush_sid(dev, dart, sid);
-			return (0);
+			return (apple_dart_flush_sid(dev, dart, sid));
 		}
 		t = (uint64_t *)PHYS_TO_DMAP((pte & 0x3ffffffc00ul) << 4);
 	}
