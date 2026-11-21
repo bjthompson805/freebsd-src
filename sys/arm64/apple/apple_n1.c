@@ -274,11 +274,8 @@ n1_dma_alloc(struct n1_softc *sc, size_t size, uint64_t *iova)
 static int
 n1_find_stream(struct n1_softc *sc)
 {
-	pcell_t *map;
 	phandle_t node;
 	device_t d;
-	u_int rid;
-	int i, n;
 
 	node = -1;
 	for (d = device_get_parent(sc->dev); d != NULL; d = device_get_parent(d)) {
@@ -288,20 +285,8 @@ n1_find_stream(struct n1_softc *sc)
 	}
 	if (d == NULL)
 		return (ENXIO);
-	rid = pci_get_rid(sc->dev);
-	n = OF_getencprop_alloc_multi(node, "iommu-map", sizeof(*map),
-	    (void **)&map);
-	for (i = 0; i + 3 < n; i += 4) {
-		if (rid >= map[i] && rid < map[i] + map[i + 3]) {
-			sc->dart = OF_node_from_xref(map[i + 1]);
-			sc->sid = map[i + 2] + rid - map[i];
-			OF_prop_free(map);
-			return (0);
-		}
-	}
-	if (n > 0)
-		OF_prop_free(map);
-	return (ENOENT);
+	return (apple_dart_pci_stream(node, pci_get_rid(sc->dev), &sc->dart,
+	    &sc->sid));
 }
 
 /* Inspect latched faults without acknowledging them. */

@@ -483,6 +483,40 @@ apple_dart_identity(device_t dev)
 	return (error);
 }
 
+/* Look up a PCI requester ID in a host bridge's one-cell DART map. */
+int
+apple_dart_pci_stream(phandle_t host, u_int rid, phandle_t *dart, u_int *sid)
+{
+	pcell_t *map, mask;
+	phandle_t node;
+	int error, i, n;
+
+	if (OF_getencprop(host, "iommu-map-mask", &mask, sizeof(mask)) ==
+	    sizeof(mask))
+		rid &= mask;
+	n = OF_getencprop_alloc_multi(host, "iommu-map", sizeof(*map),
+	    (void **)&map);
+	if (n <= 0)
+		return (ENOENT);
+	error = ENOENT;
+	for (i = 0; i + 3 < n; i += 4) {
+		if (rid < map[i] || rid - map[i] >= map[i + 3])
+			continue;
+		node = OF_node_from_xref(map[i + 1]);
+		if (node <= 0 || map[i + 2] >= DART_T8110_MAX_SID ||
+		    rid - map[i] >= DART_T8110_MAX_SID - map[i + 2]) {
+			error = EINVAL;
+			break;
+		}
+		*dart = node;
+		*sid = map[i + 2] + rid - map[i];
+		error = 0;
+		break;
+	}
+	OF_prop_free(map);
+	return (error);
+}
+
 struct apple_dart_irq_softc {
 	device_t dev;
 	struct resource *mem;
@@ -536,7 +570,31 @@ apple_dart_error_intr(void *arg)
 	(void)bus_read_4(sc->mem, DART_V2_EXCEPTION(0));
 }
 
-/* Match DARTs used by the native MTP and USB drivers. */
+/* m1n1 leaves the N1 PCIe port and its DART powered for its enabled DT node. */
+static bool
+apple_dart_is_n1(phandle_t dart)
+{
+	phandle_t node, host, mapped;
+	pcell_t reg[5];
+	u_int sid, rid;
+
+	node = OF_finddevice("wifi0");
+	if (node <= 0 || !ofw_bus_node_status_okay(node) ||
+	    !ofw_bus_node_is_compatible(node, "pci106b,1902") ||
+	    OF_getencprop(node, "reg", reg, sizeof(reg)) != sizeof(reg))
+		return (false);
+	rid = (reg[0] >> 8) & 0xffff;
+	for (host = OF_parent(node); host > 0; host = OF_parent(host)) {
+		if (!ofw_bus_node_status_okay(host))
+			return (false);
+		if (OF_hasprop(host, "iommu-map"))
+			return (apple_dart_pci_stream(host, rid, &mapped,
+			    &sid) == 0 && mapped == dart);
+	}
+	return (false);
+}
+
+/* Match DARTs used by the native N1, MTP and USB drivers. */
 static int
 apple_dart_irq_probe(device_t dev)
 {
@@ -549,6 +607,10 @@ apple_dart_irq_probe(device_t dev)
 	    !ofw_bus_is_compatible(dev, "apple,t8142-dart"))
 		return (ENXIO);
 	dart = ofw_bus_get_node(dev);
+	if (apple_dart_is_n1(dart)) {
+		device_set_desc(dev, "Apple N1 PCIe DART error interrupt");
+		return (BUS_PROBE_DEFAULT);
+	}
 	for (node = OF_child(OF_parent(dart)); node != 0; node = OF_peer(node)) {
 		if (!ofw_bus_node_status_okay(node))
 			continue;
