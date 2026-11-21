@@ -707,11 +707,20 @@ common:
 #undef BUILD_PTE_FUNC
 
 #if PAGE_SIZE != PAGE_SIZE_4K
-	/* Link the l2 -> l3 table */
-	mov	x9, x6
+	/*
+	 * Link every l2 -> l3 table the entries above span. build_l3_page_pagetable
+	 * runs on through the consecutive pagetable_l3_ttbr1 tables, but each one
+	 * maps only one L2 entry (32MiB with 16k pages): linking just the first
+	 * left a large preload (e.g. an mfsroot) and modulep unmapped.
+	 */
+	adrp	x9, pagetable_l3_ttbr1
+	add	x9, x9, :lo12:pagetable_l3_ttbr1
+	mov	x8, #(KERNBASE)
+	add	x10, x14, #(Ln_ENTRIES - 1)
+	lsr	x10, x10, #(Ln_ENTRIES_SHIFT)
 	adrp	x6, pagetable_l2_ttbr1
 	add	x6, x6, :lo12:pagetable_l2_ttbr1
-	bl	link_l2_pagetable
+	bl	link_l2_pagetables
 #endif
 
 	/* Link the l1 -> l2 table */
@@ -942,6 +951,30 @@ LENTRY(link_l2_pagetable)
 
 	ret
 LEND(link_l2_pagetable)
+
+/*
+ * Link x10 consecutive L2 -> L3 table entries.
+ *  x6  = L2 table
+ *  x8  = VA start (trashed)
+ *  x9  = PA of the first L3 table; the rest follow it, PAGE_SIZE apart (trashed)
+ *  x10 = Table count (trashed)
+ *  x11, x12 and x13 are trashed
+ */
+LENTRY(link_l2_pagetables)
+	cbz	x10, 2f
+1:	lsr	x11, x8, #L2_SHIFT
+	and	x11, x11, #Ln_ADDR_MASK
+	mov	x12, #L2_TABLE
+	lsr	x13, x9, #PAGE_SHIFT
+	orr	x13, x12, x13, lsl #PAGE_SHIFT
+	str	x13, [x6, x11, lsl #3]
+	ldr	x13, =(L2_SIZE)
+	add	x8, x8, x13
+	add	x9, x9, #(PAGE_SIZE)
+	subs	x10, x10, #1
+	b.ne	1b
+2:	ret
+LEND(link_l2_pagetables)
 
 /*
  * Builds count level 3 page table entries. Uses ATTR_CONTIGUOUS to create

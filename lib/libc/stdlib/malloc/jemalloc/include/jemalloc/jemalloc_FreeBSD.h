@@ -88,7 +88,15 @@
 #  define JEMALLOC_TLS_MODEL	/* Default. */
 #endif
 
+/*
+ * m5: arm64 kernels may use 16K pages (ARM64_16K_PAGES). jemalloc must not assume a page
+ * smaller than the kernel's, and a larger LG_PAGE is safe on a 4K kernel.
+ */
+#ifdef __aarch64__
+#define	LG_PAGE			14
+#else
 #define	LG_PAGE			PAGE_SHIFT
+#endif
 #define	LG_SIZEOF_INT		2
 #define	LG_SIZEOF_LONG		LG_SIZEOF_PTR
 #define	LG_SIZEOF_INTMAX_T	3
