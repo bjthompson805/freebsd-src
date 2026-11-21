@@ -62,4 +62,14 @@ int	apple_agx_submit_render(device_t dev, u_int context,
 	    const struct agx_render_program *programs, u_int nprograms,
 	    u_int timeout_ms);
 
+/*
+ * As apple_agx_submit_render, but return once the pass is published:
+ * done(arg, error) runs when it retires or fails, from a task thread with
+ * no driver lock held. Only waits while every render slot is in use.
+ */
+int	apple_agx_submit_render_async(device_t dev, u_int context,
+	    const struct agx_render_pass *pass,
+	    const struct agx_render_program *programs, u_int nprograms,
+	    void (*done)(void *, int), void *arg);
+
 #endif /* _ARM64_APPLE_APPLE_AGX_API_H_ */
