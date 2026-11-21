@@ -6,6 +6,7 @@
 #define	_ARM64_APPLE_APPLE_DART_H_
 
 int	apple_dart_identity(device_t dev);
+int	apple_dart_lookup(uint64_t iova, size_t size, vm_paddr_t *pa);
 int	apple_dart_map(device_t dev, uint64_t iova, vm_paddr_t pa,
 	    size_t size);
 vm_paddr_t apple_dart_translate(uint64_t iova);

@@ -42,9 +42,11 @@
 
 #define	DART_PARAMS3			0x08
 #define	DART_PARAMS3_VA_WIDTH(r)	(((r) >> 16) & 0x3f)
+#define	DART_PARAMS3_VERSION(r)		((r) & 0xffff)	/* major.minor */
 
 #define	DART_T8110_TLB_CMD		0x80
 #define	DART_T8110_TLB_CMD_BUSY		(1u << 31)
+#define	DART_T8110_TLB_CMD_V2		(1u << 15)	/* rev 2.2+ */
 #define	DART_T8110_TLB_CMD_FLUSH_SID	(1u << 8)
 #define	DART_T8110_PROTECT		0x200
 #define	DART_T8110_PROTECT_TTBR_TCR	(1u << 0)
@@ -136,6 +138,78 @@ apple_dart_build_identity(void)
 	    pages * DART_PAGE_SIZE >> 20);
 }
 
+/*
+ * Flush one stream's TLB. From revision 2.2 the stream flush is the V2
+ * command (aurora's apple_dart_t8110_hw_tlb_command).
+ */
+static void
+apple_dart_tlb_flush(device_t dev, vm_offset_t va, u_int sid)
+{
+	uint32_t cmd;
+	int i;
+
+	for (i = 0; i < 1000 &&
+	    (DART_RD4(va, DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY); i++)
+		DELAY(1);
+	cmd = DART_T8110_TLB_CMD_FLUSH_SID | sid;
+	if (DART_PARAMS3_VERSION(DART_RD4(va, DART_PARAMS3)) >= 0x0202)
+		cmd |= DART_T8110_TLB_CMD_V2;
+	dsb(sy);
+	DART_WR4(va, DART_T8110_TLB_CMD, cmd);
+	for (i = 0; i < 1000 &&
+	    (DART_RD4(va, DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY); i++)
+		DELAY(1);
+	if (i == 1000)
+		device_printf(dev, "DART TLB flush of sid %u timed out\n", sid);
+}
+
+/* The PA that iova maps to in the shared table, or ~0. */
+static vm_paddr_t
+apple_dart_walk(uint64_t *t, uint64_t iova)
+{
+	uint64_t pte;
+	int shift;
+
+	for (shift = 36; t != NULL && shift >= 14; shift -= 11) {
+		pte = t[(iova >> shift) & 0x7ff];
+		if ((pte & DART_PTE_VALID) == 0)
+			break;
+		if (shift == 14)
+			return (((pte & 0x3ffffffc00ul) << 4) |
+			    (iova & (DART_PAGE_SIZE - 1)));
+		t = (uint64_t *)PHYS_TO_DMAP((pte & 0x3ffffffc00ul) << 4);
+	}
+	return (~(vm_paddr_t)0);
+}
+
+/*
+ * Where the range [iova, iova + size) sits in RAM, if contiguous, from the
+ * identity table (for buffers firmware placed itself).
+ */
+int
+apple_dart_lookup(uint64_t iova, size_t size, vm_paddr_t *pap)
+{
+	vm_paddr_t pa;
+	size_t off;
+	int error;
+
+	error = 0;
+	sx_slock(&apple_dart_lock);
+	pa = apple_dart_walk(apple_dart_l1, iova);
+	for (off = DART_PAGE_SIZE - (iova & (DART_PAGE_SIZE - 1));
+	    pa != ~(vm_paddr_t)0 && off < size; off += DART_PAGE_SIZE)
+		if (apple_dart_walk(apple_dart_l1, iova + off) != pa + off) {
+			error = EFAULT;
+			break;
+		}
+	sx_sunlock(&apple_dart_lock);
+	if (pa == ~(vm_paddr_t)0)
+		return (ENOENT);
+	if (error == 0)
+		*pap = pa;
+	return (error);
+}
+
 static int
 apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1);
 
@@ -153,7 +227,7 @@ apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1)
 	vm_offset_t va;
 	vm_paddr_t l1pa;
 	uint32_t tcr, streams;
-	int i, error;
+	int error;
 
 	if (!ofw_bus_node_is_compatible(dart, "apple,t8110-dart")) {
 		device_printf(dev, "unsupported DART type\n");
@@ -178,10 +252,7 @@ apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1)
 	DART_WR4(va, DART_T8110_TCR(sid), 0);
 	DART_WR4(va, DART_T8110_TTBR(sid),
 	    (l1pa >> DART_PAGE_SHIFT) << 2 | DART_T8110_TTBR_VALID);
-	DART_WR4(va, DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_FLUSH_SID | sid);
-	for (i = 0; i < 1000 &&
-	    (DART_RD4(va, DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY); i++)
-		DELAY(1);
+	apple_dart_tlb_flush(dev, va, sid);
 	DART_WR4(va, DART_T8110_TCR(sid),
 	    DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL);
 	streams = DART_T8110_ENABLE_STREAMS + 4 * (sid / 32);
@@ -204,16 +275,12 @@ apple_dart_flush_sid(device_t dev, phandle_t dart, u_int sid)
 	bus_addr_t pa;
 	bus_size_t size;
 	vm_offset_t va;
-	int i;
 
 	if (sid >= DART_T8110_MAX_SID ||
 	    ofw_reg_to_paddr(dart, 0, &pa, &size, NULL) != 0)
 		return;
 	va = (vm_offset_t)pmap_mapdev(pa, size);
-	DART_WR4(va, DART_T8110_TLB_CMD, DART_T8110_TLB_CMD_FLUSH_SID | sid);
-	for (i = 0; i < 1000 &&
-	    (DART_RD4(va, DART_T8110_TLB_CMD) & DART_T8110_TLB_CMD_BUSY); i++)
-		DELAY(1);
+	apple_dart_tlb_flush(dev, va, sid);
 	pmap_unmapdev((void *)va, size);
 }
 
