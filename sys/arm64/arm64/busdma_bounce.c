@@ -80,6 +80,8 @@ struct bus_dma_tag {
 	int			bounce_flags;
 	bus_dma_segment_t	*segments;
 	struct bounce_zone	*bounce_zone;
+	const struct bus_dma_bounce_translation *translation;
+	void			*translation_cookie;
 };
 
 static SYSCTL_NODE(_hw, OID_AUTO, busdma, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
@@ -107,11 +109,14 @@ struct bus_dmamap {
 #define	DMAMAP_FROM_DMAMEM	(1 << 1)
 #define	DMAMAP_MBUF		(1 << 2)
 	int			sync_count;
+	int			translated_count;
 #ifdef KMSAN
 	struct memdesc	       kmsan_mem;
 #endif
 	struct sync_list	slist[];
 };
+
+static void bounce_bus_dmamap_unload(bus_dma_tag_t dmat, bus_dmamap_t map);
 
 static bool _bus_dmamap_pagesneeded(bus_dma_tag_t dmat, bus_dmamap_t map,
     vm_paddr_t buf, bus_size_t buflen, int *pagesneeded);
@@ -276,6 +281,8 @@ bounce_bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment,
 
 		/* Copy some flags from the parent */
 		newtag->bounce_flags |= parent->bounce_flags & BF_COHERENT;
+		newtag->translation = parent->translation;
+		newtag->translation_cookie = parent->translation_cookie;
 	}
 
 	if ((newtag->bounce_flags & BF_COHERENT) != 0) {
@@ -311,6 +318,21 @@ bounce_bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment,
 	    __func__, newtag, (newtag != NULL ? newtag->common.flags : 0),
 	    error);
 	return (error);
+}
+
+int
+bus_dma_bounce_set_translation(bus_dma_tag_t tag,
+    const struct bus_dma_bounce_translation *ops, void *cookie)
+{
+
+	if (tag->common.impl != &bus_dma_bounce_impl ||
+	    tag->translation != NULL || (tag->bounce_flags & BF_COHERENT) != 0)
+		return (EINVAL);
+	if (tag->map_count != 0)
+		return (EBUSY);
+	tag->translation = ops;
+	tag->translation_cookie = cookie;
+	return (0);
 }
 
 static int
@@ -353,6 +375,8 @@ static bool
 bounce_bus_dma_id_mapped(bus_dma_tag_t dmat, vm_paddr_t buf, bus_size_t buflen)
 {
 
+	if (dmat->translation != NULL)
+		return (false);
 	if (!might_bounce(dmat, NULL, buf, buflen))
 		return (true);
 	return (!_bus_dmamap_pagesneeded(dmat, NULL, buf, buflen, NULL));
@@ -366,6 +390,8 @@ alloc_dmamap(bus_dma_tag_t dmat, int flags)
 
 	mapsize = sizeof(*map);
 	mapsize += sizeof(struct sync_list) * dmat->common.nsegments;
+	if (dmat->translation != NULL)
+		mapsize += sizeof(bus_dma_segment_t) * dmat->common.nsegments;
 	map = malloc_domainset(mapsize, M_DEVBUF,
 	    DOMAINSET_PREF(dmat->common.domain), flags | M_ZERO);
 	if (map == NULL)
@@ -471,7 +497,8 @@ bounce_bus_dmamap_destroy(bus_dma_tag_t dmat, bus_dmamap_t map)
 	if ((map->flags & DMAMAP_FROM_DMAMEM) != 0)
 		panic("bounce_bus_dmamap_destroy: Invalid map freed\n");
 
-	if (STAILQ_FIRST(&map->bpages) != NULL || map->sync_count != 0) {
+	if (STAILQ_FIRST(&map->bpages) != NULL || map->sync_count != 0 ||
+	    map->translated_count != 0) {
 		CTR3(KTR_BUSDMA, "%s: tag %p error %d", __func__, dmat, EBUSY);
 		return (EBUSY);
 	}
@@ -620,6 +647,7 @@ bounce_bus_dmamem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map)
 	 */
 	if ((map->flags & DMAMAP_FROM_DMAMEM) == 0)
 		panic("bus_dmamem_free: Invalid map freed\n");
+	KASSERT(map->translated_count == 0, ("DMA memory still translated"));
 	if ((dmat->bounce_flags & BF_KMEM_ALLOC) == 0)
 		free(vaddr, M_DEVBUF);
 	else
@@ -935,12 +963,51 @@ bounce_bus_dmamap_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
 	return (segs);
 }
 
+static bus_dma_segment_t *
+bounce_bus_dmamap_translated(bus_dma_tag_t dmat, bus_dmamap_t map)
+{
+
+	return ((bus_dma_segment_t *)&map->slist[dmat->common.nsegments]);
+}
+
+static int
+bounce_bus_dmamap_translate(bus_dma_tag_t dmat, bus_dmamap_t map,
+    bus_dma_segment_t *segs, int nsegs)
+{
+	bus_dma_segment_t *translated;
+	int error, i;
+
+	if (dmat->translation == NULL || nsegs == 0)
+		return (0);
+	KASSERT(map->translated_count == 0, ("DMA map already translated"));
+	/* Leave cache sync and bounce metadata in CPU address space. */
+	translated = bounce_bus_dmamap_translated(dmat, map);
+	for (i = 0; i < nsegs; i++) {
+		translated[i] = segs[i];
+		error = dmat->translation->map(dmat->translation_cookie,
+		    &dmat->common, &translated[i]);
+		if (error != 0) {
+			bounce_bus_dmamap_unload(dmat, map);
+			return (error);
+		}
+		map->translated_count++;
+	}
+	memcpy(segs, translated, nsegs * sizeof(*segs));
+	return (0);
+}
+
 /*
  * Release the mapping held by map.
  */
 static void
 bounce_bus_dmamap_unload(bus_dma_tag_t dmat, bus_dmamap_t map)
 {
+	bus_dma_segment_t *translated;
+
+	translated = bounce_bus_dmamap_translated(dmat, map);
+	while (map->translated_count != 0)
+		dmat->translation->unmap(dmat->translation_cookie,
+		    &translated[--map->translated_count]);
 	free_bounce_pages(dmat, map);
 	map->sync_count = 0;
 	map->flags &= ~DMAMAP_MBUF;
@@ -1144,6 +1211,7 @@ struct bus_dma_impl bus_dma_bounce_impl = {
 	.load_ma = bus_dmamap_load_ma_triv,
 	.map_waitok = bounce_bus_dmamap_waitok,
 	.map_complete = bounce_bus_dmamap_complete,
+	.map_translate = bounce_bus_dmamap_translate,
 	.map_unload = bounce_bus_dmamap_unload,
 	.map_sync = bounce_bus_dmamap_sync,
 #ifdef KMSAN

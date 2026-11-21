@@ -352,7 +352,7 @@ bus_dmamap_load(bus_dma_tag_t dmat, bus_dmamap_t map, void *buf,
 	if (error == EINPROGRESS)
 		return (error);
 
-	segs = _bus_dmamap_complete(dmat, map, NULL, nsegs, error);
+	segs = _bus_dmamap_complete(dmat, map, NULL, nsegs, &error);
 	if (error)
 		(*callback)(callback_arg, segs, 0, error);
 	else
@@ -387,7 +387,7 @@ bus_dmamap_load_mbuf(bus_dma_tag_t dmat, bus_dmamap_t map, struct mbuf *m0,
 	error = _bus_dmamap_load_mbuf_sg(dmat, map, m0, NULL, &nsegs, flags);
 	++nsegs;
 
-	segs = _bus_dmamap_complete(dmat, map, NULL, nsegs, error);
+	segs = _bus_dmamap_complete(dmat, map, NULL, nsegs, &error);
 	if (error)
 		(*callback)(callback_arg, segs, 0, 0, error);
 	else
@@ -413,7 +413,7 @@ bus_dmamap_load_mbuf_sg(bus_dma_tag_t dmat, bus_dmamap_t map, struct mbuf *m0,
 	*nsegs = -1;
 	error = _bus_dmamap_load_mbuf_sg(dmat, map, m0, segs, nsegs, flags);
 	++*nsegs;
-	_bus_dmamap_complete(dmat, map, segs, *nsegs, error);
+	_bus_dmamap_complete(dmat, map, segs, *nsegs, &error);
 	return (error);
 }
 
@@ -434,7 +434,7 @@ bus_dmamap_load_uio(bus_dma_tag_t dmat, bus_dmamap_t map, struct uio *uio,
 	error = _bus_dmamap_load_uio(dmat, map, uio, &nsegs, flags);
 	nsegs++;
 
-	segs = _bus_dmamap_complete(dmat, map, NULL, nsegs, error);
+	segs = _bus_dmamap_complete(dmat, map, NULL, nsegs, &error);
 	if (error)
 		(*callback)(callback_arg, segs, 0, 0, error);
 	else
@@ -513,7 +513,7 @@ bus_dmamap_load_mem(bus_dma_tag_t dmat, bus_dmamap_t map,
 	if (error == EINPROGRESS)
 		return (error);
 
-	segs = _bus_dmamap_complete(dmat, map, NULL, nsegs, error);
+	segs = _bus_dmamap_complete(dmat, map, NULL, nsegs, &error);
 	if (error)
 		(*callback)(callback_arg, segs, 0, error);
 	else
@@ -574,7 +574,7 @@ bus_dmamap_load_crp_buffer(bus_dma_tag_t dmat, bus_dmamap_t map,
 	if (error == EINPROGRESS)
 		return (error);
 
-	segs = _bus_dmamap_complete(dmat, map, NULL, nsegs, error);
+	segs = _bus_dmamap_complete(dmat, map, NULL, nsegs, &error);
 	if (error)
 		(*callback)(callback_arg, segs, 0, error);
 	else

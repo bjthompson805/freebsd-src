@@ -508,6 +508,7 @@ struct xhci_softc {
 	struct sx		sc_cmd_sx;
 
 	struct usb_device	*sc_devices[XHCI_MAX_DEVICES];
+	bus_dma_tag_t		sc_dma_tag;
 	struct resource		*sc_io_res;
 	struct resource		*sc_irq_res;
 	struct resource		*sc_msix_res;

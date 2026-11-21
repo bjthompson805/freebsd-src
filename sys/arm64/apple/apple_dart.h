@@ -19,13 +19,10 @@ int	apple_dart_identity_stream(device_t dev, phandle_t dart, u_int sid);
 int	apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid,
 	    uint64_t iova, vm_paddr_t pa, size_t size);
 
-struct vm_page;
 struct apple_dart_domain;
 int	apple_dart_domain_create(device_t dev, struct apple_dart_domain **result);
 void	apple_dart_domain_destroy(struct apple_dart_domain *domain);
-int	apple_dart_domain_map(struct apple_dart_domain *domain, vm_offset_t iova,
-	    struct vm_page **pages, bus_size_t size, vm_prot_t prot);
-int	apple_dart_domain_unmap(struct apple_dart_domain *domain, vm_offset_t iova,
-	    bus_size_t size);
+int	apple_dart_domain_set_dma_tag(struct apple_dart_domain *domain,
+	    bus_dma_tag_t tag);
 
 #endif /* _ARM64_APPLE_APPLE_DART_H_ */

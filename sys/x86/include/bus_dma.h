@@ -181,12 +181,12 @@ _bus_dmamap_waitok(bus_dma_tag_t dmat, bus_dmamap_t map,
 
 static inline bus_dma_segment_t *
 _bus_dmamap_complete(bus_dma_tag_t dmat, bus_dmamap_t map,
-    bus_dma_segment_t *segs, int nsegs, int error)
+    bus_dma_segment_t *segs, int nsegs, int *error)
 {
 	struct bus_dma_tag_common *tc;
 
 	tc = (struct bus_dma_tag_common *)dmat;
-	return (tc->impl->map_complete(dmat, map, segs, nsegs, error));
+	return (tc->impl->map_complete(dmat, map, segs, nsegs, *error));
 }
 
 #ifdef KMSAN

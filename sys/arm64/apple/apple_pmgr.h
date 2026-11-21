@@ -7,4 +7,6 @@
 
 int	apple_pmgr_power_on(device_t dev);
 
+int	apple_pmgr_power_on_node(device_t dev, phandle_t node);
+
 #endif /* _ARM64_APPLE_APPLE_PMGR_H_ */

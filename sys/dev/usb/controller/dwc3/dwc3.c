@@ -90,6 +90,11 @@ struct snps_dwc3_softc {
 	uint32_t		snpsversion;
 	uint32_t		snpsrevision;
 	uint32_t		snpsversion_type;
+#if defined(FDT) && defined(SOC_APPLE_T8103)
+	struct apple_dart_domain *dart;
+#endif
+	bool			xhci_initialized;
+	bool			xhci_polling;
 #ifdef FDT
 	clk_t			clk_ref;
 	clk_t			clk_suspend;
@@ -115,6 +120,43 @@ xhci_interrupt_poll(void *_sc)
 	usb_callout_reset(&sc->sc_callout, 1, (void *)&xhci_interrupt_poll, sc);
 }
 
+#if defined(FDT) && defined(SOC_APPLE_T8103)
+static int dwc3_dart_isolation;
+TUNABLE_INT("hw.apple.dwc3_dart_isolation", &dwc3_dart_isolation);
+
+static bool
+snps_dwc3_use_dart(device_t dev)
+{
+
+	return (dwc3_dart_isolation != 0 && PAGE_SIZE == 16384 &&
+	    ofw_bus_is_compatible(dev, "apple,t8142-dwc3"));
+}
+
+static int
+snps_dwc3_setup_dart(struct snps_dwc3_softc *snps_sc)
+{
+	struct xhci_softc *sc = &snps_sc->sc;
+	device_t dev = snps_sc->dev;
+	int error;
+
+	sc->sc_bus.parent = dev;
+	if (xhci_halt_controller(sc) != 0)
+		return (EIO);
+	error = apple_dart_domain_create(dev, &snps_sc->dart);
+	if (error != 0)
+		return (error);
+	error = bus_dma_tag_create(NULL, 1, 0, BUS_SPACE_MAXADDR,
+	    BUS_SPACE_MAXADDR, NULL, NULL, BUS_SPACE_MAXSIZE,
+	    BUS_SPACE_UNRESTRICTED, BUS_SPACE_MAXSIZE, 0, NULL, NULL,
+	    &sc->sc_dma_tag);
+	if (error == 0)
+		error = apple_dart_domain_set_dma_tag(snps_sc->dart, sc->sc_dma_tag);
+	if (error == 0)
+		device_printf(dev, "using isolated DART DMA for both USB streams\n");
+	return (error);
+}
+#endif
+
 static int
 snps_dwc3_attach_xhci(device_t dev)
 {
@@ -127,6 +169,16 @@ snps_dwc3_attach_xhci(device_t dev)
 	sc->sc_io_tag = snps_sc->bst;
 	sc->sc_io_hdl = snps_sc->bsh;
 	sc->sc_io_size = rman_get_size(snps_sc->mem_res);
+
+#if defined(FDT) && defined(SOC_APPLE_T8103)
+	if (snps_dwc3_use_dart(dev)) {
+		err = snps_dwc3_setup_dart(snps_sc);
+		if (err != 0) {
+			device_printf(dev, "Failed to initialize DART: %d\n", err);
+			return (err);
+		}
+	}
+#endif
 
 	sc->sc_irq_res = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
 	    RF_SHAREABLE | RF_ACTIVE);
@@ -168,9 +220,11 @@ snps_dwc3_attach_xhci(device_t dev)
 		return (ENXIO);
 	}
 
+	snps_sc->xhci_initialized = true;
 	usb_callout_init_mtx(&sc->sc_callout, &sc->sc_bus.bus_mtx, 0);
 
 	if (xhci_use_polling() != 0) {
+		snps_sc->xhci_polling = true;
 		device_printf(dev, "Interrupt polling at %dHz\n", hz);
 		USB_BUS_LOCK(&sc->sc_bus);
 		xhci_interrupt_poll(sc);
@@ -192,6 +246,68 @@ snps_dwc3_attach_xhci(device_t dev)
 
 	return (0);
 }
+
+#if defined(FDT) && defined(SOC_APPLE_T8103)
+static int
+snps_dwc3_release_dart(struct snps_dwc3_softc *snps_sc)
+{
+	struct xhci_softc *sc = &snps_sc->sc;
+	device_t dev = snps_sc->dev;
+	int error;
+
+	if (sc->sc_bus.bdev != NULL) {
+		error = device_delete_child(dev, sc->sc_bus.bdev);
+		if (error != 0)
+			return (error);
+		sc->sc_bus.bdev = NULL;
+	}
+	if (snps_sc->xhci_polling) {
+		usb_callout_drain(&sc->sc_callout);
+		snps_sc->xhci_polling = false;
+	}
+	if (snps_sc->xhci_initialized && xhci_halt_controller(sc) != 0)
+		return (EBUSY);
+	if (sc->sc_intr_hdl != NULL) {
+		error = bus_teardown_intr(dev, sc->sc_irq_res, sc->sc_intr_hdl);
+		if (error != 0)
+			return (error);
+		sc->sc_intr_hdl = NULL;
+	}
+	if (snps_sc->xhci_initialized) {
+		xhci_uninit(sc);
+		snps_sc->xhci_initialized = false;
+	}
+	if (sc->sc_dma_tag != NULL) {
+		error = bus_dma_tag_destroy(sc->sc_dma_tag);
+		if (error != 0)
+			return (error);
+		sc->sc_dma_tag = NULL;
+	}
+	if (snps_sc->dart != NULL)
+		apple_dart_domain_destroy(snps_sc->dart);
+	snps_sc->dart = NULL;
+
+	if (sc->sc_irq_res != NULL) {
+		bus_release_resource(dev, SYS_RES_IRQ,
+		    rman_get_rid(sc->sc_irq_res), sc->sc_irq_res);
+		sc->sc_irq_res = NULL;
+	}
+	bus_release_resource(dev, SYS_RES_MEMORY, rman_get_rid(snps_sc->mem_res),
+	    snps_sc->mem_res);
+	sc->sc_io_res = snps_sc->mem_res = NULL;
+	return (0);
+}
+
+static int
+snps_dwc3_fdt_detach(device_t dev)
+{
+	struct snps_dwc3_softc *sc = device_get_softc(dev);
+
+	if (sc->dart != NULL)
+		return (snps_dwc3_release_dart(sc));
+	return (generic_xhci_detach(dev));
+}
+#endif
 
 #ifdef DWC3_DEBUG
 static void
@@ -521,6 +637,11 @@ skip_phys:
 
 #ifdef FDT
 	if (error) {
+#ifdef SOC_APPLE_T8103
+		if (is_fdt && snps_dwc3_use_dart(dev) &&
+		    snps_dwc3_release_dart(sc) != 0)
+			panic("cannot tear down USB DART after failed attach");
+#endif
 		if (sc->clk_ref != NULL)
 			clk_disable(sc->clk_ref);
 		if (sc->clk_suspend != NULL)
@@ -560,13 +681,14 @@ snps_dwc3_fdt_attach(device_t dev)
 #ifdef SOC_APPLE_T8103
 	int error;
 
-	/* No DART driver yet: identity-map RAM for the controller's DMA. */
+	/* Power the controller before accessing its host registers. */
 	if (ofw_bus_is_compatible(dev, "apple,t8103-dwc3")) {
 		if ((error = apple_pmgr_power_on(dev)) != 0) {
 			device_printf(dev, "cannot power on: %d\n", error);
 			return (error);
 		}
-		if ((error = apple_dart_identity(dev)) != 0) {
+		if (!snps_dwc3_use_dart(dev) &&
+		    (error = apple_dart_identity(dev)) != 0) {
 			device_printf(dev, "cannot set up DART: %d\n", error);
 			return (error);
 		}
@@ -580,6 +702,9 @@ static device_method_t snps_dwc3_fdt_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		snps_dwc3_fdt_probe),
 	DEVMETHOD(device_attach,	snps_dwc3_fdt_attach),
+#ifdef SOC_APPLE_T8103
+	DEVMETHOD(device_detach,	snps_dwc3_fdt_detach),
+#endif
 
 	DEVMETHOD_END
 };

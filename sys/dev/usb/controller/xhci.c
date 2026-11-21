@@ -625,7 +625,8 @@ xhci_init(struct xhci_softc *sc, device_t self, uint8_t dma32)
 
 	/* get all DMA memory */
 	if (usb_bus_mem_alloc_all(&sc->sc_bus,
-	    USB_GET_DMA_TAG(self), &xhci_iterate_hw_softc)) {
+	    sc->sc_dma_tag != NULL ? sc->sc_dma_tag : USB_GET_DMA_TAG(self),
+	    &xhci_iterate_hw_softc)) {
 		return (ENOMEM);
 	}
 

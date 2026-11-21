@@ -72,6 +72,8 @@ struct bus_dma_impl {
 	    void *callback_arg);
 	bus_dma_segment_t *(*map_complete)(bus_dma_tag_t dmat, bus_dmamap_t map,
 	    bus_dma_segment_t *segs, int nsegs, int error);
+	int (*map_translate)(bus_dma_tag_t dmat, bus_dmamap_t map,
+	    bus_dma_segment_t *segs, int nsegs);
 	void (*map_unload)(bus_dma_tag_t dmat, bus_dmamap_t map);
 	void (*map_sync)(bus_dma_tag_t dmat, bus_dmamap_t map,
 	    bus_dmasync_op_t op);
@@ -85,6 +87,14 @@ int common_bus_dma_tag_create(struct bus_dma_tag_common *parent,
     bus_addr_t highaddr, bus_size_t maxsize, int nsegments,
     bus_size_t maxsegsz, int flags, bus_dma_lock_t *lockfunc,
     void *lockfuncarg, size_t sz, void **dmat);
+
+struct bus_dma_bounce_translation {
+	int (*map)(void *cookie, const struct bus_dma_tag_common *tag,
+	    bus_dma_segment_t *seg);
+	void (*unmap)(void *cookie, const bus_dma_segment_t *seg);
+};
+int bus_dma_bounce_set_translation(bus_dma_tag_t tag,
+    const struct bus_dma_bounce_translation *ops, void *cookie);
 
 extern struct bus_dma_impl bus_dma_bounce_impl;
 

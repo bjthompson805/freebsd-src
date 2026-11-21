@@ -106,5 +106,12 @@ int
 apple_pmgr_power_on(device_t dev)
 {
 
-	return (apple_pmgr_enable_domains(dev, ofw_bus_get_node(dev), 0));
+	return (apple_pmgr_power_on_node(dev, ofw_bus_get_node(dev)));
+}
+
+int
+apple_pmgr_power_on_node(device_t dev, phandle_t node)
+{
+
+	return (apple_pmgr_enable_domains(dev, node, 0));
 }

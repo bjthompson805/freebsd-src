@@ -37,7 +37,7 @@
 
 bus_dma_segment_t	*_bus_dmamap_complete(bus_dma_tag_t dmat,
 			    bus_dmamap_t map, bus_dma_segment_t *segs,
-			    int nsegs, int error);
+			    int nsegs, int *error);
 
 int	_bus_dmamap_load_buffer(bus_dma_tag_t dmat, bus_dmamap_t map,
 	    void *buf, bus_size_t buflen, struct pmap *pmap,
