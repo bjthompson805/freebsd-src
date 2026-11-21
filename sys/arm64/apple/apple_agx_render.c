@@ -2014,10 +2014,8 @@ agx_m5_render_bind_work_slot(uint8_t storage[AGX_M5_RENDER_STORAGE_BYTES],
 
 /*
  * fw/m5/render_demand.rs, the parts render_resources.rs M5Policy::plan uses
- * for vertex and fragment programs: RenderDemand::new, include_vertex,
- * include_fragment and resource_flags. Mesh and compute demand is not
- * ported (this driver refuses mesh programs). Overflow is EINVAL, where Rust
- * returns PoolError::Geometry.
+ * for vertex, fragment, mesh and object programs. Overflow is EINVAL,
+ * where Rust returns PoolError::Geometry.
  */
 struct demand {
 	uint32_t	counts[5];
@@ -2220,6 +2218,57 @@ demand_vertex(struct demand *d, uint32_t primary, uint32_t secondary,
 	return (demand_merge(d, parts, minimum, ideal, p.pressure));
 }
 
+/* include_mesh uses compute occupancy on the tiling engine's cores. */
+static int
+demand_mesh(struct demand *d, const struct agx_render_program *e)
+{
+	const uint64_t resident_warps = 96, shared_budget = 114688;
+	struct fragment_params p;
+	uint64_t warps, groups, active_warps, shared_small, shared_large;
+	uint64_t shared, small, large, group_large, tile, transient;
+	uint64_t base, tail, minimum, ideal, pressure;
+	uint32_t parts[5] = { 0 };
+	int error;
+
+	error = fragment_params(e->primary_bytes, e->secondary_bytes,
+	    e->linked_bytes, e->minimum_primary_bytes, 0, &p);
+	if (error != 0)
+		return (error);
+	warps = pages_of(e->threads, 32);
+	groups = resident_warps / warps;
+	shared = e->threadgroup_bytes;
+	if (shared != 0) {
+		uint64_t shared_groups = shared_budget / (pages_of(shared, 64) * 64);
+
+		if (groups > shared_groups)
+			groups = shared_groups;
+	}
+	if (groups == 0)
+		return (EINVAL);
+
+	small = p.page_units - p.large_units;
+	large = p.large_units;
+	shared_small = pages_of(shared, 0x1000);
+	shared_large = pages_of(shared, 0x10000);
+	active_warps = groups * warps;
+	pressure = active_warps * small +
+	    (active_warps < 10 ? active_warps : 10) * large +
+	    groups * shared_small + (groups < 8 ? groups : 8) * shared_large;
+
+	group_large = (warps < 10 ? warps : 10) * large;
+	tile = shared_small + shared_large;
+	transient = sat_sub(warps * small + group_large + tile, d->floor) + tile;
+	base = d->limited_maximum * (d->floor + 11) + 58;
+	tail = large + shared_large + 64;
+	minimum = base + tail + transient * d->limited_maximum +
+	    (shared_large + group_large) * d->limited_total;
+	ideal = base + tail + sat_sub(pressure, d->floor) * d->limited_maximum;
+	parts[0] = p.primary_large;
+	parts[1] = p.secondary_large;
+	parts[2] = shared_large;
+	return (demand_merge(d, parts, minimum, ideal, pressure));
+}
+
 /*
  * render_resources.rs Programs::demands and the stage plans of
  * M5Policy::plan (CONTEXT_FLOOR 96; priority 0 counts three resident kicks,
@@ -2255,11 +2304,14 @@ agx_m5_render_plan(const uint32_t *core_masks, unsigned clusters,
 	for (i = 0; i < n; i++) {
 		const struct agx_render_program *e = &programs[i];
 
-		if (e->stage > 1 || (e->stage == 0 && (e->auxiliary_count != 0 ||
-		    e->threadgroup_bytes != 0 || e->imageblock_bytes != 0 ||
-		    e->multisample_bytes != 0)))
+		if (e->stage > 1 || (e->stage == 1 && e->threads != 0) ||
+		    (e->stage == 0 && (e->auxiliary_count != 0 ||
+		    (e->threads == 0 && e->threadgroup_bytes != 0) ||
+		    e->imageblock_bytes != 0 || e->multisample_bytes != 0)))
 			return (EINVAL);
-		if (e->stage == 0) {
+		if (e->threads != 0) {
+			error = demand_mesh(&stage[0], e);
+		} else if (e->stage == 0) {
 			error = demand_vertex(&stage[0], e->primary_bytes,
 			    e->secondary_bytes, e->linked_bytes,
 			    e->minimum_primary_bytes);

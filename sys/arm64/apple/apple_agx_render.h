@@ -128,7 +128,7 @@ struct agx_stage_plan {
 	uint32_t	ptc_max;
 };
 
-/* drm_asahi_render_program, as render_resources.rs Programs reads it. */
+/* Shader resource inputs to the render planner. */
 struct agx_render_program {
 	uint32_t	stage;		/* 0 vertex, 1 fragment */
 	uint32_t	primary_bytes;
@@ -139,6 +139,7 @@ struct agx_render_program {
 	uint32_t	threadgroup_bytes;
 	uint32_t	imageblock_bytes;
 	uint32_t	multisample_bytes;
+	uint32_t	threads;	/* nonzero for mesh or object programs */
 };
 
 /* fw/render.rs RenderArgs with memory.rs write_m5_commands' inputs. */
