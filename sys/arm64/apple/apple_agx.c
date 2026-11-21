@@ -21,6 +21,8 @@
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_extern.h>
+#include <vm/vm_kern.h>
 
 #include <machine/atomic.h>
 #include <machine/cpufunc.h>
@@ -35,6 +37,7 @@
 #include <dev/ofw/ofw_subr.h>
 
 #include <arm64/apple/apple_agx.h>
+#include <arm64/apple/apple_agx_graph.h>
 #include <arm64/apple/apple_pmgr.h>
 #include <arm64/apple/apple_rtkit.h>
 
@@ -57,6 +60,21 @@
 #define	AGX_M5_START_CONTROL	0xe90000
 #define	AGX_G17_GATING_CONTROL	0xd06030
 #define	AGX_G17_GATING_DISABLE	0x6
+
+/* G17 endpoints and messages (g17/mod.rs). */
+#define	AGX_EP_CRASHLOG		0x01
+#define	AGX_EP_FIRMWARE		0x20
+#define	AGX_EP_DOORBELL		0x21
+#define	AGX_MSG_LOG_BUFFER	(0x9ull << 52)
+#define	AGX_MSG_INITDATA	(0x81ull << 48)
+#define	AGX_MSG_INITDATA_ACK	0x09
+#define	AGX_MSG_INITDATA_DONE	(0x89ull << 48)
+#define	AGX_MSG_POWER_ON_DONE	(0x89ull << 48)
+#define	AGX_MSG_ADDR_MASK	((1ull << 44) - 1)
+#define	AGX_FW_LOG_SIZE		0x8000
+/* abi CONTROL_STATE_OFFSET (12 work channels x 0x40) and OPENING_PRODUCER. */
+#define	AGX_CONTROL_STATE	0x300
+#define	AGX_OPENING_PRODUCER	1
 
 /* ASCWrap v6 (soc/apple/mailbox.c). */
 #define	AGX_ASC_CPU_CONTROL	0x44
@@ -101,7 +119,7 @@ MALLOC_DEFINE(M_AGX, "apple_agx", "Apple GPU");
 
 static SYSCTL_NODE(_hw, OID_AUTO, apple_agx, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Apple M5 GPU");
-/* 1: identify only; 2: also start both coprocessors' RTKit. */
+/* 1: identify; 2: start both coprocessors; 3: InitData. */
 static int agx_stage = 1;
 SYSCTL_INT(_hw_apple_agx, OID_AUTO, stage, CTLFLAG_RDTUN, &agx_stage, 0,
     "Bring-up stage to run at attach");
@@ -176,6 +194,7 @@ struct agx_role {
 	bus_size_t		wrapper_size;
 	struct apple_rtkit	*rtk;
 	u_int			msgs;
+	bool			init_ack;
 };
 
 struct apple_agx_softc {
@@ -185,6 +204,7 @@ struct apple_agx_softc {
 	struct agx_role		roles[2];	/* GFX, GFX1 */
 	void			*lower_root;
 	struct agx_uat		uat;
+	uint8_t			*graph_va[nitems(agx_graph_objects)];
 	uint8_t			*asc;
 	uint8_t			*sgx;
 	bus_size_t		asc_size;
@@ -565,6 +585,9 @@ agx_recv(void *arg, uint32_t ep, uint64_t msg)
 {
 	struct agx_role *r = arg;
 
+	/* recv_message_early: the InitData acknowledgment. */
+	if (ep == AGX_EP_FIRMWARE && msg >> 48 == AGX_MSG_INITDATA_ACK)
+		r->init_ack = true;
 	if (r->msgs++ < 16)
 		device_printf(r->sc->dev, "%s: ep %#x msg %#018lx\n", r->name,
 		    ep, msg);
@@ -631,39 +654,196 @@ agx_role_boot(struct apple_agx_softc *sc, struct agx_role *r)
 }
 
 static int
-agx_stage3a(struct apple_agx_softc *sc)
+agx_graph_find(const char *name)
 {
-	uint64_t snap[3], pte;
-	void *page;
+	u_int i;
+
+	for (i = 0; i < nitems(agx_graph_objects); i++)
+		if (strcmp(agx_graph_objects[i].name, name) == 0)
+			return (i);
+	return (-1);
+}
+
+/* build_m5: the 26B123 graph (apple_agx_graph.h) in the kernel window. */
+static int
+agx_build_graph(struct apple_agx_softc *sc)
+{
+	const struct agx_graph_object *o;
+	vm_size_t size;
 	vm_paddr_t pa;
+	u_int i;
 	int error;
+
+	for (i = 0; i < nitems(agx_graph_objects); i++) {
+		o = &agx_graph_objects[i];
+		size = roundup2(o->size, AGX_UAT_PGSZ);
+		sc->graph_va[i] = (uint8_t *)kmem_alloc_contig(size,
+		    M_WAITOK | M_ZERO, 0, ~(vm_paddr_t)0, AGX_UAT_PGSZ, 0,
+		    o->wb ? VM_MEMATTR_DEFAULT : VM_MEMATTR_WRITE_COMBINING);
+		if (sc->graph_va[i] == NULL)
+			return (ENOMEM);
+	}
+	for (i = 0; i < nitems(agx_graph_words); i++) {
+		const struct agx_graph_word *w = &agx_graph_words[i];
+
+		*(volatile uint32_t *)(sc->graph_va[w->obj] + w->off) = w->val;
+	}
+	dsb(sy);
+	for (i = 0; i < nitems(agx_graph_objects); i++) {
+		o = &agx_graph_objects[i];
+		pa = pmap_kextract((vm_offset_t)sc->graph_va[i]);
+		if ((error = agx_uat_map(&sc->uat, sc->uat.upper_root, o->va,
+		    pa, roundup2(o->size, AGX_UAT_PGSZ), o->prot)) != 0) {
+			device_printf(sc->dev, "graph: map %s: %d\n", o->name,
+			    error);
+			return (error);
+		}
+	}
+	for (i = 0; i < nitems(agx_graph_aliases); i++) {
+		const struct agx_graph_alias *a = &agx_graph_aliases[i];
+
+		o = &agx_graph_objects[a->obj];
+		pa = pmap_kextract((vm_offset_t)sc->graph_va[a->obj]);
+		if ((error = agx_uat_map(&sc->uat, sc->uat.lower_root, a->va,
+		    pa, roundup2(o->size, AGX_UAT_PGSZ), a->prot)) != 0) {
+			device_printf(sc->dev, "graph: alias %s: %d\n", o->name,
+			    error);
+			return (error);
+		}
+	}
+	for (i = 0; i < nitems(agx_graph_windows); i++) {
+		const struct agx_graph_window *w = &agx_graph_windows[i];
+
+		if ((error = agx_uat_map(&sc->uat, sc->uat.upper_root, w->va,
+		    w->pa, w->size, AGX_PROT_FW_MMIO_RW)) != 0) {
+			device_printf(sc->dev, "graph: window %u: %d\n",
+			    w->slot, error);
+			return (error);
+		}
+	}
+	device_printf(sc->dev, "M5 firmware graph ready: %zu objects, %zu "
+	    "aliases, %zu register windows, %d tables\n",
+	    nitems(agx_graph_objects), nitems(agx_graph_aliases),
+	    nitems(agx_graph_windows), sc->uat.ntables);
+	return (0);
+}
+
+static void
+agx_poll_both(struct apple_agx_softc *sc)
+{
+
+	apple_rtkit_poll(sc->roles[1].rtk);
+	apple_rtkit_poll(sc->roles[0].rtk);
+}
+
+/* Coprocessor::init with InitAck::Message, then the INITDATA_DONE doorbell. */
+static int
+agx_role_init(struct apple_agx_softc *sc, int idx)
+{
+	struct agx_role *r = &sc->roles[idx];
+	uint64_t root = agx_graph_roots[idx];
+	int error, i;
+
+	if ((error = apple_rtkit_start_ep(r->rtk, AGX_EP_FIRMWARE)) != 0 ||
+	    (error = apple_rtkit_start_ep(r->rtk, AGX_EP_DOORBELL)) != 0)
+		return (error);
+	r->init_ack = false;
+	if ((error = apple_rtkit_send(r->rtk, AGX_EP_FIRMWARE,
+	    AGX_MSG_INITDATA | (root & AGX_MSG_ADDR_MASK))) != 0)
+		return (error);
+	for (i = 0; i < 2000 && !r->init_ack; i++) {	/* 2 s */
+		agx_poll_both(sc);
+		if (apple_rtkit_crashed(r->rtk))
+			return (EIO);
+		DELAY(1000);
+	}
+	if (!r->init_ack) {
+		device_printf(sc->dev, "%s: no InitData acknowledgment\n",
+		    r->name);
+		return (ETIMEDOUT);
+	}
+	device_printf(sc->dev, "%s: InitData %#lx acknowledged after %d ms\n",
+	    r->name, root, i);
+	return (apple_rtkit_send(r->rtk, AGX_EP_DOORBELL,
+	    AGX_MSG_INITDATA_DONE));
+}
+
+static bool
+agx_opening_retired(struct apple_agx_softc *sc, int idx)
+{
+	volatile uint32_t *st = (volatile uint32_t *)(sc->graph_va[0] +
+	    agx_graph_state_grids[idx] + AGX_CONTROL_STATE);
+
+	return (st[0] == AGX_OPENING_PRODUCER &&
+	    st[0x10 / 4] == AGX_OPENING_PRODUCER &&
+	    st[0x20 / 4] == AGX_OPENING_PRODUCER);
+}
+
+/*
+ * Stage 3: boot_m5 after both coprocessors run. Adopt the roots, build
+ * the graph, hand out the log buffers (GFX1, GFX), InitData (GFX1, GFX),
+ * POWER_ON_DONE to both, and wait for the opening records to retire.
+ */
+static int
+agx_stage3(struct apple_agx_softc *sc)
+{
+	uint64_t snap[3];
+	int error, i, idx;
 
 	if ((error = agx_uat_adopt_roots(&sc->uat, snap)) != 0)
 		return (error);
 	device_printf(sc->dev, "UAT: firmware root entries %#lx %#lx %#lx\n",
 	    snap[0], snap[1], snap[2]);
-
-	/* One page at the M5 graph's private cluster address. */
-	page = contigmalloc(AGX_UAT_PGSZ, M_AGX, M_WAITOK | M_ZERO, 0,
-	    ~(vm_paddr_t)0, AGX_UAT_PGSZ, 0);
-	pa = pmap_kextract((vm_offset_t)page);
-	if ((error = agx_uat_map(&sc->uat, sc->uat.upper_root,
-	    AGX_M5_BASE + 0x20000, pa, AGX_UAT_PGSZ,
-	    AGX_PROT_FW_SHARED_RW)) != 0)
+	_Static_assert(nitems(agx_graph_objects) > 0, "graph");
+	if (strcmp(agx_graph_objects[0].name, "cluster") != 0)
+		return (EINVAL);
+	if ((error = agx_build_graph(sc)) != 0)
 		return (error);
-	if ((error = agx_uat_lookup(&sc->uat, sc->uat.upper_root,
-	    AGX_M5_BASE + 0x20000, &pte)) != 0)
-		return (error);
-	device_printf(sc->dev, "UAT: test page %#lx -> PTE %#lx (%d tables)\n",
-	    AGX_M5_BASE + 0x20000, pte, sc->uat.ntables);
-
 	if ((error = agx_uat_confirm_roots(&sc->uat, snap)) != 0) {
 		device_printf(sc->dev, "UAT: firmware root entries changed\n");
 		return (error);
 	}
 	if ((error = agx_uat_mirror_secondary(&sc->uat)) != 0)
 		return (error);
-	device_printf(sc->dev, "stage 3a: roots adopted, confirmed, mirrored\n");
+
+	for (idx = 1; idx >= 0; idx--) {
+		/* FW_LOG[role]: fw_log0 is GFX's, fw_log1 GFX1's. */
+		int o = agx_graph_find(idx == 0 ? "fw_log0" : "fw_log1");
+		uint64_t va;
+
+		if (o < 0)
+			return (EINVAL);
+		va = agx_graph_objects[o].va;
+		if ((error = apple_rtkit_send(sc->roles[idx].rtk,
+		    AGX_EP_CRASHLOG, AGX_MSG_LOG_BUFFER |
+		    (uint64_t)(AGX_FW_LOG_SIZE >> 12) << 44 |
+		    (va & AGX_MSG_ADDR_MASK))) != 0)
+			return (error);
+	}
+	if ((error = agx_role_init(sc, 1)) != 0 ||
+	    (error = agx_role_init(sc, 0)) != 0)
+		return (error);
+	if ((error = apple_rtkit_send(sc->roles[0].rtk, AGX_EP_DOORBELL,
+	    AGX_MSG_POWER_ON_DONE)) != 0 ||
+	    (error = apple_rtkit_send(sc->roles[1].rtk, AGX_EP_DOORBELL,
+	    AGX_MSG_POWER_ON_DONE)) != 0)
+		return (error);
+	for (i = 0; i <= 1000; i++) {
+		agx_poll_both(sc);
+		if (apple_rtkit_crashed(sc->roles[0].rtk) ||
+		    apple_rtkit_crashed(sc->roles[1].rtk))
+			return (EIO);
+		if (agx_opening_retired(sc, 0) && agx_opening_retired(sc, 1))
+			break;
+		DELAY(1000);
+	}
+	if (i > 1000) {
+		device_printf(sc->dev, "firmware did not retire its opening "
+		    "records\n");
+		return (ETIMEDOUT);
+	}
+	device_printf(sc->dev, "M5 firmware opening records retired after "
+	    "%d ms\n", i);
 	return (0);
 }
 
@@ -723,9 +903,8 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 	device_printf(sc->dev, "G17 gating %#x -> %#x\n", v,
 	    agx_sgx_read(sc, AGX_G17_GATING_CONTROL));
 
-	/* Stage 3a: the UAT the firmware built while booting. */
-	if ((error = agx_stage3a(sc)) != 0)
-		device_printf(sc->dev, "stage 3a failed: %d\n", error);
+	if (agx_stage >= 3 && (error = agx_stage3(sc)) != 0)
+		device_printf(sc->dev, "stage 3 failed: %d\n", error);
 
 	/* Listen for a while; no InitData yet. */
 	for (i = 0; i < 200; i++) {
