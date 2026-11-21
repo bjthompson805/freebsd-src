@@ -272,7 +272,7 @@ struct agx_compute_queue {
 	u_int			qid;
 	u_int			qos;
 	u_int			pool_row;
-	bool			leased;
+	u_int			users;	/* DRM queues sharing it */
 	uint8_t			*sched;
 	uint8_t			*work;
 	uint8_t			*graph;
@@ -342,6 +342,7 @@ struct agx_render {
 	uint32_t	stamp;
 	uint64_t	work_node;
 	uint64_t	pb_token;	/* buffer.rs: a token names one PB binding */
+	uint64_t	stamp_events;	/* stamp events naming QID 0 or 1 */
 	u_int		pb_context;
 	u_int		context;
 	uint8_t		generation;
@@ -1754,17 +1755,28 @@ apple_agx_queue_create(device_t dev, u_int *slot)
 	struct apple_agx_softc *sc = device_get_softc(dev);
 	u_int i;
 
+	u_int best = nitems(sc->queues);
+
+	/*
+	 * DRM queues share the firmware compute queues: a submission runs to
+	 * retirement, and a kick carries its own context. Take the least used.
+	 */
 	mtx_lock(&sc->mtx);
 	for (i = 0; i < nitems(sc->queues); i++) {
-		if (sc->queues[i].leased || sc->queues[i].failed)
+		if (sc->queues[i].failed)
 			continue;
-		sc->queues[i].leased = true;
-		*slot = i;
-		mtx_unlock(&sc->mtx);
-		return (0);
+		if (best == nitems(sc->queues) ||
+		    sc->queues[i].users < sc->queues[best].users)
+			best = i;
 	}
+	if (best == nitems(sc->queues)) {
+		mtx_unlock(&sc->mtx);
+		return (EIO);
+	}
+	sc->queues[best].users++;
+	*slot = best;
 	mtx_unlock(&sc->mtx);
-	return (ENOSPC);
+	return (0);
 }
 
 void
@@ -1773,8 +1785,8 @@ apple_agx_queue_destroy(device_t dev, u_int slot)
 	struct apple_agx_softc *sc = device_get_softc(dev);
 
 	mtx_lock(&sc->mtx);
-	if (slot < nitems(sc->queues))
-		sc->queues[slot].leased = false;
+	if (slot < nitems(sc->queues) && sc->queues[slot].users > 0)
+		sc->queues[slot].users--;
 	mtx_unlock(&sc->mtx);
 }
 
@@ -1797,14 +1809,16 @@ apple_agx_submit_compute(device_t dev, u_int slot, u_int context,
 	if (cdm_end <= cdm_va || cdm_end - cdm_va < 4 || (cdm_va & 7) != 0)
 		return (EINVAL);
 	mtx_lock(&sc->mtx);
-	if (!queue->leased) {
+	if (queue->users == 0) {
 		mtx_unlock(&sc->mtx);
 		return (ENOENT);
 	}
-	if (queue->failed || queue->busy) {
-		error = queue->failed ? EIO : EBUSY;
+	/* Another DRM queue's kick on this firmware queue retires first. */
+	while (queue->busy && !queue->failed)
+		mtx_sleep(&queue->busy, &sc->mtx, 0, "agxcq", 0);
+	if (queue->failed) {
 		mtx_unlock(&sc->mtx);
-		return (error);
+		return (EIO);
 	}
 	root = agx_client_root(sc, context);
 	if (root == NULL || !root->live) {
@@ -1824,6 +1838,7 @@ apple_agx_submit_compute(device_t dev, u_int slot, u_int context,
 	}
 	queue->failed = error != 0;
 	queue->busy = false;
+	wakeup(&queue->busy);
 	mtx_unlock(&sc->mtx);
 	if (error != 0)
 		device_printf(sc->dev, "submit: compute at %#lx: %d\n", cdm_va,
@@ -2256,16 +2271,20 @@ agx_stage7(struct apple_agx_softc *sc)
 #define	AGX_RENDER_RECORDS_VA	(AGX_RENDER_GRAPH_VA + 0xb4000)
 #define	AGX_RENDER_DESC_VA	(AGX_RENDER_GRAPH_VA + 0xc0000)
 #define	AGX_RENDER_DESC_LOW_VA	0x8020000000ul	/* past the free-list pool */
+/*
+ * Sized for the largest single-layer pass agxdrm admits, 16384 x 16384
+ * with 16 x 16 utiles: a 5.25 MiB tile map and an 8 MiB TPC slice.
+ */
 #define	AGX_RENDER_TARGET_VA	0x1006000000ul
-#define	AGX_RENDER_TARGET_SIZE	0x10000
-#define	AGX_RENDER_TPC_VA	0x1006100000ul
-#define	AGX_RENDER_TPC_SIZE	0x40000
-#define	AGX_RENDER_STATE_VA	0x1006200000ul
+#define	AGX_RENDER_TARGET_SIZE	0x600000
+#define	AGX_RENDER_TPC_VA	0x1007000000ul
+#define	AGX_RENDER_TPC_SIZE	0x800000
+#define	AGX_RENDER_STATE_VA	0x1008000000ul
 #define	AGX_RENDER_STATE_SIZE	0x10000	/* generation.rs Layout::m5 */
 #define	AGX_RENDER_STATE_STATUS	0x4000
 #define	AGX_RENDER_STATE_AUX	0x8000
 #define	AGX_RENDER_VIEWPORT	0x9c0	/* ContextStore stream + 0x40 */
-#define	AGX_RENDER_TIMESTAMPS_VA 0x1006300000ul
+#define	AGX_RENDER_TIMESTAMPS_VA 0x1008100000ul
 #define	AGX_RENDER_USAGE	0x100	/* in the support page */
 #define	AGX_RENDER_TIMESTAMPS	0x200	/* in the support page */
 #define	AGX_RENDER_ANNOUNCE	0x800	/* in the records page */
@@ -2606,11 +2625,15 @@ agx_render_retire(struct apple_agx_softc *sc, u_int timeout_ms, u_int *ms)
 	    (r->work_node - AGX_RENDER_WORK_VA));
 	volatile uint32_t *status = (volatile uint32_t *)(r->state +
 	    AGX_RENDER_STATE_STATUS);
+	bool interrupt = sc->roles[0].irq_tag != NULL;
+	sbintime_t started, deadline;
 	u_int i;
 	bool done = false;
 
-	for (i = 0; i <= timeout_ms; i++) {
-		if (sc->roles[0].irq_tag == NULL)
+	started = sbinuptime();
+	deadline = started + timeout_ms * SBT_1MS;
+	for (i = 0;; i++) {
+		if (!interrupt)
 			agx_poll_both(sc);
 		if (apple_rtkit_crashed(sc->roles[0].rtk) ||
 		    apple_rtkit_crashed(sc->roles[1].rtk))
@@ -2620,10 +2643,20 @@ agx_render_retire(struct apple_agx_softc *sc, u_int timeout_ms, u_int *ms)
 		    agx_stamp_covers(stamps[4], r->stamp) &&
 		    ta[0] == r->items_end[0] && fragment[0] == r->items_end[1] &&
 		    node[AGX_Q_NODE_COMPLETED / 4] >= 2;
-		if (done)
+		if (done || sbinuptime() >= deadline)
 			break;
-		DELAY(1000);
+		/*
+		 * With the interrupt, sleep on the pair's stamp events and
+		 * release the mutex: compute submissions run meanwhile. The
+		 * node count can trail the stamps, so wake every millisecond.
+		 */
+		if (interrupt)
+			msleep_sbt(&r->stamp_events, &sc->mtx, 0, "agxrnd",
+			    SBT_1MS, 0, 0);
+		else
+			DELAY(1000);
 	}
+	i = (sbinuptime() - started) / SBT_1MS;
 	*ms = i;
 	device_printf(sc->dev, "render %u: %s after %u ms: stamps TA %#x 3D %#x "
 	    "(want %#x), consumers %u/%u %u/%u, node completed %u, status "
@@ -2661,11 +2694,12 @@ apple_agx_submit_render(device_t dev, u_int context,
 	if (error != 0)
 		return (error);
 	mtx_lock(&sc->mtx);
+	/* One render at a time: later ones wait for the pair. */
+	while (r->busy && !r->failed)
+		mtx_sleep(&r->busy, &sc->mtx, 0, "agxpair", 0);
 	root = agx_client_root(sc, context);
-	if (!r->installed || r->failed || r->busy || root == NULL ||
-	    !root->live) {
-		error = !r->installed ? ENODEV : r->failed ? EIO :
-		    r->busy ? EBUSY : ENOENT;
+	if (!r->installed || r->failed || root == NULL || !root->live) {
+		error = !r->installed ? ENODEV : r->failed ? EIO : ENOENT;
 		mtx_unlock(&sc->mtx);
 		return (error);
 	}
@@ -2681,6 +2715,7 @@ apple_agx_submit_render(device_t dev, u_int context,
 	r->failed = error != 0 && r->ordinal != 0 && error != EINVAL &&
 	    error != E2BIG && error != EOPNOTSUPP;
 	r->busy = false;
+	wakeup(&r->busy);
 	mtx_unlock(&sc->mtx);
 	if (error != 0)
 		device_printf(sc->dev, "submit: render %ux%u: %d\n", pass->width,
@@ -2913,6 +2948,10 @@ agx_drain_events(struct agx_role *r)
 			device_printf(sc->dev, "%s: event %u tag %u: %#x %#x %#x "
 			    "%#x %#x\n", r->name, c, rec[0], rec[1], rec[2],
 			    rec[3], rec[4], rec[5]);
+		if (idx == 0 && rec[0] == AGX_EVENT_STAMP && (rec[1] & 3) != 0) {
+			sc->render.stamp_events++;
+			wakeup(&sc->render.stamp_events);
+		}
 		if (idx == 0 && rec[0] == AGX_EVENT_STAMP) {
 			for (u_int i = 0; i < nitems(sc->queues); i++) {
 				struct agx_compute_queue *queue = &sc->queues[i];
