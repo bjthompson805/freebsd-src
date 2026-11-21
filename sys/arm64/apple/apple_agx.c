@@ -2420,7 +2420,7 @@ agx_items_room(uint32_t producer, uint32_t consumer)
 static int
 agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
     uint8_t generation, const struct agx_render_pass *pass,
-    const struct agx_stage_plan stages[2])
+    const struct agx_stage_plan stages[2], uint8_t mesh_class)
 {
 	struct agx_render *r = &sc->render;
 	struct agx_render_slot *slot = &r->slots[index];
@@ -2553,7 +2553,7 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	    AGX_RENDER_SUPPORT_VA + 0x18 };
 	a.has_stages = true;
 	memcpy(a.stages, stages, sizeof(a.stages));
-	a.mesh_class = 0;		/* mesh programs are refused */
+	a.mesh_class = mesh_class;
 	a.usage[0] = AGX_RENDER_SUPPORT_VA + AGX_RENDER_USAGE + index * 0x80;
 	a.usage[1] = a.usage[0] + 0x40;
 	memset(slot->desc, 0, AGX_M5_RENDER_STORAGE_BYTES);
@@ -2811,10 +2811,19 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 	struct agx_render_pass p = *pass;
 	struct agx_stage_plan stages[2];
 	struct agx_render_slot *slot;
-	u_int index, n = 0;
+	u_int i, index, n = 0;
+	uint8_t mesh_class = 0;
 	int error;
 
 	p.usc_base = AGX_CLIENT_SHADER;
+	/*
+	 * render_resources.rs mesh_class: 1 for a hardware mesh (with its
+	 * passthrough object stage). Task (class 2) kicks need the TA mesh
+	 * storage buffer, which DRM does not admit yet.
+	 */
+	for (i = 0; i < nprograms; i++)
+		if (programs[i].threads != 0)
+			mesh_class = 1;
 	/* render_resources.rs M5Policy: every core of every cluster. */
 	error = agx_m5_render_plan(sc->id.core_masks, sc->id.num_clusters,
 	    sc->id.num_cores * sc->id.num_clusters, AGX_RENDER_PRIORITY,
@@ -2838,7 +2847,7 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 	index = (r->oldest + r->in_flight) % AGX_RENDER_SLOTS;
 	slot = &r->slots[index];
 	error = agx_render_kick(sc, index, context, root->generation, &p,
-	    stages);
+	    stages, mesh_class);
 	if (error == 0) {
 		slot->used = true;
 		slot->done = done;
