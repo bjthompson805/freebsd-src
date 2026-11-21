@@ -88,16 +88,30 @@
 #define AIC_IPI_SR_EL1		s3_5_c15_c1_1
 #define  AIC_IPI_SR_EL1_PENDING	(1 << 0)
 
+/* Which guest timers may raise a FIQ (enable bits, not pending bits). */
 #define AIC_FIQ_VM_TIMER	s3_5_c15_c1_3
 #define	AIC_FIQ_VM_TIMER_VEN	(1 << 0)
 #define	AIC_FIQ_VM_TIMER_PEN	(1 << 1)
 #define	AIC_FIQ_VM_TIMER_BITS	(AIC_FIQ_VM_TIMER_VEN | AIC_FIQ_VM_TIMER_PEN)
+
+/* Guest timers, seen from EL2 with VHE */
+#define	AIC_CNTP_CTL_EL02	s3_5_c14_c2_1
+#define	AIC_CNTV_CTL_EL02	s3_5_c14_c3_1
+
+/* Core and uncore PMC interrupt modes; FIQ sources nobody handles yet. */
+#define	AIC_PMCR0_EL1		s3_1_c15_c0_0
+#define	 AIC_PMCR0_IMODE	(7ul << 8)
+#define	 AIC_PMCR0_IACT		(1ul << 11)
+#define	AIC_UPMCR0_EL1		s3_7_c15_c0_4
+#define	 AIC_UPMCR0_IMODE	(7ul << 16)
 
 #define CNTV_CTL_ENABLE		(1 << 0)
 #define CNTV_CTL_IMASK		(1 << 1)
 #define CNTV_CTL_ISTATUS	(1 << 2)
 #define	CNTV_CTL_BITS		\
     (CNTV_CTL_ENABLE | CNTV_CTL_IMASK | CNTV_CTL_ISTATUS)
+#define	AIC_TIMER_FIRING(ctl)	\
+    (((ctl) & CNTV_CTL_BITS) == (CNTV_CTL_ENABLE | CNTV_CTL_ISTATUS))
 
 /*
  * AIC v3 (M3 and later).  There is no per-IRQ CPU target register, the IRQ
@@ -153,6 +167,7 @@ struct apple_aic_softc {
 	bus_size_t		sc_mask_set;
 	bus_size_t		sc_mask_clr;
 	bus_size_t		sc_die_stride;
+	bool			sc_vm_timer_ro;	/* T8142: VM timer enable traps */
 	struct apple_aic_irqsrc	*sc_isrcs[AIC_MAXDIES];
 	u_int			sc_nirqs;
 	u_int			sc_ndie;
@@ -180,6 +195,19 @@ static inline uint32_t
 aic_read_event(struct apple_aic_softc *sc)
 {
 	return (bus_read_4(sc->sc_mem, sc->sc_event));
+}
+
+/* Per CPU: switch off the PMC FIQs firmware may have left on. */
+static void
+apple_aic_init_cpu(struct apple_aic_softc *sc)
+{
+
+	WRITE_SPECIALREG(AIC_PMCR0_EL1, READ_SPECIALREG(AIC_PMCR0_EL1) &
+	    ~(AIC_PMCR0_IMODE | AIC_PMCR0_IACT));
+	if (sc->sc_version >= 2)
+		WRITE_SPECIALREG(AIC_UPMCR0_EL1,
+		    READ_SPECIALREG(AIC_UPMCR0_EL1) & ~AIC_UPMCR0_IMODE);
+	isb();
 }
 
 static device_probe_t apple_aic_probe;
@@ -287,14 +315,23 @@ apple_aic_attach(device_t dev)
 		    sc->sc_maxirqs, sc->sc_ndie, (uintmax_t)sc->sc_die_stride);
 
 	if (sc->sc_version == 3) {
-		/* Mask everything until a handler is set up, then enable. */
+		/*
+		 * Mask everything until a handler is set up and drop stale
+		 * software triggers, then enable.
+		 */
 		for (i = 0; i < sc->sc_ndie; i++)
-			for (j = 0; j < sc->sc_nirqs; j += 32)
+			for (j = 0; j < sc->sc_nirqs; j += 32) {
 				bus_write_4(sc->sc_mem, AIC_IRQ_REG(sc,
 				    sc->sc_mask_set, i, j), ~0u);
+				bus_write_4(sc->sc_mem, AIC_IRQ_REG(sc,
+				    sc->sc_sw_clr, i, j), ~0u);
+			}
 		bus_write_4(sc->sc_mem, AIC3_GLBCFG,
 		    bus_read_4(sc->sc_mem, AIC3_GLBCFG) | AIC3_GLBCFG_ENABLE);
+		sc->sc_vm_timer_ro = ofw_bus_is_compatible(dev,
+		    "apple,t8142-aic3");
 	}
+	apple_aic_init_cpu(sc);
 
 	for (i = 0; i < sc->sc_ndie; i++) {
 		sc->sc_isrcs[i] = mallocarray(sc->sc_nirqs,
@@ -302,10 +339,10 @@ apple_aic_attach(device_t dev)
 	}
 
 #ifdef SMP
-	sc->sc_ipimasks = malloc(sizeof(*sc->sc_ipimasks) * mp_maxid + 1,
+	sc->sc_ipimasks = malloc(sizeof(*sc->sc_ipimasks) * (mp_maxid + 1),
 	    M_DEVBUF, M_WAITOK | M_ZERO);
 #endif
-	sc->sc_cpuids = malloc(sizeof(*sc->sc_cpuids) * mp_maxid + 1,
+	sc->sc_cpuids = malloc(sizeof(*sc->sc_cpuids) * (mp_maxid + 1),
 	    M_DEVBUF, M_WAITOK | M_ZERO);
 
 	cpu = PCPU_GET(cpuid);
@@ -657,39 +694,43 @@ apple_aic_irq(void *arg)
 	uint32_t die, event, irq, type;
 	struct apple_aic_irqsrc	*aisrc;
 	struct trapframe *tf;
+	bool handled;
 
 	sc = arg;
 	tf = curthread->td_intr_frame;
+	handled = false;
 
-	event = aic_read_event(sc);
-	type = AIC_EVENT_TYPE(event);
+	/* Each read takes (and masks) the next event; drain them all. */
+	while ((event = aic_read_event(sc)) != 0) {
+		type = AIC_EVENT_TYPE(event);
 
-	/* If we get an IPI here, we really goofed. */
-	MPASS(type != AIC_EVENT_TYPE_IPI);
+		/* If we get an IPI here, we really goofed. */
+		MPASS(type != AIC_EVENT_TYPE_IPI);
 
-	if (type != AIC_EVENT_TYPE_IRQ) {
-		if (type != AIC_EVENT_TYPE_NONE)
+		if (type != AIC_EVENT_TYPE_IRQ) {
 			device_printf(sc->sc_dev, "unexpected event type %d\n",
 			    type);
-		return (FILTER_STRAY);
+			continue;
+		}
+
+		die = AIC_EVENT_DIE(event);
+		irq = AIC_EVENT_IRQ(event);
+
+		if (die >= sc->sc_ndie)
+			panic("%s: unexpected die %d", __func__, die);
+		if (irq >= sc->sc_nirqs)
+			panic("%s: unexpected irq %d", __func__, irq);
+
+		aisrc = &sc->sc_isrcs[die][irq];
+		if (intr_isrc_dispatch(&aisrc->ai_isrc, tf) != 0) {
+			device_printf(sc->sc_dev, "Stray irq %u:%u disabled\n",
+			    die, irq);
+			continue;
+		}
+		handled = true;
 	}
 
-	die = AIC_EVENT_DIE(event);
-	irq = AIC_EVENT_IRQ(event);
-
-	if (die >= sc->sc_ndie)
-		panic("%s: unexpected die %d", __func__, die);
-	if (irq >= sc->sc_nirqs)
-		panic("%s: unexpected irq %d", __func__, irq);
-
-	aisrc = &sc->sc_isrcs[die][irq];
-	if (intr_isrc_dispatch(&aisrc->ai_isrc, tf) != 0) {
-		device_printf(sc->sc_dev, "Stray irq %u:%u disabled\n",
-		    die, irq);
-		return (FILTER_STRAY);
-	}
-
-	return (FILTER_HANDLED);
+	return (handled ? FILTER_HANDLED : FILTER_STRAY);
 }
 
 static int
@@ -698,6 +739,7 @@ apple_aic_fiq(void *arg)
 	struct apple_aic_softc *sc;
 	struct apple_aic_irqsrc *isrcs;
 	struct trapframe *tf;
+	bool vhe;
 
 	sc = arg;
 	tf = curthread->td_intr_frame;
@@ -715,28 +757,44 @@ apple_aic_fiq(void *arg)
 	 * of IPI handling, so we have to probe around outside of AIC to
 	 * determine if we might have been fired off due to a timer.
 	 */
+	/*
+	 * The EL0 timer registers are the guest timers at EL1 and the
+	 * hypervisor's own at EL2 with VHE, where the guest timers are the
+	 * EL02 ones; those count only while enabled in AIC_FIQ_VM_TIMER.
+	 */
 	isrcs = sc->sc_isrcs[0];
-	if ((READ_SPECIALREG(cntv_ctl_el0) & CNTV_CTL_BITS) ==
-	    (CNTV_CTL_ENABLE | CNTV_CTL_ISTATUS)) {
-		intr_isrc_dispatch(&isrcs[AIC_TMR_GUEST_VIRT].ai_isrc, tf);
-	}
+	vhe = in_vhe();
+	if (AIC_TIMER_FIRING(READ_SPECIALREG(cntp_ctl_el0)))
+		intr_isrc_dispatch(&isrcs[vhe ? AIC_TMR_HV_PHYS :
+		    AIC_TMR_GUEST_PHYS].ai_isrc, tf);
+	if (AIC_TIMER_FIRING(READ_SPECIALREG(cntv_ctl_el0)))
+		intr_isrc_dispatch(&isrcs[vhe ? AIC_TMR_HV_VIRT :
+		    AIC_TMR_GUEST_VIRT].ai_isrc, tf);
 
-	if (has_hyp()) {
-		uint64_t reg;
+	if (vhe) {
+		uint64_t ena;
 
-		if ((READ_SPECIALREG(cntp_ctl_el0) & CNTV_CTL_ISTATUS) != 0) {
+		/* T8142 traps writes there and has both enabled. */
+		ena = sc->sc_vm_timer_ro ? AIC_FIQ_VM_TIMER_BITS :
+		    READ_SPECIALREG(AIC_FIQ_VM_TIMER);
+		if ((ena & AIC_FIQ_VM_TIMER_PEN) != 0 &&
+		    AIC_TIMER_FIRING(READ_SPECIALREG(AIC_CNTP_CTL_EL02)))
 			intr_isrc_dispatch(&isrcs[AIC_TMR_GUEST_PHYS].ai_isrc,
 			    tf);
-		}
+		if ((ena & AIC_FIQ_VM_TIMER_VEN) != 0 &&
+		    AIC_TIMER_FIRING(READ_SPECIALREG(AIC_CNTV_CTL_EL02)))
+			intr_isrc_dispatch(&isrcs[AIC_TMR_GUEST_VIRT].ai_isrc,
+			    tf);
+	}
 
-		reg = READ_SPECIALREG(AIC_FIQ_VM_TIMER);
-		if ((reg & AIC_FIQ_VM_TIMER_PEN) != 0) {
-			intr_isrc_dispatch(&isrcs[AIC_TMR_HV_PHYS].ai_isrc, tf);
-		}
-
-		if ((reg & AIC_FIQ_VM_TIMER_VEN) != 0) {
-			intr_isrc_dispatch(&isrcs[AIC_TMR_HV_VIRT].ai_isrc, tf);
-		}
+	/* PMC FIQs: nothing handles them; switch off any that fire. */
+	if ((READ_SPECIALREG(AIC_PMCR0_EL1) &
+	    (AIC_PMCR0_IMODE | AIC_PMCR0_IACT)) ==
+	    ((4ul << 8) | AIC_PMCR0_IACT)) {
+		device_printf(sc->sc_dev, "PMC FIQ fired, masking\n");
+		WRITE_SPECIALREG(AIC_PMCR0_EL1, READ_SPECIALREG(AIC_PMCR0_EL1) &
+		    ~(AIC_PMCR0_IMODE | AIC_PMCR0_IACT));
+		isb();
 	}
 
 	return (FILTER_HANDLED);
@@ -838,6 +896,7 @@ apple_aic_init_secondary(device_t dev, uint32_t rootnum)
 	if (rootnum != INTR_ROOT_IRQ)
 		return;
 
+	apple_aic_init_cpu(sc);
 	if (sc->sc_version == 3)
 		return;
 
