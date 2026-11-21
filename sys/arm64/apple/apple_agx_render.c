@@ -2011,3 +2011,278 @@ agx_m5_render_bind_work_slot(uint8_t storage[AGX_M5_RENDER_STORAGE_BYTES],
 	put32(storage + AGX_M5_RENDER_FRAGMENT_OFFSET, 0x2158, slot);
 	return (0);
 }
+
+/*
+ * fw/m5/render_demand.rs, the parts render_resources.rs M5Policy::plan uses
+ * for vertex and fragment programs: RenderDemand::new, include_vertex,
+ * include_fragment and resource_flags. Mesh and compute demand is not
+ * ported (this driver refuses mesh programs). Overflow is EINVAL, where Rust
+ * returns PoolError::Geometry.
+ */
+struct demand {
+	uint32_t	counts[5];
+	uint32_t	minimum_pages, ideal_pages, pressure;
+	uint64_t	clusters, maximum, total, floor;
+	uint64_t	limited_maximum, limited_total;
+	bool		included;
+};
+
+struct fragment_params {
+	uint32_t	pressure, page_units, large_units, auxiliary_units;
+	uint32_t	primary_large, secondary_large;
+};
+
+struct tile_params {
+	uint32_t	pressure, page_units, large_units;
+	uint32_t	threadgroup_large, imageblock_large, multisample_large;
+};
+
+static uint64_t
+pages_of(uint64_t value, uint64_t size)
+{
+
+	return ((value + size - 1) / size);
+}
+
+static uint64_t
+sat_sub(uint64_t a, uint64_t b)
+{
+
+	return (a > b ? a - b : 0);
+}
+
+static int
+fragment_params(uint32_t primary_bytes, uint32_t secondary_bytes,
+    uint32_t linked_bytes, uint32_t minimum_primary_bytes,
+    uint32_t auxiliary_count, struct fragment_params *f)
+{
+	uint64_t primary, secondary, small, large, auxiliary, reserved, pressure;
+	uint64_t pl, sl;
+
+	primary = (uint64_t)primary_bytes + linked_bytes;
+	if (primary < minimum_primary_bytes)
+		primary = minimum_primary_bytes;
+	primary = primary * 32 + 0x4380;
+	secondary = (uint64_t)secondary_bytes * 32;
+	pl = pages_of(primary, 0x10000);
+	sl = pages_of(secondary, 0x10000);
+	small = pages_of(primary, 0x1000) + pages_of(secondary, 0x1000);
+	large = pl + sl;
+	auxiliary = (uint64_t)auxiliary_count * 128;
+	if (auxiliary == 0)
+		reserved = 0;
+	else {
+		reserved = (auxiliary > 0x4000 ? auxiliary : 0x4000) | 64;
+		auxiliary |= 64;
+	}
+	pressure = small * 96 + large * 10 + pages_of(auxiliary, 0x1000) * 64 +
+	    pages_of(auxiliary, 0x10000) * 5;
+	if (pressure > UINT32_MAX)
+		return (EINVAL);
+	f->pressure = pressure;
+	f->page_units = small + large;
+	f->large_units = large;
+	f->auxiliary_units = pages_of(reserved, 0x1000) +
+	    pages_of(reserved, 0x10000);
+	f->primary_large = pl;
+	f->secondary_large = sl;
+	return (0);
+}
+
+static void
+tile_params(uint32_t threadgroup, uint32_t imageblock, uint32_t multisample,
+    struct tile_params *t)
+{
+	uint64_t sizes[3] = { threadgroup, imageblock == 0 ? 0 :
+	    (uint64_t)imageblock + 64, multisample };
+	uint64_t large[3], small = 0, total = 0;
+	int i;
+
+	for (i = 0; i < 3; i++) {
+		large[i] = pages_of(sizes[i], 0x10000);
+		small += pages_of(sizes[i], 0x1000);
+		total += large[i];
+	}
+	/* preempt_formula false: factor 6 */
+	t->pressure = small * 6 + total * 6;
+	t->page_units = small + total;
+	t->large_units = total;
+	t->threadgroup_large = large[0];
+	t->imageblock_large = large[1];
+	t->multisample_large = large[2];
+}
+
+static int
+demand_flags(const uint32_t c[5], uint64_t *flags)
+{
+
+	if (c[0] > 0xff || c[1] > 0xf || c[2] > 3 || c[3] > 0xff || c[4] > 0xff)
+		return (EINVAL);
+	*flags = 0x14b | (uint64_t)c[0] << 10 | (uint64_t)c[1] << 18 |
+	    (uint64_t)c[2] << 22 | (uint64_t)c[3] << 24 | (uint64_t)c[4] << 32;
+	return (0);
+}
+
+static int
+demand_merge(struct demand *d, const uint32_t parts[5], uint64_t minimum,
+    uint64_t ideal, uint64_t pressure)
+{
+	struct demand next = *d;
+	uint64_t flags, m, i;
+	int k;
+
+	m = (minimum * d->clusters + 7) & ~7ull;
+	i = (ideal * d->clusters + 7) & ~7ull;
+	if (m > INT32_MAX || i > INT32_MAX || pressure > UINT32_MAX)
+		return (EINVAL);
+	if (next.minimum_pages < m)
+		next.minimum_pages = m;
+	if (next.ideal_pages < i)
+		next.ideal_pages = i;
+	if (next.pressure < pressure)
+		next.pressure = pressure;
+	for (k = 0; k < 5; k++)
+		if (next.counts[k] < parts[k])
+			next.counts[k] = parts[k];
+	if (demand_flags(next.counts, &flags) != 0)
+		return (EINVAL);
+	next.included = true;
+	*d = next;
+	return (0);
+}
+
+static int
+demand_new(const uint32_t *masks, unsigned clusters, uint32_t nominal,
+    uint32_t ptc_floor, struct demand *d)
+{
+	uint64_t limit, maximum = 0, total = 0, n;
+	unsigned i;
+
+	for (i = 0; i < clusters; i++) {
+		n = __builtin_popcount(masks[i]);
+		total += n;
+		if (n > maximum)
+			maximum = n;
+	}
+	if (clusters == 0 || total == 0 || ptc_floor == 0 || nominal < total)
+		return (EINVAL);
+	memset(d, 0, sizeof(*d));
+	limit = (uint64_t)nominal * 2 / clusters;
+	d->clusters = clusters;
+	d->maximum = maximum;
+	d->total = total;
+	d->floor = ptc_floor;
+	d->limited_maximum = maximum < limit ? maximum : limit;
+	d->limited_total = total < limit * clusters ? total : limit * clusters;
+	return (0);
+}
+
+static int
+demand_fragment(struct demand *d, const struct fragment_params *f,
+    const struct tile_params *t)
+{
+	uint64_t base, pressure, large, tails, ideal, minimum;
+	uint32_t parts[5] = { f->primary_large, f->secondary_large,
+	    t->threadgroup_large, t->imageblock_large, t->multisample_large };
+
+	base = d->maximum * (d->floor + 11) + 58;
+	pressure = (uint64_t)f->pressure + t->pressure;
+	large = (uint64_t)f->large_units + f->auxiliary_units + t->large_units;
+	tails = (uint64_t)parts[0] + parts[1] + parts[2] + parts[3];
+	ideal = base + t->multisample_large + tails +
+	    sat_sub(pressure, d->floor) * d->maximum + 64;
+	minimum = base + t->multisample_large + tails +
+	    (sat_sub((uint64_t)f->page_units + t->page_units, d->floor) +
+	    t->page_units) * d->maximum + large * d->total + 64;
+	return (demand_merge(d, parts, minimum, ideal, pressure));
+}
+
+static int
+demand_vertex(struct demand *d, uint32_t primary, uint32_t secondary,
+    uint32_t linked, uint32_t minimum_primary)
+{
+	struct fragment_params p;
+	uint64_t large, base, minimum, ideal;
+	uint32_t parts[5] = { 0 };
+	int error;
+
+	if ((error = fragment_params(primary, secondary, linked,
+	    minimum_primary, 0, &p)) != 0)
+		return (error);
+	large = p.large_units;
+	base = d->limited_maximum * (d->floor + 11) + 58;
+	minimum = base + large + 64 + sat_sub(p.page_units, d->floor) *
+	    d->limited_maximum + large * d->limited_total;
+	ideal = base + large + 64 + sat_sub(p.pressure, d->floor) *
+	    d->limited_maximum;
+	parts[0] = p.primary_large;
+	parts[1] = p.secondary_large;
+	return (demand_merge(d, parts, minimum, ideal, p.pressure));
+}
+
+/*
+ * render_resources.rs Programs::demands and the stage plans of
+ * M5Policy::plan (CONTEXT_FLOOR 96; priority 0 counts three resident kicks,
+ * the others four).
+ */
+int
+agx_m5_render_plan(const uint32_t *core_masks, unsigned clusters,
+    uint32_t nominal_cores, uint8_t priority,
+    const struct agx_render_program *programs, unsigned n,
+    struct agx_stage_plan stages[2])
+{
+	struct demand base, stage[2];
+	struct fragment_params empty;
+	struct tile_params no_tile, tile;
+	struct fragment_params f;
+	uint32_t active, pressure;
+	unsigned i;
+	int error;
+
+	if (priority > 3 || n == 0)
+		return (EINVAL);
+	active = priority == 0 ? 3 : 4;
+	if ((error = demand_new(core_masks, clusters, nominal_cores, 96,
+	    &base)) != 0)
+		return (error);
+	stage[0] = stage[1] = base;
+	if ((error = demand_vertex(&stage[0], 0, 0, 0, 0)) != 0 ||
+	    (error = fragment_params(0, 0, 0, 0, 0, &empty)) != 0)
+		return (error);
+	tile_params(0, 0, 0, &no_tile);
+	if ((error = demand_fragment(&stage[1], &empty, &no_tile)) != 0)
+		return (error);
+	for (i = 0; i < n; i++) {
+		const struct agx_render_program *e = &programs[i];
+
+		if (e->stage > 1 || (e->stage == 0 && (e->auxiliary_count != 0 ||
+		    e->threadgroup_bytes != 0 || e->imageblock_bytes != 0 ||
+		    e->multisample_bytes != 0)))
+			return (EINVAL);
+		if (e->stage == 0) {
+			error = demand_vertex(&stage[0], e->primary_bytes,
+			    e->secondary_bytes, e->linked_bytes,
+			    e->minimum_primary_bytes);
+		} else {
+			error = fragment_params(e->primary_bytes,
+			    e->secondary_bytes, e->linked_bytes,
+			    e->minimum_primary_bytes, e->auxiliary_count, &f);
+			tile_params(e->threadgroup_bytes, e->imageblock_bytes,
+			    e->multisample_bytes, &tile);
+			if (error == 0)
+				error = demand_fragment(&stage[1], &f, &tile);
+		}
+		if (error != 0)
+			return (error);
+	}
+	memset(stages, 0, 2 * sizeof(*stages));
+	for (i = 0; i < 2; i++) {
+		if ((error = demand_flags(stage[i].counts,
+		    &stages[i].resource_flags)) != 0)
+			return (error);
+		pressure = stage[i].pressure / active;
+		stages[i].ptc_max = pressure < 96 ? 96 : pressure > 512 ? 512 :
+		    pressure;
+	}
+	return (0);
+}

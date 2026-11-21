@@ -2351,7 +2351,7 @@ agx_put_unaligned64(uint8_t *p, uint64_t v)
  */
 static int
 agx_render_kick(struct apple_agx_softc *sc, u_int context, uint8_t generation,
-    const struct agx_render_pass *pass, uint8_t mesh_class)
+    const struct agx_render_pass *pass, const struct agx_stage_plan stages[2])
 {
 	struct agx_render *r = &sc->render;
 	const struct agx_board *board = &agx_j813_board;
@@ -2467,7 +2467,9 @@ agx_render_kick(struct apple_agx_softc *sc, u_int context, uint8_t generation,
 	a.fragment = (struct agx_render_stage){ 1, AGX_RENDER_DESC_LOW_VA +
 	    AGX_M5_RENDER_FRAGMENT_OFFSET, word, AGX_RENDER_SUPPORT_VA + 0x10,
 	    AGX_RENDER_SUPPORT_VA + 0x18 };
-	a.mesh_class = mesh_class;
+	a.has_stages = true;
+	memcpy(a.stages, stages, sizeof(a.stages));
+	a.mesh_class = 0;		/* mesh programs are refused */
 	a.usage[0] = AGX_RENDER_SUPPORT_VA + AGX_RENDER_USAGE;
 	a.usage[1] = a.usage[0] + 0x40;
 	memset(r->desc, 0, AGX_M5_RENDER_STORAGE_BYTES);
@@ -2639,16 +2641,25 @@ agx_render_retire(struct apple_agx_softc *sc, u_int timeout_ms, u_int *ms)
 
 int
 apple_agx_submit_render(device_t dev, u_int context,
-    const struct agx_render_pass *pass, uint8_t mesh_class, u_int timeout_ms)
+    const struct agx_render_pass *pass,
+    const struct agx_render_program *programs, u_int nprograms,
+    u_int timeout_ms)
 {
 	struct apple_agx_softc *sc = device_get_softc(dev);
 	struct agx_render *r = &sc->render;
 	struct agx_client_root *root;
 	struct agx_render_pass p = *pass;
+	struct agx_stage_plan stages[2];
 	u_int ms;
 	int error;
 
 	p.usc_base = AGX_CLIENT_SHADER;
+	/* render_resources.rs M5Policy: every core of every cluster. */
+	error = agx_m5_render_plan(sc->id.core_masks, sc->id.num_clusters,
+	    sc->id.num_cores * sc->id.num_clusters, AGX_RENDER_PRIORITY,
+	    programs, nprograms, stages);
+	if (error != 0)
+		return (error);
 	mtx_lock(&sc->mtx);
 	root = agx_client_root(sc, context);
 	if (!r->installed || r->failed || r->busy || root == NULL ||
@@ -2662,7 +2673,7 @@ apple_agx_submit_render(device_t dev, u_int context,
 	error = agx_render_map_client(sc, root);
 	if (error == 0)
 		error = agx_render_kick(sc, context, root->generation, &p,
-		    mesh_class);
+		    stages);
 	if (error == 0)
 		error = agx_render_retire(sc, timeout_ms == 0 ? 2000 :
 		    timeout_ms, &ms);

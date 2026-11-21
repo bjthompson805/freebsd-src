@@ -128,6 +128,19 @@ struct agx_stage_plan {
 	uint32_t	ptc_max;
 };
 
+/* drm_asahi_render_program, as render_resources.rs Programs reads it. */
+struct agx_render_program {
+	uint32_t	stage;		/* 0 vertex, 1 fragment */
+	uint32_t	primary_bytes;
+	uint32_t	secondary_bytes;
+	uint32_t	linked_bytes;
+	uint32_t	minimum_primary_bytes;
+	uint32_t	auxiliary_count;
+	uint32_t	threadgroup_bytes;
+	uint32_t	imageblock_bytes;
+	uint32_t	multisample_bytes;
+};
+
 /* fw/render.rs RenderArgs with memory.rs write_m5_commands' inputs. */
 struct agx_render_args {
 	const struct agx_board *board;
@@ -164,6 +177,10 @@ struct agx_m5_target_layout {
 	uint64_t	cluster_control[3];
 };
 
+int	agx_m5_render_plan(const uint32_t *core_masks, unsigned clusters,
+	    uint32_t nominal_cores, uint8_t priority,
+	    const struct agx_render_program *programs, unsigned n,
+	    struct agx_stage_plan stages[2]);
 int	agx_m5_render_validate(const struct agx_render_pass *p);
 int	agx_m5_target_layout(const struct agx_render_pass *p, uint32_t clusters,
 	    size_t parameter_bytes, struct agx_m5_target_layout *l);
