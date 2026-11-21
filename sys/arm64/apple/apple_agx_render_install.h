@@ -18,6 +18,8 @@
 #define AGX_RENDER_SCRATCH_VA 0x1004000000ul
 #define AGX_RENDER_DISCARD_VA 0x1005000000ul
 #define AGX_RENDER_WORK_HEAD 0x4400ul
+#define AGX_RENDER_QUEUE_STRIDE 0x80ul
+#define AGX_RENDER_PB_GENERATION 0x1ul
 #define AGX_RENDER_PRIORITY 0x1ul
 static const uint8_t agx_render_work_head[0x18] = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x03, 0x08, 0x22, 0xfc, 0xff, 0xff,
@@ -108,6 +110,13 @@ static const struct agx_queue_word agx_render_graph[] = {
 #define AGX_RENDER_TVB_BLOCK_SIZE 0x80000
 #define AGX_RENDER_TVB_STRIDE 0x88000
 #define AGX_RENDER_TVB_BLOCKS 0x4
+#define AGX_RENDER_PM_COUNTER 0x200
+#define AGX_RENDER_SCENE_TABLE 0x400
+#define AGX_RENDER_SCENE_SIZE 0x80
+#define AGX_RENDER_SCENES 0x50
+#define AGX_RENDER_SCRATCH_SLOTS 0x50
+#define AGX_RENDER_SCRATCH_STRIDE 0x40
+#define AGX_RENDER_METRIC_STRIDE 0x40
 static const struct agx_queue_word agx_render_parameter[] = {
 	{ 0x20, 0x08088000 },
 	{ 0x24, 0xfffffc22 },

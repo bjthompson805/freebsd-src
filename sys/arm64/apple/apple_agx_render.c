@@ -110,7 +110,7 @@ static uint64_t
 ids_word(struct agx_object_ids ids)
 {
 
-	return ((uint64_t)ids.predecessor << 32 | ids.current);
+	return ((uint64_t)ids.predecessor << 32 | ids.id);
 }
 
 /*
@@ -976,7 +976,7 @@ inputs_new(const struct agx_render_args *a, struct inputs *in)
 		c->stamp = stamp;
 		c->queue_index = s->qid;
 		c->ordinal = (uint32_t)a->ordinal;
-		c->key = i == 0 ? r->ta_ids.current : r->fragment_ids.current;
+		c->key = i == 0 ? r->ta_ids.id : r->fragment_ids.id;
 	}
 	in->ta.pb_slot = r->pb_slot;
 	in->ta.pb_state = r->pb_va;

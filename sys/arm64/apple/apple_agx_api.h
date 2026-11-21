@@ -49,4 +49,14 @@ int	apple_agx_submit_compute(device_t dev, u_int slot, u_int context,
 	    uint64_t cdm_va,
 	    uint64_t cdm_end, u_int timeout_ms);
 
+/*
+ * Run one render pass (struct agx_render_pass, its USC offsets relative to
+ * the queue's USC window) on the render pair in the client VM and wait for
+ * both stages to retire.
+ */
+struct agx_render_pass;
+int	apple_agx_submit_render(device_t dev, u_int context,
+	    const struct agx_render_pass *pass, uint8_t mesh_class,
+	    u_int timeout_ms);
+
 #endif /* _ARM64_APPLE_APPLE_AGX_API_H_ */

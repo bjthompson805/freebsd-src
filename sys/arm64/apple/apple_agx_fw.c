@@ -669,6 +669,28 @@ agx_queue_config_compute(uint8_t out[AGX_QUEUE_CONFIG_SIZE],
 	return (0);
 }
 
+/* fw/queue.rs QueueConfig::new for a tiling (with its binding) or fragment queue. */
+int
+agx_queue_config_render(uint8_t out[AGX_QUEUE_CONFIG_SIZE],
+    const struct agx_queue_config_args *a, bool tiling, uint64_t pb_va,
+    uint64_t pb_token, uint32_t pb_slot, uint8_t fragment_qid)
+{
+	int error;
+
+	if (tiling && fragment_qid > AGX_QID_MAX)
+		return (EINVAL);
+	if ((error = agx_queue_config_compute(out, a)) != 0)
+		return (error);
+	put16(out, 0x22, tiling ? AGX_DM_TILING : AGX_DM_FRAGMENT);
+	if (tiling) {
+		put64(out, 0x6e, pb_va);
+		put64(out, 0x76, pb_token);
+		put32(out, 0x7e, pb_slot);
+		put32(out, 0x82, fragment_qid);
+	}
+	return (0);
+}
+
 int
 agx_kick_announce(uint8_t out[AGX_KICK_ANNOUNCE_SIZE], uint8_t qid,
     uint32_t data_master, uint64_t timestamp, uint8_t priority)

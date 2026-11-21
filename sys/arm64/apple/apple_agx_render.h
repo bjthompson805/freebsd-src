@@ -79,7 +79,7 @@ struct agx_render_pass {
 /* fw/mod.rs ObjectIds */
 struct agx_object_ids {
 	uint32_t	predecessor;
-	uint32_t	current;
+	uint32_t	id;		/* ObjectIds::current */
 };
 
 /* fw/render.rs RenderResources, the fields the M5 path reads. */

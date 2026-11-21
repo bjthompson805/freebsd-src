@@ -185,6 +185,9 @@ int	agx_kick_entry(uint8_t out[AGX_KICK_ENTRY_SIZE],
 uint64_t agx_kick_dependency(uint8_t qid, uint64_t timestamp);
 int	agx_queue_config_compute(uint8_t out[AGX_QUEUE_CONFIG_SIZE],
 	    const struct agx_queue_config_args *a);
+int	agx_queue_config_render(uint8_t out[AGX_QUEUE_CONFIG_SIZE],
+	    const struct agx_queue_config_args *a, bool tiling, uint64_t pb_va,
+	    uint64_t pb_token, uint32_t pb_slot, uint8_t fragment_qid);
 int	agx_kick_announce(uint8_t out[AGX_KICK_ANNOUNCE_SIZE], uint8_t qid,
 	    uint32_t data_master, uint64_t timestamp, uint8_t priority);
 int	agx_work_slot(uint8_t out[AGX_WORK_SLOT_SIZE], uint32_t data_master,

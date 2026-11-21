@@ -45,6 +45,7 @@
 #include <arm64/apple/apple_agx_render_install.h>
 #include <arm64/apple/apple_agx_job.h>
 #include <arm64/apple/apple_agx_fw.h>
+#include <arm64/apple/apple_agx_render.h>
 #include <arm64/apple/apple_agx_api.h>
 #include <arm64/apple/apple_pmgr.h>
 #include <arm64/apple/apple_rtkit.h>
@@ -95,6 +96,7 @@
 #define	AGX_CLIENT_LOW_END	0x8000000000ul	/* AGX_M5_DATA_END */
 #define	AGX_CLIENT_SHADER	0x10000000000ul	/* AGX_M5_SHADER_BASE */
 #define	AGX_CLIENT_SHADER_END	(AGX_CLIENT_SHADER + 0x100000000ul)
+#define	AGX_COMPACT_BASE	0x1000000000ul	/* BlockGeometry::M5_COMPACT */
 
 #define	AGX_MSG_EVENTS		(0x42ull << 48)
 /* Event ring in each role's status block (fw/initdata.rs status, channels.rs). */
@@ -258,6 +260,7 @@ struct agx_qos {
 struct agx_client_root {
 	vm_paddr_t	pa;
 	uint8_t		generation;
+	bool		render_mapped;
 	bool		live;
 	bool		published;
 };
@@ -300,6 +303,55 @@ struct agx_compute_queue {
 	bool			failed;
 };
 
+/*
+ * The render pair (QIDs 0 and 1) stage 7 installs, and the one render in
+ * flight. Objects the render registers address from the M5 compact window
+ * (0x10_0000_0000) are client-private: every client root aliases them.
+ */
+#define	AGX_RENDER_COMPACT_MAX	16
+struct agx_render_object {
+	uint8_t		*kva;
+	vm_size_t	size;
+	uint64_t	va;
+	int		prot;
+};
+
+struct agx_render {
+	bool		installed;
+	bool		busy;
+	bool		failed;
+	uint8_t		*graph;
+	uint8_t		*work;
+	uint8_t		*kicks;
+	uint8_t		*parameter;
+	uint8_t		*pool_state;
+	uint8_t		*support;	/* stamps, usage */
+	uint8_t		*records;	/* configurations, announcements */
+	uint8_t		*desc;		/* TA and 3D commands */
+	uint8_t		*target;
+	uint8_t		*tpc;
+	uint8_t		*state;
+	uint8_t		*timestamps;
+	struct agx_render_object compact[AGX_RENDER_COMPACT_MAX];
+	u_int		ncompact;
+	uint64_t	ts;		/* both queues' next kick timestamp */
+	uint32_t	ordinal;
+	uint32_t	next_word;
+	uint32_t	next_id;
+	uint32_t	items_end[2];
+	uint32_t	stamp;
+	uint64_t	work_node;
+	uint64_t	pb_token;	/* buffer.rs: a token names one PB binding */
+	u_int		pb_context;
+	u_int		context;
+	uint8_t		generation;
+};
+
+struct apple_agx_softc;
+struct agx_client_root;
+static int agx_render_map_client(struct apple_agx_softc *sc,
+    struct agx_client_root *root);
+
 struct apple_agx_softc {
 	device_t		dev;
 	struct mtx		mtx;	/* both RTKits and the rings */
@@ -317,6 +369,7 @@ struct apple_agx_softc {
 	uint8_t			*job_usc;
 	uint8_t			*job_out;
 	struct agx_client_root	client_roots[AGX_VM_SLOTS];
+	struct agx_render	render;
 	struct agx_qos		qos;
 	uint8_t			*asc;
 	uint8_t			*sgx;
@@ -1561,6 +1614,9 @@ apple_agx_vm_valid(device_t dev, uint64_t va, vm_size_t size)
 
 	if (end < va || ((va | size) & AGX_UAT_PGMSK) != 0 || size == 0)
 		return (false);
+	/* The M5 compact window holds the render pair's objects. */
+	if (va < AGX_COMPACT_BASE + 0x100000000ul && end > AGX_COMPACT_BASE)
+		return (false);
 	return ((va >= AGX_CLIENT_START && end <= AGX_CLIENT_LOW_END) ||
 	    (va >= AGX_CLIENT_SHADER && end <= AGX_CLIENT_SHADER_END));
 }
@@ -1606,6 +1662,8 @@ apple_agx_vm_create(device_t dev, u_int *context)
 			device_printf(dev, "installed client context %u\n",
 			    AGX_VM_FIRST_CONTEXT + i);
 		}
+		if ((error = agx_render_map_client(sc, root)) != 0)
+			break;
 		if (++root->generation == 0)
 			root->generation = 1;
 		root->live = true;
@@ -1984,6 +2042,58 @@ agx_stage5(struct apple_agx_softc *sc, phandle_t node,
 	return (cursors[0] == AGX_Q_INSTALL_END ? 0 : ETIMEDOUT);
 }
 
+/* Record a compact-window object of the render pair, aliased into the boot root. */
+static int
+agx_render_alias(struct apple_agx_softc *sc, const char *name, uint8_t *kva,
+    vm_size_t size, uint64_t va, int prot)
+{
+	struct agx_render *r = &sc->render;
+
+	if (r->ncompact == nitems(r->compact))
+		return (ENOSPC);
+	r->compact[r->ncompact++] = (struct agx_render_object){ kva, size, va,
+	    prot };
+	return (agx_queue_alias(sc, name, kva, size, sc->uat.lower_root, va,
+	    prot));
+}
+
+static int
+agx_render_compact(struct apple_agx_softc *sc, const char *name, uint8_t **kva,
+    vm_size_t size, uint64_t va)
+{
+
+	*kva = (uint8_t *)kmem_alloc_contig(size, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, AGX_UAT_PGSZ, 0, VM_MEMATTR_WRITE_COMBINING);
+	if (*kva == NULL)
+		return (ENOMEM);
+	return (agx_render_alias(sc, name, *kva, size, va,
+	    AGX_PROT_GPU_SHARED_RW));
+}
+
+/* Alias every compact render object into a client root, once per root. */
+static int
+agx_render_map_client(struct apple_agx_softc *sc, struct agx_client_root *root)
+{
+	struct agx_render *r = &sc->render;
+	u_int i;
+	int error;
+
+	if (root->render_mapped || r->ncompact == 0)
+		return (0);
+	for (i = 0; i < r->ncompact; i++) {
+		error = agx_uat_map(&sc->uat, root->pa, r->compact[i].va,
+		    pmap_kextract((vm_offset_t)r->compact[i].kva),
+		    r->compact[i].size, r->compact[i].prot);
+		if (error != 0) {
+			device_printf(sc->dev, "render: client alias %#lx: %d\n",
+			    r->compact[i].va, error);
+			return (error);
+		}
+	}
+	root->render_mapped = true;
+	return (0);
+}
+
 static int
 agx_render_install_resources(struct apple_agx_softc *sc)
 {
@@ -2000,28 +2110,23 @@ agx_render_install_resources(struct apple_agx_softc *sc)
 	if ((error = agx_queue_object(sc, "render parameter graph", &parameter,
 	    AGX_RENDER_PARAMETER_SIZE, sc->uat.upper_root,
 	    AGX_RENDER_PARAMETER_VA, AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
-	    (error = agx_queue_alias(sc, "render parameter page list",
+	    (error = agx_render_alias(sc, "render parameter page list",
 	    parameter + AGX_RENDER_PAGE_LIST_OFFSET, AGX_RENDER_PAGE_LIST_SIZE,
-	    sc->uat.lower_root, AGX_RENDER_PAGE_LIST_VA,
-	    AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
+	    AGX_RENDER_PAGE_LIST_VA, AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
 	    (error = agx_queue_object(sc, "render metrics", &metrics, 0x8000,
 	    sc->uat.upper_root, AGX_RENDER_METRICS_FW_VA,
 	    AGX_PROT_FW_SHARED_RW)) != 0 ||
-	    (error = agx_queue_alias(sc, "render metrics", metrics, 0x8000,
-	    sc->uat.lower_root, AGX_RENDER_METRICS_VA,
-	    AGX_PROT_GPU_SHARED_RW)) != 0 ||
-	    (error = agx_queue_object(sc, "render scratch", &backing,
-	    AGX_RENDER_SCRATCH_SIZE, sc->uat.lower_root, AGX_RENDER_SCRATCH_VA,
-	    AGX_PROT_GPU_SHARED_RW)) != 0 ||
-	    (error = agx_queue_object(sc, "render discard", &backing, 0x8000,
-	    sc->uat.lower_root, AGX_RENDER_DISCARD_VA,
-	    AGX_PROT_GPU_SHARED_RW)) != 0)
+	    (error = agx_render_alias(sc, "render metrics", metrics, 0x8000,
+	    AGX_RENDER_METRICS_VA, AGX_PROT_GPU_SHARED_RW)) != 0 ||
+	    (error = agx_render_compact(sc, "render scratch", &backing,
+	    AGX_RENDER_SCRATCH_SIZE, AGX_RENDER_SCRATCH_VA)) != 0 ||
+	    (error = agx_render_compact(sc, "render discard", &backing, 0x8000,
+	    AGX_RENDER_DISCARD_VA)) != 0)
 		return (error);
 	for (i = 0; i < AGX_RENDER_TVB_BLOCKS; i++) {
-		error = agx_queue_object(sc, "render TVB block", &backing,
-		    AGX_RENDER_TVB_BLOCK_SIZE, sc->uat.lower_root,
-		    AGX_RENDER_TVB_VA + i * AGX_RENDER_TVB_STRIDE,
-		    AGX_PROT_GPU_SHARED_RW);
+		error = agx_render_compact(sc, "render TVB block", &backing,
+		    AGX_RENDER_TVB_BLOCK_SIZE,
+		    AGX_RENDER_TVB_VA + i * AGX_RENDER_TVB_STRIDE);
 		if (error != 0)
 			return (error);
 	}
@@ -2036,6 +2141,8 @@ agx_render_install_resources(struct apple_agx_softc *sc)
 	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_POOL_STATE_VA,
 	    AGX_PROT_GPU_FW_SHARED_RW)) != 0)
 		return (error);
+	sc->render.parameter = parameter;
+	sc->render.pool_state = state;
 	agx_put_words(parameter, agx_render_parameter, nitems(agx_render_parameter));
 	agx_put_words(pool, agx_render_pool, nitems(agx_render_pool));
 	agx_put_words(control, agx_render_pool_control, nitems(agx_render_pool_control));
@@ -2052,6 +2159,8 @@ agx_render_install_resources(struct apple_agx_softc *sc)
 	dsb(sy);
 	return (0);
 }
+
+static int agx_render_objects(struct apple_agx_softc *sc);
 
 /*
  * Register QIDs 0 (tiling) and 1 (fragment). This cold install publishes
@@ -2089,6 +2198,11 @@ agx_stage7(struct apple_agx_softc *sc)
 	if (error != 0)
 		return (error);
 
+	sc->render.graph = graph;
+	sc->render.work = work;
+	sc->render.kicks = kicks;
+	sc->render.context = AGX_Q_CONTEXT;
+	sc->render.pb_context = AGX_Q_CONTEXT;	/* the cold install's token 0 */
 	agx_put_words(scheduler, agx_q_sched, nitems(agx_q_sched));
 	agx_put_words(graph, agx_render_graph, nitems(agx_render_graph));
 	memcpy(work + AGX_RENDER_WORK_HEAD, agx_render_work_head,
@@ -2125,7 +2239,442 @@ agx_stage7(struct apple_agx_softc *sc)
 	device_printf(sc->dev, "render configuration: QID 0 %u/%u, "
 	    "QID 1 %u/%u after %d ms\n", ta[0], ta[producer_offset],
 	    fragment[0], fragment[producer_offset], i);
-	return (ta[0] == 1 && fragment[0] == 1 ? 0 : ETIMEDOUT);
+	if (ta[0] != 1 || fragment[0] != 1)
+		return (ETIMEDOUT);
+	sc->render.items_end[0] = sc->render.items_end[1] = 1;
+	if ((error = agx_render_objects(sc)) != 0)
+		return (error);
+	sc->render.ts = 1;			/* KickTimestamp::FIRST */
+	sc->render.next_word = AGX_WORK_FIRST_WORD;
+	sc->render.next_id = 2;
+	sc->render.installed = true;
+	return (0);
+}
+
+/* The render pair's remaining kernel objects; see struct agx_render. */
+#define	AGX_RENDER_SUPPORT_VA	(AGX_RENDER_GRAPH_VA + 0xb0000)
+#define	AGX_RENDER_RECORDS_VA	(AGX_RENDER_GRAPH_VA + 0xb4000)
+#define	AGX_RENDER_DESC_VA	(AGX_RENDER_GRAPH_VA + 0xc0000)
+#define	AGX_RENDER_DESC_LOW_VA	0x8020000000ul	/* past the free-list pool */
+#define	AGX_RENDER_TARGET_VA	0x1006000000ul
+#define	AGX_RENDER_TARGET_SIZE	0x10000
+#define	AGX_RENDER_TPC_VA	0x1006100000ul
+#define	AGX_RENDER_TPC_SIZE	0x40000
+#define	AGX_RENDER_STATE_VA	0x1006200000ul
+#define	AGX_RENDER_STATE_SIZE	0x10000	/* generation.rs Layout::m5 */
+#define	AGX_RENDER_STATE_STATUS	0x4000
+#define	AGX_RENDER_STATE_AUX	0x8000
+#define	AGX_RENDER_VIEWPORT	0x9c0	/* ContextStore stream + 0x40 */
+#define	AGX_RENDER_TIMESTAMPS_VA 0x1006300000ul
+#define	AGX_RENDER_USAGE	0x100	/* in the support page */
+#define	AGX_RENDER_TIMESTAMPS	0x200	/* in the support page */
+#define	AGX_RENDER_ANNOUNCE	0x800	/* in the records page */
+#define	AGX_RENDER_FREE_LIST_SLOT 129
+#define	AGX_RENDER_ID_PREDECESSOR 1
+
+static int
+agx_render_objects(struct apple_agx_softc *sc)
+{
+	struct agx_render *r = &sc->render;
+	int error;
+
+	if ((error = agx_queue_object(sc, "render support", &r->support,
+	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_SUPPORT_VA,
+	    AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
+	    (error = agx_queue_object(sc, "render records", &r->records,
+	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_RECORDS_VA,
+	    AGX_PROT_FW_SHARED_RW)) != 0 ||
+	    (error = agx_queue_object(sc, "render commands", &r->desc,
+	    AGX_M5_RENDER_STORAGE_BYTES, sc->uat.upper_root, AGX_RENDER_DESC_VA,
+	    AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
+	    (error = agx_queue_alias(sc, "render commands", r->desc,
+	    AGX_M5_RENDER_STORAGE_BYTES, sc->uat.lower_root,
+	    AGX_RENDER_DESC_LOW_VA, AGX_PROT_GPU_SHARED_RW)) != 0 ||
+	    (error = agx_render_compact(sc, "render target", &r->target,
+	    AGX_RENDER_TARGET_SIZE, AGX_RENDER_TARGET_VA)) != 0 ||
+	    (error = agx_render_compact(sc, "render TPC", &r->tpc,
+	    AGX_RENDER_TPC_SIZE, AGX_RENDER_TPC_VA)) != 0 ||
+	    (error = agx_render_compact(sc, "render state", &r->state,
+	    AGX_RENDER_STATE_SIZE, AGX_RENDER_STATE_VA)) != 0 ||
+	    (error = agx_render_compact(sc, "render timestamps", &r->timestamps,
+	    AGX_UAT_PGSZ, AGX_RENDER_TIMESTAMPS_VA)) != 0)
+		return (error);
+	return (0);
+}
+
+/* storage.rs Viewport::new with_control(0x3000), applied word by word. */
+static int
+agx_render_viewport(uint8_t *at, uint32_t width, uint32_t height)
+{
+	volatile uint32_t *v = (volatile uint32_t *)at;
+	uint32_t x, y, dims[2] = { width, height }, half[2];
+	int i, highest;
+
+	for (i = 0; i < 2; i++) {
+		if (dims[i] == 0)
+			return (EINVAL);
+		highest = flsl(dims[i]) - 1;
+		if (highest > 23)
+			return (EINVAL);
+		half[i] = (uint32_t)(highest + 126) << 23 |
+		    ((dims[i] << (23 - highest)) & 0x7fffff);
+	}
+	x = half[0];
+	y = half[1];
+	v[0] = 0x3000;
+	v[1] = 0x80000000u | ((width + 31) / 32 - 1);
+	v[2] = (height + 31) / 32 - 1;
+	v[4] = x;
+	v[5] = x;
+	v[6] = y;
+	v[7] = y | 0x80000000u;
+	v[9] = 0x3f800000;
+	return (0);
+}
+
+static void
+agx_put_unaligned64(uint8_t *p, uint64_t v)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		((volatile uint8_t *)p)[i] = v >> (8 * i);
+}
+
+/*
+ * One render on the pair, as queue/render.rs prepare and publish build it
+ * on the J813: the target, state and scene, the work-state node, both
+ * commands (apple_agx_render.c), a configuration, the descriptor and an
+ * announcement on each stage's item ring, both kick entries, QoS, the
+ * free-list and parameter-manager submissions, fragment then tiling on the
+ * shared work ring, and the pipe-0 doorbell. The previous render retired.
+ */
+static int
+agx_render_kick(struct apple_agx_softc *sc, u_int context, uint8_t generation,
+    const struct agx_render_pass *pass, uint8_t mesh_class)
+{
+	struct agx_render *r = &sc->render;
+	const struct agx_board *board = &agx_j813_board;
+	static const size_t cursors_off[2] = { AGX_RENDER_TA_CURSORS,
+	    AGX_RENDER_FRAGMENT_CURSORS };
+	static const size_t items_off[2] = { AGX_RENDER_TA_ITEMS,
+	    AGX_RENDER_FRAGMENT_ITEMS };
+	const u_int producer_offset = (AGX_Q_PRODUCER - AGX_Q_CURSORS) / 4;
+	struct agx_m5_target_layout layout;
+	struct agx_render_resources res;
+	struct agx_render_args a;
+	struct agx_m5_render_encoded enc;
+	struct agx_queue_config_args ca;
+	struct agx_kick_args ka;
+	uint8_t config[AGX_QUEUE_CONFIG_SIZE], announce[AGX_KICK_ANNOUNCE_SIZE];
+	uint8_t slots[2][AGX_WORK_SLOT_SIZE], node[0xc8], types[2][2];
+	volatile uint32_t *cursors[2];
+	volatile uint64_t *items;
+	uint64_t ts = r->ts, kicks[2], barrier, va, node_va, values[3];
+	uint32_t word, base[2], counter_off, scene = 1, ordinal = r->ordinal;
+	bool identity;
+	int error, s, i;
+
+	if ((error = agx_m5_target_layout(pass, 1,
+	    AGX_RENDER_TVB_BLOCKS * AGX_RENDER_TVB_BLOCK_SIZE, &layout)) != 0)
+		return (error);
+	if (layout.used > AGX_RENDER_TARGET_SIZE ||
+	    layout.slice_bytes > AGX_RENDER_TPC_SIZE)
+		return (E2BIG);
+	for (s = 0; s < 2; s++) {
+		cursors[s] = (volatile uint32_t *)(r->graph + cursors_off[s]);
+		base[s] = cursors[s][producer_offset];
+		if (cursors[s][0] != base[s] || base[s] != r->items_end[s]) {
+			device_printf(sc->dev, "render %u: stage %d cursors %u/%u\n",
+			    ordinal, s, cursors[s][0], base[s]);
+			return (EIO);
+		}
+	}
+
+	/* The target records, TPC, state generation and timestamps. */
+	memset(r->target, 0, roundup2(layout.used, AGX_UAT_PGSZ));
+	memset(r->tpc, 0, roundup2(layout.slice_bytes, AGX_UAT_PGSZ));
+	memset(r->state + AGX_RENDER_STATE_STATUS, 0, AGX_UAT_PGSZ);
+	memset(r->state + AGX_RENDER_STATE_AUX, 0, AGX_RENDER_STATE_SIZE -
+	    AGX_RENDER_STATE_AUX);
+	if ((error = agx_render_viewport(r->state + AGX_RENDER_VIEWPORT,
+	    pass->width, pass->height)) != 0)
+		return (error);
+	memset(r->support, 0, AGX_UAT_PGSZ);
+
+	/* Manager::prepare_scene */
+	*(volatile uint32_t *)(r->parameter + AGX_RENDER_SCENE_TABLE +
+	    scene * AGX_RENDER_SCENE_SIZE + 0x48) = 0;
+	agx_put_unaligned64(r->parameter + AGX_RENDER_SCENE_TABLE +
+	    scene * AGX_RENDER_SCENE_SIZE + 0x4c, AGX_RENDER_PB_GENERATION);
+	*(volatile uint32_t *)(r->parameter + 0xc) = 0;	/* State::buffer_id */
+
+	/* The work-state node, with both kicks submitted. */
+	do {
+		word = r->next_word++;
+	} while ((word & 63) == AGX_WORK_STATES);
+	node_va = AGX_RENDER_WORK_VA + (word & 63) * AGX_NODE_STRIDE;
+	counter_off = AGX_UAT_PGSZ + (word & 63) * 4;
+	memset(node, 0, sizeof(node));
+	va = AGX_RENDER_WORK_VA + counter_off;
+	memcpy(node, &va, 8);
+	memcpy(node + 8, &word, 4);
+	node[0x10] = 0x50;
+	memcpy(r->work + (word & 63) * AGX_NODE_STRIDE, node, sizeof(node));
+	*(volatile uint32_t *)(r->work + counter_off) = 0;
+	dsb(sy);
+
+	memset(&res, 0, sizeof(res));
+	res.context_id = context;
+	res.context_generation = generation;
+	res.pb_slot = 0;
+	res.free_list_slot = AGX_RENDER_FREE_LIST_SLOT;
+	res.free_list_control_va = AGX_RENDER_POOL_CONTROL_VA;
+	res.kick_record_va = node_va;
+	res.pb_va = AGX_RENDER_PARAMETER_VA;
+	res.scene_va = AGX_RENDER_PARAMETER_VA + AGX_RENDER_SCENE_TABLE +
+	    scene * AGX_RENDER_SCENE_SIZE;
+	res.scene_end_va = AGX_RENDER_PARAMETER_VA + AGX_RENDER_SCENE_TABLE +
+	    AGX_RENDER_SCENES * AGX_RENDER_SCENE_SIZE;
+	res.pm_scratch = AGX_RENDER_SCRATCH_VA - AGX_COMPACT_BASE +
+	    (scene % AGX_RENDER_SCRATCH_SLOTS) * AGX_RENDER_SCRATCH_STRIDE;
+	res.pm_metric = (AGX_RENDER_METRICS_VA - AGX_COMPACT_BASE +
+	    scene * AGX_RENDER_METRIC_STRIDE) | 1;
+	res.tilemap_va = AGX_RENDER_TARGET_VA;
+	res.layermeta_va = AGX_RENDER_TARGET_VA + layout.layer_offset;
+	res.heapmeta_va = AGX_RENDER_TARGET_VA + layout.heap_offset;
+	res.tpc_va = AGX_RENDER_TPC_VA;
+	res.tpc_size = layout.tpc_size;
+	res.deflake_va = AGX_RENDER_STATE_VA;
+	res.ta_status_va = AGX_RENDER_STATE_VA + AGX_RENDER_STATE_STATUS;
+	res.fragment_status_va = res.ta_status_va + 8;
+	res.aux_fb_va = AGX_RENDER_STATE_VA + AGX_RENDER_STATE_AUX;
+	/* The firmware writes the stage timestamps: a firmware address. */
+	res.timestamp_va = AGX_RENDER_SUPPORT_VA + AGX_RENDER_TIMESTAMPS;
+	/* ids.rs render_pair: fragment, then tiling, after the graph's id. */
+	res.fragment_ids.predecessor = res.ta_ids.predecessor =
+	    AGX_RENDER_ID_PREDECESSOR;
+	res.fragment_ids.id = r->next_id;
+	res.ta_ids.id = r->next_id + 1;
+
+	memset(&a, 0, sizeof(a));
+	a.board = board;
+	a.pass = pass;
+	a.resources = &res;
+	a.ordinal = ordinal;
+	a.ta = (struct agx_render_stage){ 0, AGX_RENDER_DESC_LOW_VA, word,
+	    AGX_RENDER_SUPPORT_VA, AGX_RENDER_SUPPORT_VA + 8 };
+	a.fragment = (struct agx_render_stage){ 1, AGX_RENDER_DESC_LOW_VA +
+	    AGX_M5_RENDER_FRAGMENT_OFFSET, word, AGX_RENDER_SUPPORT_VA + 0x10,
+	    AGX_RENDER_SUPPORT_VA + 0x18 };
+	a.mesh_class = mesh_class;
+	a.usage[0] = AGX_RENDER_SUPPORT_VA + AGX_RENDER_USAGE;
+	a.usage[1] = a.usage[0] + 0x40;
+	memset(r->desc, 0, AGX_M5_RENDER_STORAGE_BYTES);
+	if ((error = agx_m5_render_encode(r->desc, AGX_RENDER_DESC_LOW_VA, &a,
+	    &enc)) != 0 ||
+	    (error = agx_m5_render_bind_work_slot(r->desc, 0)) != 0) {
+		device_printf(sc->dev, "render %u: encode: %d\n", ordinal, error);
+		return (error);
+	}
+	kicks[0] = kicks[1] = ts;
+	/* context/identity.rs payload: the channel's pass count. */
+	agx_m5_render_link_completions(r->desc, kicks, (uint8_t)(ordinal + 1),
+	    false);
+	dsb(sy);
+
+	/* Each stage: configuration, descriptor, announcement. */
+	identity = context != r->context || generation != r->generation;
+	/*
+	 * buffer.rs acquire_owner_bound: the firmware refuses to rebind a
+	 * token to another context's PB state; a moved binding takes a fresh one.
+	 */
+	if (context != r->pb_context) {
+		r->pb_token++;
+		r->pb_context = context;
+	}
+	for (s = 0; s < 2; s++) {
+		memset(&ca, 0, sizeof(ca));
+		ca.kick_ring_va = AGX_RENDER_KICK_LOW_VA + s * AGX_Q_KICK_SIZE;
+		ca.kick_ring_fw_va = AGX_RENDER_KICK_HIGH_VA + s * AGX_Q_KICK_SIZE;
+		ca.qid = s;
+		ca.context_id = context;
+		ca.free_list_va = AGX_RENDER_POOL_CONTROL_VA;
+		ca.free_list_generation = 1;
+		ca.free_list_slot = AGX_RENDER_FREE_LIST_SLOT;
+		ca.scheduler_va = AGX_RENDER_SCHED_VA;
+		ca.priority = AGX_RENDER_PRIORITY;
+		ca.policy = AGX_Q_POLICY;
+		ca.qos_slot = 0;
+		ca.qos_update = identity;
+		ca.owner_pid = 1;
+		ca.context_update = identity;
+		if ((error = agx_queue_config_render(config, &ca, s == 0,
+		    AGX_RENDER_PARAMETER_VA, r->pb_token, 0, 1)) != 0 ||
+		    (error = agx_kick_announce(announce, s, s == 0 ?
+		    AGX_DM_TILING : AGX_DM_FRAGMENT, ts,
+		    AGX_RENDER_PRIORITY)) != 0)
+			return (error);
+		values[0] = agx_queue_record(r->records, AGX_RENDER_RECORDS_VA,
+		    s * 0x100, 0x100, config, sizeof(config));
+		values[1] = AGX_RENDER_DESC_VA + s * AGX_M5_RENDER_FRAGMENT_OFFSET;
+		values[2] = agx_queue_record(r->records, AGX_RENDER_RECORDS_VA,
+		    AGX_RENDER_ANNOUNCE + s * 0x80, 0x80, announce,
+		    sizeof(announce));
+		items = (volatile uint64_t *)(r->graph + items_off[s]);
+		for (i = 0; i < 3; i++)
+			items[(base[s] + i) % AGX_Q_ITEM_ENTRIES] = values[i];
+		r->items_end[s] = (base[s] + 3) % AGX_Q_ITEM_ENTRIES;
+	}
+
+	/* Kick entries: the fragment kick waits for its own tiling kick. */
+	barrier = agx_kick_dependency(0, ts);
+	types[0][0] = 1;
+	types[1][0] = 1;
+	types[1][1] = 3;
+	for (s = 1; s >= 0; s--) {
+		memset(&ka, 0, sizeof(ka));
+		ka.qid = s;
+		ka.timestamp = ts;
+		ka.parent = ts - 1;
+		ka.barriers = s == 1 ? &barrier : NULL;
+		ka.nbarriers = s == 1;
+		ka.dependency_types = types[s];
+		ka.descriptor_va = AGX_RENDER_DESC_VA +
+		    s * AGX_M5_RENDER_FRAGMENT_OFFSET;
+		ka.queue_va = AGX_RENDER_GRAPH_VA + s * AGX_RENDER_QUEUE_STRIDE;
+		ka.qos_slot = 0;
+		ka.qos_class = s == 0 ? AGX_TA_QOS_CLASS : AGX_FRAGMENT_QOS_CLASS;
+		memcpy(ka.register_arrays, enc.rce[s], sizeof(ka.register_arrays));
+		ka.scs_enabled = enc.scratch[s];
+		ka.compute_matrix = enc.matrix[s];
+		ka.priority = AGX_RENDER_PRIORITY;
+		if ((error = agx_kick_entry(r->kicks + s * AGX_Q_KICK_SIZE +
+		    (ts & 0xff) * AGX_KICK_ENTRY_SIZE, &ka)) != 0)
+			return (error);
+	}
+	dsb(sy);
+	if (ordinal == 0)
+		agx_uat_tlbi_all();
+
+	if ((error = agx_qos_publish(sc, 1, 0, AGX_DM_FRAGMENT,
+	    AGX_RENDER_SCHED_VA, AGX_Q_QOS_CLASS, AGX_Q_QOS_SHARE)) != 0 ||
+	    (error = agx_qos_publish(sc, 0, 0, AGX_DM_TILING,
+	    AGX_RENDER_SCHED_VA, AGX_Q_QOS_CLASS, AGX_Q_QOS_SHARE)) != 0)
+		return (error);
+	/* initdata.rs m5_work_pair: the shared ring's slots name compute. */
+	if ((error = agx_work_slot(slots[0], AGX_DM_COMPUTE,
+	    AGX_RENDER_GRAPH_VA + AGX_RENDER_QUEUE_STRIDE, 1, r->items_end[1],
+	    false)) != 0 ||
+	    (error = agx_work_slot(slots[1], AGX_DM_COMPUTE, AGX_RENDER_GRAPH_VA,
+	    0, r->items_end[0], false)) != 0)
+		return (error);
+	/* add_submitted_kicks(2), the free-list and manager submissions. */
+	*(volatile uint32_t *)(r->work + counter_off) = 2;
+	*(volatile uint64_t *)r->pool_state += 2;
+	(*(volatile uint32_t *)(r->parameter + AGX_RENDER_PM_COUNTER))++;
+	dsb(sy);
+	cursors[1][producer_offset] = r->items_end[1];
+	cursors[0][producer_offset] = r->items_end[0];
+	dsb(sy);
+	if ((error = agx_publish_work_slots(sc, slots[0], slots[1])) != 0)
+		return (error);
+	r->stamp = agx_stamp_value(ordinal + 1);
+	r->context = context;
+	r->generation = generation;
+	r->ts = ts + 1;
+	r->next_id += 2;
+	r->ordinal = ordinal + 1;
+	r->work_node = node_va;
+	return (apple_rtkit_send(sc->roles[0].rtk, AGX_EP_DOORBELL,
+	    AGX_MSG_WORK_NOTIFY | AGX_RENDER_PRIORITY << 2));
+}
+
+/* Retirement of the last render: both stamps, both item rings, the node. */
+static int
+agx_render_retire(struct apple_agx_softc *sc, u_int timeout_ms, u_int *ms)
+{
+	struct agx_render *r = &sc->render;
+	volatile uint32_t *stamps = (volatile uint32_t *)r->support;
+	volatile uint32_t *ta = (volatile uint32_t *)(r->graph +
+	    AGX_RENDER_TA_CURSORS);
+	volatile uint32_t *fragment = (volatile uint32_t *)(r->graph +
+	    AGX_RENDER_FRAGMENT_CURSORS);
+	volatile uint32_t *node = (volatile uint32_t *)(r->work +
+	    (r->work_node - AGX_RENDER_WORK_VA));
+	volatile uint32_t *status = (volatile uint32_t *)(r->state +
+	    AGX_RENDER_STATE_STATUS);
+	u_int i;
+	bool done = false;
+
+	for (i = 0; i <= timeout_ms; i++) {
+		if (sc->roles[0].irq_tag == NULL)
+			agx_poll_both(sc);
+		if (apple_rtkit_crashed(sc->roles[0].rtk) ||
+		    apple_rtkit_crashed(sc->roles[1].rtk))
+			break;
+		dsb(sy);
+		done = agx_stamp_covers(stamps[0], r->stamp) &&
+		    agx_stamp_covers(stamps[4], r->stamp) &&
+		    ta[0] == r->items_end[0] && fragment[0] == r->items_end[1] &&
+		    node[AGX_Q_NODE_COMPLETED / 4] >= 2;
+		if (done)
+			break;
+		DELAY(1000);
+	}
+	*ms = i;
+	device_printf(sc->dev, "render %u: %s after %u ms: stamps TA %#x 3D %#x "
+	    "(want %#x), consumers %u/%u %u/%u, node completed %u, status "
+	    "%#x %#x, usage %#x %#x\n", r->ordinal - 1,
+	    done ? "retired" : "not retired", i, stamps[0], stamps[4], r->stamp,
+	    ta[0], r->items_end[0], fragment[0], r->items_end[1],
+	    node[AGX_Q_NODE_COMPLETED / 4], status[0], status[2],
+	    ((volatile uint32_t *)(r->support + AGX_RENDER_USAGE))[0],
+	    ((volatile uint32_t *)(r->support + AGX_RENDER_USAGE))[16]);
+	if (!done)
+		return (apple_rtkit_crashed(sc->roles[0].rtk) ? EIO : ETIMEDOUT);
+	agx_qos_complete(sc, 1, 0, AGX_DM_FRAGMENT);
+	return (agx_qos_complete(sc, 0, 0, AGX_DM_TILING));
+}
+
+int
+apple_agx_submit_render(device_t dev, u_int context,
+    const struct agx_render_pass *pass, uint8_t mesh_class, u_int timeout_ms)
+{
+	struct apple_agx_softc *sc = device_get_softc(dev);
+	struct agx_render *r = &sc->render;
+	struct agx_client_root *root;
+	struct agx_render_pass p = *pass;
+	u_int ms;
+	int error;
+
+	p.usc_base = AGX_CLIENT_SHADER;
+	mtx_lock(&sc->mtx);
+	root = agx_client_root(sc, context);
+	if (!r->installed || r->failed || r->busy || root == NULL ||
+	    !root->live) {
+		error = !r->installed ? ENODEV : r->failed ? EIO :
+		    r->busy ? EBUSY : ENOENT;
+		mtx_unlock(&sc->mtx);
+		return (error);
+	}
+	r->busy = true;
+	error = agx_render_map_client(sc, root);
+	if (error == 0)
+		error = agx_render_kick(sc, context, root->generation, &p,
+		    mesh_class);
+	if (error == 0)
+		error = agx_render_retire(sc, timeout_ms == 0 ? 2000 :
+		    timeout_ms, &ms);
+	/* A render that may still run keeps the pair. */
+	r->failed = error != 0 && r->ordinal != 0 && error != EINVAL &&
+	    error != E2BIG && error != EOPNOTSUPP;
+	r->busy = false;
+	mtx_unlock(&sc->mtx);
+	if (error != 0)
+		device_printf(sc->dev, "submit: render %ux%u: %d\n", pass->width,
+		    pass->height, error);
+	return (error);
 }
 
 /*
