@@ -43,6 +43,7 @@
 #include <dev/ofw/ofw_subr.h>
 
 #include <arm64/apple/apple_dart.h>
+#include <arm64/apple/apple_pmgr.h>
 
 #define	DART_PARAMS3			0x08
 #define	DART_PARAMS3_VA_WIDTH(r)	(((r) >> 16) & 0x3f)
@@ -535,25 +536,42 @@ apple_dart_error_intr(void *arg)
 	(void)bus_read_4(sc->mem, DART_V2_EXCEPTION(0));
 }
 
-/* Only claim the native MTP DART on T8142. */
+/* Match DARTs used by the native MTP and USB drivers. */
 static int
 apple_dart_irq_probe(device_t dev)
 {
 	phandle_t dart, node;
-	pcell_t ref[2];
+	pcell_t *refs;
+	int i, n;
+	bool mtp, usb;
 
 	if (!ofw_bus_status_okay(dev) ||
 	    !ofw_bus_is_compatible(dev, "apple,t8142-dart"))
 		return (ENXIO);
 	dart = ofw_bus_get_node(dev);
 	for (node = OF_child(OF_parent(dart)); node != 0; node = OF_peer(node)) {
-		if (ofw_bus_node_status_okay(node) &&
-		    ofw_bus_node_is_compatible(node, "apple,t8142-mtp") &&
-		    OF_getencprop(node, "iommus", ref, sizeof(ref)) ==
-		    sizeof(ref) && OF_node_from_xref(ref[0]) == dart) {
-			device_set_desc(dev, "Apple MTP DART error interrupt");
-			return (BUS_PROBE_DEFAULT);
-		}
+		if (!ofw_bus_node_status_okay(node))
+			continue;
+		mtp = ofw_bus_node_is_compatible(node, "apple,t8142-mtp");
+		usb = ofw_bus_node_is_compatible(node, "apple,t8142-dwc3");
+		if (!mtp && !usb)
+			continue;
+		/* USB DART registers require their port's PMGR domain. */
+		if (usb && OF_getproplen(dart, "power-domains") <= 0)
+			continue;
+		n = OF_getencprop_alloc_multi(node, "iommus", sizeof(*refs),
+		    (void **)&refs);
+		if (n <= 0)
+			continue;
+		for (i = 0; i + 1 < n; i += 2)
+			if (OF_node_from_xref(refs[i]) == dart)
+				break;
+		OF_prop_free(refs);
+		if (i + 1 >= n)
+			continue;
+		device_set_desc(dev, mtp ? "Apple MTP DART error interrupt" :
+		    "Apple USB DART error interrupt");
+		return (BUS_PROBE_DEFAULT);
 	}
 	return (ENXIO);
 }
@@ -567,6 +585,9 @@ apple_dart_irq_attach(device_t dev)
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
+	error = apple_pmgr_power_on(dev);
+	if (error != 0)
+		return (error);
 	rid = 0;
 	sc->mem = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid, RF_ACTIVE);
 	if (sc->mem == NULL)
@@ -581,7 +602,8 @@ apple_dart_irq_attach(device_t dev)
 		goto fail_mem;
 
 	rid = 0;
-	sc->irq = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid, RF_ACTIVE);
+	sc->irq = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
+	    RF_ACTIVE | RF_SHAREABLE);
 	if (sc->irq == NULL)
 		goto fail_mem;
 	error = bus_setup_intr(dev, sc->irq, INTR_TYPE_MISC | INTR_MPSAFE,
@@ -599,6 +621,9 @@ apple_dart_irq_attach(device_t dev)
 		    UINT32_MAX >> (32 - remaining));
 	}
 	bus_write_4(sc->mem, DART_V24_ERROR_ENABLE, UINT32_MAX);
+	if (bootverbose)
+		device_printf(dev, "enabled fault interrupts for %u streams\n",
+		    sc->nsids);
 	return (0);
 
 fail_mem:
