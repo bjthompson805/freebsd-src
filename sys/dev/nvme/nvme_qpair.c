@@ -345,20 +345,25 @@ nvme_qpair_apple_submit(struct nvme_qpair *qpair, struct nvme_tracker *tr)
 	struct nvme_controller *ctrlr = qpair->ctrlr;
 	struct nvme_command *cmd = &tr->req->cmd;
 	struct nvme_apple_tcb *tcb;
+	struct nvme_command *sqe = &qpair->cmd[tr->cid];
 
 	tcb = &ctrlr->apple_tcb[qpair->id != 0][tr->cid];
 	memset(tcb, 0, sizeof(*tcb));
 	tcb->command_id = tr->cid;
 	tcb->length = htole16(le32toh(cmd->cdw12) & 0xffff);
-	tcb->prp1 = cmd->prp1;
-	tcb->prp2 = cmd->prp2;
 	if (cmd->prp1 == 0)
 		tcb->dma_flags = 0;
 	else if (cmd->opc & 1)
 		tcb->dma_flags = NVME_APPLE_TCB_DMA_TO_DEVICE;
 	else
 		tcb->dma_flags = NVME_APPLE_TCB_DMA_FROM_DEVICE;
-	memcpy(&qpair->cmd[tr->cid], cmd, sizeof(*cmd));
+	memcpy(sqe, cmd, sizeof(*cmd));
+	/* M5 firmware validates Flush PRPs even though Flush has no payload. */
+	if (ctrlr->apple_flush_bus != 0 && qpair->id != 0 &&
+	    cmd->opc == NVME_OPC_FLUSH && cmd->prp1 == 0 && cmd->prp2 == 0)
+		sqe->prp1 = sqe->prp2 = htole64(ctrlr->apple_flush_bus);
+	tcb->prp1 = sqe->prp1;
+	tcb->prp2 = sqe->prp2;
 
 	bus_dmamap_sync(qpair->dma_tag, qpair->queuemem_map,
 	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);

@@ -325,6 +325,7 @@ struct nvme_controller {
 	struct resource		*apple_nvmmu;	/* NVMMU + linear SQ doorbells */
 	struct nvme_apple_tcb	*apple_tcb[2];	/* admin, I/O: indexed by cid */
 	uint64_t		apple_tcb_bus[2];
+	uint64_t		apple_flush_bus;	/* scratch PRP, if required */
 
 	struct nvme_qpair	adminq;
 	struct nvme_qpair	*ioq;

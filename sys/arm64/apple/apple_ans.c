@@ -50,6 +50,7 @@
 /* NVMe vendor registers */
 #define	ANS_BOOT_STATUS			0x1300
 #define	ANS_BOOT_STATUS_OK		0xde71ce55
+#define	ANS_FLUSH_PAGE_SIZE		16384
 
 struct apple_ans_softc {
 	struct nvme_controller	ctrlr;		/* must be first: DEVICE2SOFTC */
@@ -142,7 +143,7 @@ ans_poll(void *arg)
 static void
 ans_dma_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 {
-	if (error == 0)
+	if (error == 0 && nseg == 1)
 		*(bus_addr_t *)arg = segs[0].ds_addr;
 }
 
@@ -164,7 +165,9 @@ apple_ans_attach(device_t dev)
 	struct nvme_controller *ctrlr = &sc->ctrlr;
 	const size_t tcbsz = NVME_APPLE_QUEUE_ENTRIES *
 	    sizeof(struct nvme_apple_tcb);
-	bus_addr_t tcb_pa;
+	bus_addr_t tcb_pa = 0;
+	size_t dma_align, dma_size;
+	bool flush_prps;
 	int error, i, rid;
 
 	sc->dev = dev;
@@ -189,19 +192,33 @@ apple_ans_attach(device_t dev)
 	    ans_map_phandle(dev, "apple,sart", &sc->sart, &sc->sart_size) != 0)
 		return (ENXIO);
 
-	/* Both queues' TCB arrays, programmed before the controller is up. */
-	error = bus_dma_tag_create(bus_get_dma_tag(dev), PAGE_SIZE, 0,
-	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL, 2 * tcbsz, 1,
-	    2 * tcbsz, 0, NULL, NULL, &sc->tcb_tag);
+	/* Both TCB arrays, followed by an M5 Flush scratch page. */
+	flush_prps = ofw_bus_is_compatible(dev, "apple,t8142-nvme-ans2");
+	dma_align = PAGE_SIZE;
+	dma_size = 2 * tcbsz;
+	if (flush_prps) {
+		dma_align = MAX(dma_align, ANS_FLUSH_PAGE_SIZE);
+		dma_size = roundup2(dma_size, dma_align) + dma_align;
+	}
+	error = bus_dma_tag_create(bus_get_dma_tag(dev), dma_align, 0,
+	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL, dma_size, 1,
+	    dma_size, 0, NULL, NULL, &sc->tcb_tag);
 	if (error == 0)
 		error = bus_dmamem_alloc(sc->tcb_tag, &sc->tcb_va,
 		    BUS_DMA_COHERENT | BUS_DMA_ZERO | BUS_DMA_WAITOK,
 		    &sc->tcb_map);
 	if (error == 0)
 		error = bus_dmamap_load(sc->tcb_tag, sc->tcb_map, sc->tcb_va,
-		    2 * tcbsz, ans_dma_cb, &tcb_pa, BUS_DMA_NOWAIT);
+		    dma_size, ans_dma_cb, &tcb_pa, BUS_DMA_NOWAIT);
+	if (error == 0 && tcb_pa == 0)
+		error = EFAULT;
 	if (error != 0) {
-		device_printf(dev, "can't allocate NVMMU TCBs: %d\n", error);
+		device_printf(dev, "can't allocate NVMMU DMA memory: %d\n",
+		    error);
+		if (sc->tcb_va != NULL)
+			bus_dmamem_free(sc->tcb_tag, sc->tcb_va, sc->tcb_map);
+		if (sc->tcb_tag != NULL)
+			bus_dma_tag_destroy(sc->tcb_tag);
 		return (error);
 	}
 	for (i = 0; i < 2; i++) {
@@ -209,6 +226,9 @@ apple_ans_attach(device_t dev)
 		    ((char *)sc->tcb_va + i * tcbsz);
 		ctrlr->apple_tcb_bus[i] = tcb_pa + i * tcbsz;
 	}
+
+	if (flush_prps)
+		ctrlr->apple_flush_bus = tcb_pa + dma_size - dma_align;
 
 	if (bootverbose)
 		device_printf(dev, "CPU_CONTROL %#x BOOT_STATUS %#x CC %#x "
