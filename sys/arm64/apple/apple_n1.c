@@ -3653,25 +3653,6 @@ n1_bt_start(struct n1_softc *sc)
 static int n1_boot = 1;
 TUNABLE_INT("hw.apple_n1.boot", &n1_boot);
 
-/*
- * hw.apple_n1.gp1c=1: replay the SMC gP1c sequence macOS writes before the
- * ROM doorbell, after our post-ROM port cycle (bring-up: alpha stage 0).
- */
-static int n1_gp1c = 1;
-TUNABLE_INT("hw.apple_n1.gp1c", &n1_gp1c);
-
-static void
-n1_smc_gp1c(struct n1_softc *sc)
-{
-	static const uint32_t seq[] = { 0x10001, 0x10001, 0x10000 };
-	int error = 0, i;
-
-	for (i = 0; error == 0 && i < nitems(seq); i++)
-		error = apple_smc_write_u32(0x67503163, seq[i]);
-	if (error != 0)
-		device_printf(sc->dev, "SMC gP1c sequence: %d\n", error);
-}
-
 /* hw.apple_n1.repower=1: power-cycle the N1 right before the ROM boot */
 static int n1_repower = 0;
 TUNABLE_INT("hw.apple_n1.repower", &n1_repower);
@@ -3688,8 +3669,6 @@ n1_boot_task(void *arg, int pending __unused)
 		device_t *kids;
 		int i, n;
 
-		if (n1_gp1c)
-			n1_smc_gp1c(sc);
 		BUS_RESCAN(device_get_parent(sc->dev));
 		n1_start_ipc(sc);
 		if (device_get_children(device_get_parent(sc->dev), &kids,
