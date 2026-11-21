@@ -22,12 +22,14 @@
 #include <sys/malloc.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
+#include <sys/mutex.h>
 #include <sys/rman.h>
 #include <sys/sx.h>
 #include <sys/time.h>
 
 #include <vm/vm.h>
 #include <vm/vm_param.h>
+#include <vm/vm_page.h>
 #include <vm/vm_dumpset.h>
 #include <vm/vm_extern.h>
 #include <vm/pmap.h>
@@ -81,12 +83,17 @@
 #define	DART_PTES		2048
 #define	DART_IOVA_BITS		42
 
+#define	DART_PTE_NO_READ	(1ul << 3)
+#define	DART_PTE_NO_WRITE	(1ul << 2)
+#define	DART_PTE_NO_CACHE	(1ul << 1)
 #define	DART_PTE_VALID		(1ul << 0)
 #define	DART_PTE_SP_END		(0xffful << 40)
 #define	DART_PTE_PA(pa)		(((pa) >> 4) & 0x3ffffffc00ul)
 
 #define	DART_RD4(va, o)		(*(volatile uint32_t *)((va) + (o)))
 #define	DART_WR4(va, o, v)	(*(volatile uint32_t *)((va) + (o)) = (v))
+
+static MALLOC_DEFINE(M_APPLEDART, "apple_dart", "Apple DART domains");
 
 static struct sx apple_dart_lock;
 SX_SYSINIT(apple_dart_lock, &apple_dart_lock, "apple_dart");
@@ -530,6 +537,327 @@ apple_dart_pci_stream(phandle_t host, u_int rid, phandle_t *dart, u_int *sid)
 		break;
 	}
 	OF_prop_free(map);
+	return (error);
+}
+
+struct apple_dart_stream {
+	vm_offset_t va;
+	bus_size_t size;
+	u_int sid;
+};
+
+struct apple_dart_domain {
+	device_t dev;
+	struct mtx lock;
+	uint64_t *root;
+	struct apple_dart_stream streams[2];
+	bool failed;
+};
+
+static uint64_t *
+apple_dart_domain_table(int flags)
+{
+	vm_page_t m;
+	vm_paddr_t pa;
+	uint64_t *table;
+
+	m = vm_page_alloc_noobj(flags | VM_ALLOC_WIRED | VM_ALLOC_ZERO);
+	if (m == NULL)
+		return (NULL);
+	if ((m->flags & PG_ZERO) == 0)
+		pmap_zero_page(m);
+	pa = VM_PAGE_TO_PHYS(m);
+	if ((DART_PTE_PA(pa) << 4) != pa) {
+		vm_page_unwire_noq(m);
+		vm_page_free(m);
+		return (NULL);
+	}
+	table = (uint64_t *)PHYS_TO_DMAP(pa);
+	cpu_dcache_wb_range(table, DART_PAGE_SIZE);
+	dsb(sy);
+	return (table);
+}
+
+static uint64_t *
+apple_dart_domain_leaf(struct apple_dart_domain *domain, vm_offset_t iova,
+    bool alloc)
+{
+	uint64_t *table, *pte, *next;
+	int shift;
+
+	mtx_assert(&domain->lock, MA_OWNED);
+	table = domain->root;
+	for (shift = 36; shift > DART_PAGE_SHIFT; shift -= 11) {
+		pte = &table[(iova >> shift) & (DART_PTES - 1)];
+		if ((*pte & DART_PTE_VALID) == 0) {
+			if (!alloc)
+				return (NULL);
+			next = apple_dart_domain_table(0);
+			if (next == NULL)
+				return (NULL);
+			*pte = DART_PTE_PA(DMAP_TO_PHYS((vm_offset_t)next)) |
+			    DART_PTE_VALID;
+			cpu_dcache_wb_range(pte, sizeof(*pte));
+		}
+		table = (uint64_t *)PHYS_TO_DMAP((*pte & 0x3ffffffc00ul) << 4);
+	}
+	return (&table[(iova >> DART_PAGE_SHIFT) & (DART_PTES - 1)]);
+}
+
+static void
+apple_dart_domain_free_table(uint64_t *table, int level)
+{
+	vm_page_t m;
+	u_int i;
+
+	if (level < 3) {
+		for (i = 0; i < DART_PTES; i++) {
+			if ((table[i] & DART_PTE_VALID) != 0)
+				apple_dart_domain_free_table(
+				    (uint64_t *)PHYS_TO_DMAP(
+				    (table[i] & 0x3ffffffc00ul) << 4),
+				    level + 1);
+		}
+	}
+	m = PHYS_TO_VM_PAGE(DMAP_TO_PHYS((vm_offset_t)table));
+	vm_page_unwire_noq(m);
+	vm_page_free(m);
+}
+
+static void
+apple_dart_domain_disable(struct apple_dart_domain *domain)
+{
+	struct apple_dart_stream *stream;
+	u_int i, reg;
+	uint32_t bit;
+
+	for (i = 0; i < nitems(domain->streams); i++) {
+		stream = &domain->streams[i];
+		reg = DART_T8110_ENABLE_STREAMS + 4 * (stream->sid / 32);
+		bit = 1u << (stream->sid % 32);
+		DART_WR4(stream->va, reg, DART_RD4(stream->va, reg) & ~bit);
+		if ((DART_RD4(stream->va, reg) & bit) != 0)
+			panic("cannot disable DART stream %u", stream->sid);
+		DART_WR4(stream->va, DART_T8110_TCR(stream->sid), 0);
+		DART_WR4(stream->va, DART_T8110_TTBR(stream->sid), 0);
+	}
+	dsb(sy);
+}
+
+static int
+apple_dart_domain_flush(struct apple_dart_domain *domain)
+{
+	struct apple_dart_stream *stream;
+	u_int i;
+	int error;
+
+	for (i = 0; i < nitems(domain->streams); i++) {
+		stream = &domain->streams[i];
+		error = apple_dart_tlb_flush(domain->dev, stream->va, stream->sid);
+		if (error != 0) {
+			apple_dart_domain_disable(domain);
+			domain->failed = true;
+			return (error);
+		}
+	}
+	return (0);
+}
+
+/* The requester and both DARTs must be powered, with requester DMA stopped. */
+int
+apple_dart_domain_create(device_t dev, struct apple_dart_domain **result)
+{
+	struct apple_dart_domain *domain;
+	struct apple_dart_stream *stream;
+	phandle_t dart, node;
+	pcell_t refs[4];
+	bus_addr_t pa;
+	uint32_t ttbr, tcr;
+	u_int i, reg;
+	int error;
+
+	if (PAGE_SIZE != DART_PAGE_SIZE ||
+	    !ofw_bus_is_compatible(dev, "apple,t8142-dwc3"))
+		return (ENXIO);
+	node = ofw_bus_get_node(dev);
+	if (OF_getproplen(node, "iommus") != sizeof(refs) ||
+	    OF_getencprop(node, "iommus", refs, sizeof(refs)) != sizeof(refs) ||
+	    refs[0] == refs[2])
+		return (EINVAL);
+
+	domain = malloc(sizeof(*domain), M_APPLEDART, M_WAITOK | M_ZERO);
+	domain->dev = dev;
+	domain->root = apple_dart_domain_table(VM_ALLOC_WAITOK);
+	if (domain->root == NULL) {
+		free(domain, M_APPLEDART);
+		return (ENOMEM);
+	}
+	mtx_init(&domain->lock, "Apple DART domain", NULL, MTX_DEF);
+	error = ENXIO;
+	for (i = 0; i < nitems(domain->streams); i++) {
+		stream = &domain->streams[i];
+		dart = OF_node_from_xref(refs[2 * i]);
+		stream->sid = refs[2 * i + 1];
+		if (!ofw_bus_node_status_okay(dart) ||
+		    !ofw_bus_node_is_compatible(dart, "apple,t8142-dart") ||
+		    stream->sid >= DART_T8110_MAX_SID ||
+		    ofw_reg_to_paddr(dart, 0, &pa, &stream->size, NULL) != 0 ||
+		    stream->size < DART_T8110_TTBR(stream->sid) + 4)
+			goto fail;
+		stream->va = (vm_offset_t)pmap_mapdev(pa, stream->size);
+		if (DART_PARAMS3_VERSION(DART_RD4(stream->va, DART_PARAMS3)) != 0x0204 ||
+		    DART_PARAMS3_VA_WIDTH(DART_RD4(stream->va, DART_PARAMS3)) <
+		    DART_IOVA_BITS || stream->sid >= DART_PARAMS4_NUM_SIDS(
+		    DART_RD4(stream->va, DART_PARAMS4)) ||
+		    (DART_RD4(stream->va, DART_T8110_PROTECT) &
+		    DART_T8110_PROTECT_TTBR_TCR) != 0)
+			goto fail;
+	}
+
+	apple_dart_domain_disable(domain);
+	ttbr = (DMAP_TO_PHYS((vm_offset_t)domain->root) >> DART_PAGE_SHIFT) << 2 |
+	    DART_T8110_TTBR_VALID;
+	for (i = 0; i < nitems(domain->streams); i++) {
+		stream = &domain->streams[i];
+		DART_WR4(stream->va, DART_T8110_TTBR(stream->sid), ttbr);
+	}
+	error = apple_dart_domain_flush(domain);
+	if (error != 0)
+		goto fail;
+	tcr = DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL;
+	for (i = 0; i < nitems(domain->streams); i++) {
+		stream = &domain->streams[i];
+		reg = DART_T8110_ENABLE_STREAMS + 4 * (stream->sid / 32);
+		DART_WR4(stream->va, DART_T8110_TCR(stream->sid), tcr);
+		DART_WR4(stream->va, reg,
+		    DART_RD4(stream->va, reg) | (1u << (stream->sid % 32)));
+		if (DART_RD4(stream->va, DART_T8110_TCR(stream->sid)) != tcr ||
+		    (DART_RD4(stream->va, reg) & (1u << (stream->sid % 32))) == 0) {
+			apple_dart_domain_disable(domain);
+			error = EIO;
+			goto fail;
+		}
+	}
+	*result = domain;
+	return (0);
+
+fail:
+	for (i = 0; i < nitems(domain->streams); i++) {
+		stream = &domain->streams[i];
+		if (stream->va != 0)
+			pmap_unmapdev((void *)stream->va, stream->size);
+	}
+	apple_dart_domain_free_table(domain->root, 1);
+	mtx_destroy(&domain->lock);
+	free(domain, M_APPLEDART);
+	return (error);
+}
+
+void
+apple_dart_domain_destroy(struct apple_dart_domain *domain)
+{
+	u_int i;
+
+	/* The requester must be stopped and its DMA maps unloaded. */
+	apple_dart_domain_disable(domain);
+	for (i = 0; i < nitems(domain->streams); i++)
+		pmap_unmapdev((void *)domain->streams[i].va, domain->streams[i].size);
+	apple_dart_domain_free_table(domain->root, 1);
+	mtx_destroy(&domain->lock);
+	free(domain, M_APPLEDART);
+}
+
+static bool
+apple_dart_domain_range_valid(vm_offset_t iova, bus_size_t size)
+{
+	const uint64_t limit = 1ull << DART_IOVA_BITS;
+
+	return (size != 0 && ((iova | size) & (DART_PAGE_SIZE - 1)) == 0 &&
+	    iova < limit && size <= limit - iova);
+}
+
+int
+apple_dart_domain_map(struct apple_dart_domain *domain, vm_offset_t iova,
+    vm_page_t *pages, bus_size_t size, vm_prot_t prot)
+{
+	bus_size_t offset;
+	vm_paddr_t pa;
+	uint64_t *pte, bits;
+	int error;
+
+	if (!apple_dart_domain_range_valid(iova, size) ||
+	    (prot & (VM_PROT_READ | VM_PROT_WRITE)) == 0)
+		return (EINVAL);
+	bits = DART_PTE_SP_END | DART_PTE_NO_CACHE | DART_PTE_VALID;
+	if ((prot & VM_PROT_READ) == 0)
+		bits |= DART_PTE_NO_READ;
+	if ((prot & VM_PROT_WRITE) == 0)
+		bits |= DART_PTE_NO_WRITE;
+
+	mtx_lock(&domain->lock);
+	error = EIO;
+	if (domain->failed)
+		goto out;
+
+	/* Reserve and check the whole range before publishing any leaf. */
+	for (offset = 0; offset < size; offset += DART_PAGE_SIZE) {
+		pa = VM_PAGE_TO_PHYS(pages[offset >> DART_PAGE_SHIFT]);
+		error = ERANGE;
+		if ((pa & (DART_PAGE_SIZE - 1)) != 0 ||
+		    (DART_PTE_PA(pa) << 4) != pa)
+			goto out;
+		pte = apple_dart_domain_leaf(domain, iova + offset, true);
+		error = ENOMEM;
+		if (pte == NULL)
+			goto out;
+		error = EEXIST;
+		if ((*pte & DART_PTE_VALID) != 0)
+			goto out;
+	}
+	for (offset = 0; offset < size; offset += DART_PAGE_SIZE) {
+		pte = apple_dart_domain_leaf(domain, iova + offset, false);
+		pa = VM_PAGE_TO_PHYS(pages[offset >> DART_PAGE_SHIFT]);
+		*pte = DART_PTE_PA(pa) | bits;
+		cpu_dcache_wb_range(pte, sizeof(*pte));
+	}
+	error = apple_dart_domain_flush(domain);
+	if (error != 0) {
+		for (offset = 0; offset < size; offset += DART_PAGE_SIZE) {
+			pte = apple_dart_domain_leaf(domain, iova + offset, false);
+			*pte = 0;
+			cpu_dcache_wb_range(pte, sizeof(*pte));
+		}
+	}
+out:
+	mtx_unlock(&domain->lock);
+	return (error);
+}
+
+int
+apple_dart_domain_unmap(struct apple_dart_domain *domain, vm_offset_t iova,
+    bus_size_t size)
+{
+	bus_size_t offset;
+	uint64_t *pte;
+	int error;
+
+	if (!apple_dart_domain_range_valid(iova, size))
+		return (EINVAL);
+	mtx_lock(&domain->lock);
+	for (offset = 0; offset < size; offset += DART_PAGE_SIZE) {
+		pte = apple_dart_domain_leaf(domain, iova + offset, false);
+		if (pte == NULL || (*pte & DART_PTE_VALID) == 0) {
+			mtx_unlock(&domain->lock);
+			return (ENOENT);
+		}
+	}
+	for (offset = 0; offset < size; offset += DART_PAGE_SIZE) {
+		pte = apple_dart_domain_leaf(domain, iova + offset, false);
+		*pte = 0;
+		cpu_dcache_wb_range(pte, sizeof(*pte));
+	}
+	error = domain->failed ? 0 : apple_dart_domain_flush(domain);
+	mtx_unlock(&domain->lock);
 	return (error);
 }
 
