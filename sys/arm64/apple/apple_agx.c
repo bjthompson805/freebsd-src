@@ -34,6 +34,7 @@
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/ofw/ofw_subr.h>
 
+#include <arm64/apple/apple_agx.h>
 #include <arm64/apple/apple_pmgr.h>
 #include <arm64/apple/apple_rtkit.h>
 
@@ -65,7 +66,6 @@
 /* UAT handoff (mmu.rs Handoff, SlotTTBS). */
 #define	AGX_PPL_MAGIC		0x4b1d000000000002ull
 #define	AGX_UAT_NUM_CTX		64
-#define	AGX_UAT_PGSZ		0x4000
 #define	AGX_TTBR_VALID		0x1ull
 #define	AGX_TTBR_ASID_SHIFT	48
 #define	AGX_KERNEL_ALIAS_CTX	1
@@ -97,7 +97,7 @@ struct agx_slot_ttbs {
 	uint64_t	ttb1;
 };
 
-static MALLOC_DEFINE(M_AGX, "apple_agx", "Apple GPU");
+MALLOC_DEFINE(M_AGX, "apple_agx", "Apple GPU");
 
 static SYSCTL_NODE(_hw, OID_AUTO, apple_agx, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Apple M5 GPU");
@@ -184,6 +184,7 @@ struct apple_agx_softc {
 	uint64_t		data_size;
 	struct agx_role		roles[2];	/* GFX, GFX1 */
 	void			*lower_root;
+	struct agx_uat		uat;
 	uint8_t			*asc;
 	uint8_t			*sgx;
 	bus_size_t		asc_size;
@@ -519,6 +520,13 @@ agx_uat_init(struct apple_agx_softc *sc, phandle_t node)
 
 	device_printf(sc->dev, "UAT: ttb0 %#lx (new lower root), ttb1 %#lx\n",
 	    ttb0, ttb1);
+	agx_uat_attach(&sc->uat, sc->dev, ttb0, ttb1, ttb1 + 0x40000);
+	if ((error = agx_uat_add_region(&sc->uat, pbase, psize)) != 0 ||
+	    (error = agx_region(node, "shared-l2", &pbase, &psize)) != 0 ||
+	    (error = agx_uat_add_region(&sc->uat, pbase, psize)) != 0) {
+		device_printf(sc->dev, "UAT: table regions: %d\n", error);
+		return (error);
+	}
 	pmap_unmapdev(__DEVOLATILE(void *, ttbs), tsize);
 	pmap_unmapdev(__DEVOLATILE(void *, h), hsize);
 	return (0);
@@ -623,6 +631,43 @@ agx_role_boot(struct apple_agx_softc *sc, struct agx_role *r)
 }
 
 static int
+agx_stage3a(struct apple_agx_softc *sc)
+{
+	uint64_t snap[3], pte;
+	void *page;
+	vm_paddr_t pa;
+	int error;
+
+	if ((error = agx_uat_adopt_roots(&sc->uat, snap)) != 0)
+		return (error);
+	device_printf(sc->dev, "UAT: firmware root entries %#lx %#lx %#lx\n",
+	    snap[0], snap[1], snap[2]);
+
+	/* One page at the M5 graph's private cluster address. */
+	page = contigmalloc(AGX_UAT_PGSZ, M_AGX, M_WAITOK | M_ZERO, 0,
+	    ~(vm_paddr_t)0, AGX_UAT_PGSZ, 0);
+	pa = pmap_kextract((vm_offset_t)page);
+	if ((error = agx_uat_map(&sc->uat, sc->uat.upper_root,
+	    AGX_M5_BASE + 0x20000, pa, AGX_UAT_PGSZ,
+	    AGX_PROT_FW_SHARED_RW)) != 0)
+		return (error);
+	if ((error = agx_uat_lookup(&sc->uat, sc->uat.upper_root,
+	    AGX_M5_BASE + 0x20000, &pte)) != 0)
+		return (error);
+	device_printf(sc->dev, "UAT: test page %#lx -> PTE %#lx (%d tables)\n",
+	    AGX_M5_BASE + 0x20000, pte, sc->uat.ntables);
+
+	if ((error = agx_uat_confirm_roots(&sc->uat, snap)) != 0) {
+		device_printf(sc->dev, "UAT: firmware root entries changed\n");
+		return (error);
+	}
+	if ((error = agx_uat_mirror_secondary(&sc->uat)) != 0)
+		return (error);
+	device_printf(sc->dev, "stage 3a: roots adopted, confirmed, mirrored\n");
+	return (0);
+}
+
+static int
 agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 {
 	uint32_t v;
@@ -634,6 +679,31 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 	}
 	if ((error = agx_uat_init(sc, node)) != 0)
 		return (error);
+
+	/*
+	 * The firmware samples the lower root's top-level entries only when
+	 * it starts: link every lower range the 26B123 graph uses first
+	 * (InitData::m5_lower_links, COMMON26 layout).
+	 */
+	{
+		static const u_long links[] = {
+			0x1000080000ul,			/* BOOT_LINK */
+			0x7201838000ul, 0x7201840000ul,	/* region views */
+			0x7201848000ul, 0x7201870000ul,	/* completion rings */
+			0x7201898000ul, 0x72018c0000ul,
+			0x8000000000ul,			/* canonical arena */
+		};
+		for (i = 0; i < (int)nitems(links); i++)
+			if ((error = agx_uat_alloc_tables(&sc->uat,
+			    sc->uat.lower_root, links[i],
+			    links[i] + AGX_UAT_PGSZ)) != 0) {
+				device_printf(sc->dev, "lower link %#lx: %d\n",
+				    links[i], error);
+				return (error);
+			}
+		device_printf(sc->dev, "UAT: %d lower links, %d tables\n",
+		    (int)nitems(links), sc->uat.ntables);
+	}
 
 	/* set_m5_start_control, before the coprocessors (macOS 27.0). */
 	v = agx_sgx_read(sc, AGX_M5_START_CONTROL);
@@ -652,6 +722,10 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 	agx_sgx_write(sc, AGX_G17_GATING_CONTROL, v & ~AGX_G17_GATING_DISABLE);
 	device_printf(sc->dev, "G17 gating %#x -> %#x\n", v,
 	    agx_sgx_read(sc, AGX_G17_GATING_CONTROL));
+
+	/* Stage 3a: the UAT the firmware built while booting. */
+	if ((error = agx_stage3a(sc)) != 0)
+		device_printf(sc->dev, "stage 3a failed: %d\n", error);
 
 	/* Listen for a while; no InitData yet. */
 	for (i = 0; i < 200; i++) {
