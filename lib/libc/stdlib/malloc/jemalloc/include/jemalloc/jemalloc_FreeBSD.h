@@ -89,10 +89,11 @@
 #endif
 
 /*
- * m5: arm64 kernels may use 16K pages (ARM64_16K_PAGES). jemalloc must not assume a page
- * smaller than the kernel's, and a larger LG_PAGE is safe on a 4K kernel.
+ * m5: a world for 16K kernel pages (ARM64_16K_PAGES) builds with
+ * -DM5_16K_PAGES: jemalloc must not assume a page smaller than the kernel's.
+ * The default 4K world keeps the stock page size.
  */
-#ifdef __aarch64__
+#if defined(__aarch64__) && defined(M5_16K_PAGES)
 #define	LG_PAGE			14
 #else
 #define	LG_PAGE			PAGE_SHIFT
