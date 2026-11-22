@@ -261,6 +261,7 @@ struct agx_qos {
 
 struct agx_client_root {
 	vm_paddr_t	pa;
+	uint8_t		*mesh_storage;	/* its own task mesh rendering buffer */
 	uint8_t		generation;
 	bool		render_mapped;
 	bool		live;
@@ -312,11 +313,15 @@ struct agx_compute_queue {
  */
 #define	AGX_RENDER_SLOTS	4
 /* Page list, metrics, scratch, discard, TVB blocks, and three per slot. */
-#define	AGX_RENDER_COMPACT_MAX	(5 + AGX_RENDER_TVB_BLOCKS + 3 * AGX_RENDER_SLOTS)
-/* memory.rs mesh_storage: 64 KiB chunks at a 64 KiB aligned base. */
+#define	AGX_RENDER_COMPACT_MAX	(4 + AGX_RENDER_TVB_BLOCKS + 3 * AGX_RENDER_SLOTS)
+/*
+ * The task mesh rendering buffer at a 64 KiB aligned base (memory.rs
+ * mesh_storage). Its register counts 1 KiB units here, not memory.rs's
+ * 64 KiB chunks: the payload ring's highest word tracks count x 1 KiB.
+ */
 #define	AGX_RENDER_MESH_STORAGE_VA	0x1008000000ul
-#define	AGX_RENDER_MESH_STORAGE_CHUNKS	0x200
-#define	AGX_RENDER_MESH_STORAGE_SIZE	(AGX_RENDER_MESH_STORAGE_CHUNKS * 0x10000ul)
+#define	AGX_RENDER_MESH_STORAGE_SIZE	(2ul << 20)	/* 0x8000 KiB hung */
+#define	AGX_RENDER_MESH_STORAGE_CHUNKS	(AGX_RENDER_MESH_STORAGE_SIZE >> 10)
 struct agx_render_object {
 	uint8_t		*kva;
 	vm_size_t	size;
@@ -343,6 +348,9 @@ struct agx_render_slot {
 };
 
 struct agx_render {
+	uint8_t		*mesh_storage;	/* the last task client's, for the probe */
+	u_int		mesh_chunks;	/* its register's chunk count */
+	u_int		task_context;	/* the last task render's context */
 	bool		installed;
 	bool		failed;
 	uint8_t		*graph;
@@ -2130,6 +2138,13 @@ agx_render_map_client(struct apple_agx_softc *sc, struct agx_client_root *root)
 			return (error);
 		}
 	}
+	error = agx_uat_map(&sc->uat, root->pa, AGX_RENDER_MESH_STORAGE_VA,
+	    pmap_kextract((vm_offset_t)root->mesh_storage),
+	    AGX_RENDER_MESH_STORAGE_SIZE, AGX_PROT_GPU_SHARED_RW);
+	if (error != 0) {
+		device_printf(sc->dev, "render: client mesh storage: %d\n", error);
+		return (error);
+	}
 	root->render_mapped = true;
 	return (0);
 }
@@ -2161,10 +2176,20 @@ agx_render_install_resources(struct apple_agx_softc *sc)
 	    (error = agx_render_compact(sc, "render scratch", &backing,
 	    AGX_RENDER_SCRATCH_SIZE, AGX_RENDER_SCRATCH_VA)) != 0 ||
 	    (error = agx_render_compact(sc, "render discard", &backing, 0x8000,
-	    AGX_RENDER_DISCARD_VA)) != 0 ||
-	    (error = agx_render_compact(sc, "render mesh storage", &backing,
-	    AGX_RENDER_MESH_STORAGE_SIZE, AGX_RENDER_MESH_STORAGE_VA)) != 0)
+	    AGX_RENDER_DISCARD_VA)) != 0)
 		return (error);
+	/*
+	 * memory.rs keeps a mesh rendering buffer per queue: task renders of
+	 * two clients sharing one hung the tiler. Each client root gets its
+	 * own at the same VA.
+	 */
+	for (i = 0; i < AGX_VM_SLOTS; i++) {
+		sc->client_roots[i].mesh_storage = (uint8_t *)kmem_alloc_contig(
+		    AGX_RENDER_MESH_STORAGE_SIZE, M_WAITOK | M_ZERO, 0,
+		    ~(vm_paddr_t)0, 0x10000, 0, VM_MEMATTR_WRITE_COMBINING);
+		if (sc->client_roots[i].mesh_storage == NULL)
+			return (ENOMEM);
+	}
 	for (i = 0; i < AGX_RENDER_TVB_BLOCKS; i++) {
 		error = agx_render_compact(sc, "render TVB block", &backing,
 		    AGX_RENDER_TVB_BLOCK_SIZE,
@@ -2563,7 +2588,7 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	/* render.rs: only API task kicks get the TA mesh rendering buffer. */
 	if (mesh_class == 2)
 		res.mesh_storage = AGX_RENDER_MESH_STORAGE_VA |
-		    (uint64_t)AGX_RENDER_MESH_STORAGE_CHUNKS << 48;
+		    (uint64_t)r->mesh_chunks << 48;
 	a.usage[0] = AGX_RENDER_SUPPORT_VA + AGX_RENDER_USAGE + index * 0x80;
 	a.usage[1] = a.usage[0] + 0x40;
 	memset(slot->desc, 0, AGX_M5_RENDER_STORAGE_BYTES);
@@ -2849,6 +2874,18 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 			break;
 		mtx_sleep(&r->in_flight, &sc->mtx, 0, "agxslot", hz / 100 + 1);
 	}
+	/*
+	 * A task render for another context than the last one waits for the
+	 * GPU to drain: task tiling switching among three or more clients
+	 * hung the tiler with in-flight work behind it (J815, no reference).
+	 */
+	while (mesh_class == 2 && context != r->task_context && r->installed &&
+	    !r->failed && r->in_flight != 0) {
+		n += agx_render_reap(sc, finished + n);
+		if (r->in_flight == 0)
+			break;
+		mtx_sleep(&r->in_flight, &sc->mtx, 0, "agxtask", hz / 100 + 1);
+	}
 	root = agx_client_root(sc, context);
 	if (!r->installed || r->failed || root == NULL || !root->live) {
 		error = !r->installed ? ENODEV : r->failed ? EIO : ENOENT;
@@ -2860,6 +2897,10 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 	slot = &r->slots[index];
 	error = agx_render_kick(sc, index, context, root->generation, &p,
 	    stages, mesh_class);
+	if (error == 0 && mesh_class == 2) {
+		r->mesh_storage = root->mesh_storage;
+		r->task_context = context;
+	}
 	if (error == 0) {
 		slot->used = true;
 		slot->done = done;
@@ -3249,6 +3290,60 @@ agx_sysctl_idle(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
+/*
+ * Task payload layout probe: 1 clears the mesh storage, 2 reports where
+ * each float key 1.0..64.0 (vktaskgrid's) landed and the highest word
+ * written. Debug only: read while no task render runs.
+ */
+static int
+agx_sysctl_mesh_probe(SYSCTL_HANDLER_ARGS)
+{
+	struct apple_agx_softc *sc = arg1;
+	const uint32_t *w;
+	size_t i, n, first[65], last[65], count[65], high = 0;
+	uint32_t bits[65];
+	int error, op = 0, k, e;
+
+	error = sysctl_handle_int(oidp, &op, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (sc->render.mesh_storage == NULL)
+		return (ENXIO);
+	if (op == 1) {
+		memset(sc->render.mesh_storage, 0, AGX_RENDER_MESH_STORAGE_SIZE);
+		return (0);
+	}
+	if (op != 2)
+		return (EINVAL);
+	for (k = 1; k <= 64; k++) {
+		for (e = 0; (2 << e) <= k; e++)
+			;
+		bits[k] = (uint32_t)(127 + e) << 23 |
+		    (((uint32_t)k << (23 - e)) & 0x7fffff);
+		first[k] = last[k] = count[k] = 0;
+	}
+	w = (const uint32_t *)sc->render.mesh_storage;
+	n = AGX_RENDER_MESH_STORAGE_SIZE / 4;
+	for (i = 0; i < n; i++) {
+		if (w[i] == 0)
+			continue;
+		high = i * 4;
+		for (k = 1; k <= 64; k++) {
+			if (w[i] != bits[k])
+				continue;
+			if (count[k]++ == 0)
+				first[k] = i * 4;
+			last[k] = i * 4;
+		}
+	}
+	device_printf(sc->dev, "mesh probe: highest nonzero %#zx\n", high);
+	for (k = 1; k <= 64; k++)
+		if (count[k] != 0)
+			device_printf(sc->dev, "mesh probe: key %d: %zu words, "
+			    "%#zx..%#zx\n", k, count[k], first[k], last[k]);
+	return (0);
+}
+
 static int
 agx_sysctl_control(SYSCTL_HANDLER_ARGS)
 {
@@ -3275,6 +3370,12 @@ agx_sysctls(struct apple_agx_softc *sc)
 	SYSCTL_ADD_PROC(ctx, t, OID_AUTO, "idle_policy",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
 	    agx_sysctl_idle, "I", "Publish IdlePowerOff (0 keep, 1 allow)");
+	SYSCTL_ADD_PROC(ctx, t, OID_AUTO, "mesh_probe",
+	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
+	    agx_sysctl_mesh_probe, "I", "Task mesh storage probe (1 clear, 2 scan)");
+	sc->render.mesh_chunks = AGX_RENDER_MESH_STORAGE_CHUNKS;
+	SYSCTL_ADD_UINT(ctx, t, OID_AUTO, "mesh_chunks", CTLFLAG_RW,
+	    &sc->render.mesh_chunks, 0, "Task mesh storage register chunk count");
 	SYSCTL_ADD_PROC(ctx, t, OID_AUTO, "control",
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    agx_sysctl_control, "A", "Control ring consumer, unk_10, producer");
