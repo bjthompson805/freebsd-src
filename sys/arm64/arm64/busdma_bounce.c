@@ -116,6 +116,7 @@ struct bus_dmamap {
 	struct sync_list	slist[];
 };
 
+static void bounce_bus_dma_granule(bus_dma_tag_t dmat);
 static void bounce_bus_dmamap_unload(bus_dma_tag_t dmat, bus_dmamap_t map);
 
 static bool _bus_dmamap_pagesneeded(bus_dma_tag_t dmat, bus_dmamap_t map,
@@ -300,6 +301,7 @@ bounce_bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment,
 		newtag->alloc_size = roundup2(newtag->common.maxsize,
 		    dcache_line_size);
 	}
+	bounce_bus_dma_granule(newtag);
 
 	if (newtag->common.lowaddr < ptoa((vm_paddr_t)Maxmem) ||
 	    newtag->common.alignment > 1)
@@ -320,6 +322,22 @@ bounce_bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment,
 	return (error);
 }
 
+/*
+ * A translated tag's dmamem holds only its own buffer within each IOMMU
+ * page, so the device cannot reach neighbouring kernel memory through it.
+ */
+static void
+bounce_bus_dma_granule(bus_dma_tag_t dmat)
+{
+	bus_size_t granule;
+
+	if (dmat->translation == NULL || dmat->translation->granule == 0)
+		return;
+	granule = dmat->translation->granule;
+	dmat->alloc_alignment = MAX(dmat->alloc_alignment, granule);
+	dmat->alloc_size = roundup2(dmat->alloc_size, granule);
+}
+
 int
 bus_dma_bounce_set_translation(bus_dma_tag_t tag,
     const struct bus_dma_bounce_translation *ops, void *cookie)
@@ -332,6 +350,7 @@ bus_dma_bounce_set_translation(bus_dma_tag_t tag,
 		return (EBUSY);
 	tag->translation = ops;
 	tag->translation_cookie = cookie;
+	bounce_bus_dma_granule(tag);
 	return (0);
 }
 

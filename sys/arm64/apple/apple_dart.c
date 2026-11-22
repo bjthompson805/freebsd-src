@@ -563,18 +563,18 @@ apple_dart_domain_table(int flags)
 	vm_page_t m;
 	vm_paddr_t pa;
 	uint64_t *table;
+	u_int i;
 
-	m = vm_page_alloc_noobj(flags | VM_ALLOC_WIRED | VM_ALLOC_ZERO);
+	/* One table is a whole DART page, whatever the kernel page size. */
+	m = vm_page_alloc_noobj_contig(flags | VM_ALLOC_WIRED | VM_ALLOC_ZERO,
+	    DART_PAGE_SIZE / PAGE_SIZE, 0, (1ul << DART_IOVA_BITS) - 1,
+	    DART_PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
 	if (m == NULL)
 		return (NULL);
-	if ((m->flags & PG_ZERO) == 0)
-		pmap_zero_page(m);
+	for (i = 0; i < DART_PAGE_SIZE / PAGE_SIZE; i++)
+		if ((m[i].flags & PG_ZERO) == 0)
+			pmap_zero_page(&m[i]);
 	pa = VM_PAGE_TO_PHYS(m);
-	if ((DART_PTE_PA(pa) << 4) != pa) {
-		vm_page_unwire_noq(m);
-		vm_page_free(m);
-		return (NULL);
-	}
 	table = (uint64_t *)PHYS_TO_DMAP(pa);
 	cpu_dcache_wb_range(table, DART_PAGE_SIZE);
 	dsb(sy);
@@ -623,8 +623,10 @@ apple_dart_domain_free_table(uint64_t *table, int level)
 		}
 	}
 	m = PHYS_TO_VM_PAGE(DMAP_TO_PHYS((vm_offset_t)table));
-	vm_page_unwire_noq(m);
-	vm_page_free(m);
+	for (i = 0; i < DART_PAGE_SIZE / PAGE_SIZE; i++) {
+		vm_page_unwire_noq(&m[i]);
+		vm_page_free(&m[i]);
+	}
 }
 
 static void
@@ -679,8 +681,7 @@ apple_dart_domain_create(device_t dev, struct apple_dart_domain **result)
 	u_int i, reg;
 	int error;
 
-	if (PAGE_SIZE != DART_PAGE_SIZE ||
-	    !ofw_bus_is_compatible(dev, "apple,t8142-dwc3"))
+	if (!ofw_bus_is_compatible(dev, "apple,t8142-dwc3"))
 		return (ENXIO);
 	node = ofw_bus_get_node(dev);
 	if (OF_getproplen(node, "iommus") != sizeof(refs) ||
@@ -919,6 +920,7 @@ apple_dart_dma_unmap(void *cookie, const bus_dma_segment_t *seg)
 static const struct bus_dma_bounce_translation apple_dart_dma_ops = {
 	.map = apple_dart_dma_map,
 	.unmap = apple_dart_dma_unmap,
+	.granule = DART_PAGE_SIZE,
 };
 
 int

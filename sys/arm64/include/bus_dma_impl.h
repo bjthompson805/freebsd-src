@@ -92,6 +92,8 @@ struct bus_dma_bounce_translation {
 	int (*map)(void *cookie, const struct bus_dma_tag_common *tag,
 	    bus_dma_segment_t *seg);
 	void (*unmap)(void *cookie, const bus_dma_segment_t *seg);
+	/* dmamem allocations are rounded to whole, aligned granules. */
+	bus_size_t granule;
 };
 int bus_dma_bounce_set_translation(bus_dma_tag_t tag,
     const struct bus_dma_bounce_translation *ops, void *cookie);

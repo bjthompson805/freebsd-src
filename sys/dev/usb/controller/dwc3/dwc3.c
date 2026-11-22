@@ -121,14 +121,14 @@ xhci_interrupt_poll(void *_sc)
 }
 
 #if defined(FDT) && defined(SOC_APPLE_T8103)
-static int dwc3_dart_isolation;
+static int dwc3_dart_isolation = 1;
 TUNABLE_INT("hw.apple.dwc3_dart_isolation", &dwc3_dart_isolation);
 
 static bool
 snps_dwc3_use_dart(device_t dev)
 {
 
-	return (dwc3_dart_isolation != 0 && PAGE_SIZE == 16384 &&
+	return (dwc3_dart_isolation != 0 &&
 	    ofw_bus_is_compatible(dev, "apple,t8142-dwc3"));
 }
 
