@@ -114,6 +114,8 @@ linux_alloc_pages(gfp_t flags, unsigned int order)
 		} else {
 			vm_paddr_t pmax = (flags & GFP_DMA32) ?
 			    BUS_SPACE_MAXADDR_32BIT : BUS_SPACE_MAXADDR;
+			/* Linux's buddy blocks are aligned to their size. */
+			u_long align = PAGE_SIZE << order;
 
 			if ((flags & __GFP_NORETRY) != 0)
 				req |= VM_ALLOC_NORECLAIM;
@@ -123,18 +125,18 @@ linux_alloc_pages(gfp_t flags, unsigned int order)
 				int curdomain = PCPU_GET(domain);
 				page = vm_page_alloc_noobj_contig_domain(
 				    curdomain, req, npages, 0, pmax,
-				    PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
+				    align, 0, VM_MEMATTR_DEFAULT);
 			} else {
 				page = vm_page_alloc_noobj_contig(
 				    req, npages, 0, pmax,
-				    PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
+				    align, 0, VM_MEMATTR_DEFAULT);
 			}
 
 			if (page == NULL) {
 				if ((flags & (M_WAITOK | __GFP_NORETRY | __GFP_THISNODE)) ==
 				    M_WAITOK) {
 					int err = vm_page_reclaim_contig(req,
-					    npages, 0, pmax, PAGE_SIZE, 0);
+					    npages, 0, pmax, align, 0);
 					if (err == ENOMEM)
 						vm_wait(NULL);
 					else if (err != 0)
