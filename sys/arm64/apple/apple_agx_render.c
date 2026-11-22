@@ -2224,9 +2224,13 @@ demand_vertex(struct demand *d, uint32_t primary, uint32_t secondary,
 	return (demand_merge(d, parts, minimum, ideal, p.pressure));
 }
 
-/* include_mesh uses compute occupancy on the tiling engine's cores. */
+/*
+ * include_compute: compute occupancy over maximum and total cores. Mesh
+ * programs (include_mesh) use the limited counts of the tiling engine.
+ */
 static int
-demand_mesh(struct demand *d, const struct agx_render_program *e)
+demand_occupancy(struct demand *d, const struct agx_render_program *e,
+    uint64_t maximum, uint64_t total)
 {
 	const uint64_t resident_warps = 96, shared_budget = 114688;
 	struct fragment_params p;
@@ -2264,15 +2268,61 @@ demand_mesh(struct demand *d, const struct agx_render_program *e)
 	group_large = (warps < 10 ? warps : 10) * large;
 	tile = shared_small + shared_large;
 	transient = sat_sub(warps * small + group_large + tile, d->floor) + tile;
-	base = d->limited_maximum * (d->floor + 11) + 58;
+	base = maximum * (d->floor + 11) + 58;
 	tail = large + shared_large + 64;
-	minimum = base + tail + transient * d->limited_maximum +
-	    (shared_large + group_large) * d->limited_total;
-	ideal = base + tail + sat_sub(pressure, d->floor) * d->limited_maximum;
+	minimum = base + tail + transient * maximum +
+	    (shared_large + group_large) * total;
+	ideal = base + tail + sat_sub(pressure, d->floor) * maximum;
 	parts[0] = p.primary_large;
 	parts[1] = p.secondary_large;
 	parts[2] = shared_large;
 	return (demand_merge(d, parts, minimum, ideal, pressure));
+}
+
+/* include_mesh uses compute occupancy on the tiling engine's cores. */
+static int
+demand_mesh(struct demand *d, const struct agx_render_program *e)
+{
+
+	return (demand_occupancy(d, e, d->limited_maximum, d->limited_total));
+}
+
+/*
+ * render_resources.rs plan_compute (no SCS): the compute programs'
+ * occupancy demand, as the M5 compute descriptor's resource policy (its
+ * per-kick pressure, CONTEXT_FLOOR 96, at most 512: priority 0 counts three
+ * resident kicks, the others two) and resource control (the flags).
+ */
+int
+agx_m5_compute_plan(const uint32_t *core_masks, unsigned clusters,
+    uint32_t nominal_cores, uint8_t priority,
+    const struct agx_render_program *programs, unsigned n,
+    uint64_t *policy, uint64_t *control)
+{
+	struct demand d;
+	uint32_t active, pressure;
+	unsigned i;
+	int error;
+
+	if (priority > 3 || n == 0)
+		return (EINVAL);
+	active = priority == 0 ? 3 : 2;
+	if ((error = demand_new(core_masks, clusters, nominal_cores, 96,
+	    &d)) != 0)
+		return (error);
+	for (i = 0; i < n; i++) {
+		if (programs[i].threads == 0)
+			return (EINVAL);
+		if ((error = demand_occupancy(&d, &programs[i], d.maximum,
+		    d.total)) != 0)
+			return (error);
+	}
+	if ((error = demand_flags(d.counts, control)) != 0)
+		return (error);
+	pressure = d.pressure / active;
+	pressure = pressure < 96 ? 96 : pressure > 512 ? 512 : pressure;
+	*policy = (uint64_t)pressure << 32 | 0x400020;
+	return (0);
 }
 
 /*

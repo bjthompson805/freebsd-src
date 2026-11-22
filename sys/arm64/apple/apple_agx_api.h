@@ -43,11 +43,14 @@ int	apple_agx_vm_map(device_t dev, u_int context, uint64_t va, vm_paddr_t pa,
 int	apple_agx_vm_unmap(device_t dev, u_int context, uint64_t va, vm_size_t size);
 /*
  * Run one compute command (its CDM stream at cdm_va..cdm_end, terminator
- * included) on the queue and wait for it to retire.
+ * included) on the queue and wait for it to retire. Its dispatch programs
+ * (SET_COMPUTE_RESOURCES; nprograms 0 for none) size its storage demand.
  */
+struct agx_render_program;
 int	apple_agx_submit_compute(device_t dev, u_int slot, u_int context,
-	    uint64_t cdm_va,
-	    uint64_t cdm_end, u_int timeout_ms);
+	    uint64_t cdm_va, uint64_t cdm_end,
+	    const struct agx_render_program *programs, u_int nprograms,
+	    u_int timeout_ms);
 
 /*
  * Run one render pass (struct agx_render_pass, its USC offsets relative to
@@ -56,7 +59,6 @@ int	apple_agx_submit_compute(device_t dev, u_int slot, u_int context,
  * stages' resource budgets.
  */
 struct agx_render_pass;
-struct agx_render_program;
 int	apple_agx_submit_render(device_t dev, u_int context,
 	    const struct agx_render_pass *pass,
 	    const struct agx_render_program *programs, u_int nprograms,

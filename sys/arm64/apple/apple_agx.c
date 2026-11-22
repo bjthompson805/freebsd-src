@@ -1338,12 +1338,13 @@ static const struct agx_board agx_j813_board = {
  * the M5 descriptor, the pool submission, QoS, the configuration and
  * descriptor items, the kick entry, the announcement, the work slot and
  * the doorbell. The previous kick has retired. cdm_va..cdm_end is the
- * job's CDM stream, terminator included.
+ * job's CDM stream, terminator included. policy and control are its
+ * agx_m5_compute_plan, or 0 for the fixed profile.
  */
 static int
 agx_kick(struct apple_agx_softc *sc, struct agx_compute_queue *queue,
     u_int context, uint8_t generation,
-    uint64_t cdm_va, uint64_t cdm_end)
+    uint64_t cdm_va, uint64_t cdm_end, uint64_t policy, uint64_t control)
 {
 	const struct agx_board *board = &agx_j813_board;
 	volatile uint32_t *cursors = (volatile uint32_t *)(queue->graph +
@@ -1404,12 +1405,18 @@ agx_kick(struct apple_agx_softc *sc, struct agx_compute_queue *queue,
 	d.context_id = context;
 	d.work_state = word;
 	d.object_ids = 0x0000000100000001ul;
-	d.resource_policy = 0xf500400020ul;
+	/*
+	 * queue/compute.rs: a dispatch plan's pressure and flags; without one,
+	 * macOS 27.0's J813 profile (one secondary and one imageblock unit
+	 * beside the primary one).
+	 */
+	d.resource_policy = policy != 0 ? policy : 0xf500400020ul;
 	d.preempt_state_offset = tuple.preempt_state_offset;
 	d.operand_region_bytes = AGX_Q_OPERAND_BANK;
 	d.operand_aux_offset = AGX_Q_OPERAND_TAIL;
 	d.operand_bytes = AGX_Q_OPERAND_SIZE;
-	d.resource_control = board->j813_forms ? 0x0104054b : 0x54b;
+	d.resource_control = control != 0 ? control :
+	    board->j813_forms ? 0x0104054b : 0x54b;
 	d.dispatch_control = agx_m5_dispatch_control(board, tuple.dispatch_base);
 	d.auxiliary_control = tuple.auxiliary_control;
 	d.common26_tail = board->common26;
@@ -1825,19 +1832,25 @@ apple_agx_queue_destroy(device_t dev, u_int slot)
 
 int
 apple_agx_submit_compute(device_t dev, u_int slot, u_int context,
-    uint64_t cdm_va,
-    uint64_t cdm_end, u_int timeout_ms)
+    uint64_t cdm_va, uint64_t cdm_end,
+    const struct agx_render_program *programs, u_int nprograms,
+    u_int timeout_ms)
 {
 	struct apple_agx_softc *sc = device_get_softc(dev);
 	struct agx_compute_queue *queue;
 	struct agx_client_root *root;
-	uint64_t events;
+	uint64_t events, policy = 0, control = 0;
 	u_int ms;
 	int error;
 
 	(void)timeout_ms;	/* agx_retire waits 2 s */
 	if (slot >= nitems(sc->queues))
 		return (ENOENT);
+	/* render_resources.rs plan_compute: every core of every cluster. */
+	if (nprograms != 0 && (error = agx_m5_compute_plan(sc->id.core_masks,
+	    sc->id.num_clusters, sc->id.num_cores * sc->id.num_clusters,
+	    AGX_Q_PRIORITY, programs, nprograms, &policy, &control)) != 0)
+		return (error);
 	queue = &sc->queues[slot];
 	if (cdm_end <= cdm_va || cdm_end - cdm_va < 4 || (cdm_va & 7) != 0)
 		return (EINVAL);
@@ -1860,7 +1873,8 @@ apple_agx_submit_compute(device_t dev, u_int slot, u_int context,
 	}
 	queue->busy = true;
 	events = queue->stamp_events;
-	error = agx_kick(sc, queue, context, root->generation, cdm_va, cdm_end);
+	error = agx_kick(sc, queue, context, root->generation, cdm_va, cdm_end,
+	    policy, control);
 	if (error == 0) {
 		sc->compute_in_flight++;
 		if (sc->compute_peak_in_flight < sc->compute_in_flight)
@@ -1947,7 +1961,7 @@ agx_stage6(struct apple_agx_softc *sc, struct agx_compute_queue *queue)
 		memset(sc->job_out, 0xa5, AGX_JOB_THREADS * 4);
 		dsb(sy);
 		if ((error = agx_kick(sc, queue, AGX_Q_CONTEXT, 1, AGX_JOB_CDM_VA,
-		    AGX_JOB_CDM_VA + sizeof(agx_job_cdm))) != 0 ||
+		    AGX_JOB_CDM_VA + sizeof(agx_job_cdm), 0, 0)) != 0 ||
 		    (error = agx_retire(sc, queue, &ms, false, 0)) != 0) {
 			device_printf(sc->dev, "kick %u failed: %d\n", n,
 			    error);
