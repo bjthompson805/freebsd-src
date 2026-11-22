@@ -140,6 +140,7 @@ struct agx_render_program {
 	uint32_t	imageblock_bytes;
 	uint32_t	multisample_bytes;
 	uint32_t	threads;	/* nonzero for mesh or object programs */
+	bool		task;		/* an object program running an API task */
 };
 
 /* fw/render.rs RenderArgs with memory.rs write_m5_commands' inputs. */

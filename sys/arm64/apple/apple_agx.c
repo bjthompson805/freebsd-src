@@ -312,7 +312,11 @@ struct agx_compute_queue {
  */
 #define	AGX_RENDER_SLOTS	4
 /* Page list, metrics, scratch, discard, TVB blocks, and three per slot. */
-#define	AGX_RENDER_COMPACT_MAX	(4 + AGX_RENDER_TVB_BLOCKS + 3 * AGX_RENDER_SLOTS)
+#define	AGX_RENDER_COMPACT_MAX	(5 + AGX_RENDER_TVB_BLOCKS + 3 * AGX_RENDER_SLOTS)
+/* memory.rs mesh_storage: 64 KiB chunks at a 64 KiB aligned base. */
+#define	AGX_RENDER_MESH_STORAGE_VA	0x1008000000ul
+#define	AGX_RENDER_MESH_STORAGE_CHUNKS	0x200
+#define	AGX_RENDER_MESH_STORAGE_SIZE	(AGX_RENDER_MESH_STORAGE_CHUNKS * 0x10000ul)
 struct agx_render_object {
 	uint8_t		*kva;
 	vm_size_t	size;
@@ -2157,7 +2161,9 @@ agx_render_install_resources(struct apple_agx_softc *sc)
 	    (error = agx_render_compact(sc, "render scratch", &backing,
 	    AGX_RENDER_SCRATCH_SIZE, AGX_RENDER_SCRATCH_VA)) != 0 ||
 	    (error = agx_render_compact(sc, "render discard", &backing, 0x8000,
-	    AGX_RENDER_DISCARD_VA)) != 0)
+	    AGX_RENDER_DISCARD_VA)) != 0 ||
+	    (error = agx_render_compact(sc, "render mesh storage", &backing,
+	    AGX_RENDER_MESH_STORAGE_SIZE, AGX_RENDER_MESH_STORAGE_VA)) != 0)
 		return (error);
 	for (i = 0; i < AGX_RENDER_TVB_BLOCKS; i++) {
 		error = agx_render_compact(sc, "render TVB block", &backing,
@@ -2554,6 +2560,10 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	a.has_stages = true;
 	memcpy(a.stages, stages, sizeof(a.stages));
 	a.mesh_class = mesh_class;
+	/* render.rs: only API task kicks get the TA mesh rendering buffer. */
+	if (mesh_class == 2)
+		res.mesh_storage = AGX_RENDER_MESH_STORAGE_VA |
+		    (uint64_t)AGX_RENDER_MESH_STORAGE_CHUNKS << 48;
 	a.usage[0] = AGX_RENDER_SUPPORT_VA + AGX_RENDER_USAGE + index * 0x80;
 	a.usage[1] = a.usage[0] + 0x40;
 	memset(slot->desc, 0, AGX_M5_RENDER_STORAGE_BYTES);
@@ -2818,12 +2828,14 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 	p.usc_base = AGX_CLIENT_SHADER;
 	/*
 	 * render_resources.rs mesh_class: 1 for a hardware mesh (with its
-	 * passthrough object stage). Task (class 2) kicks need the TA mesh
-	 * storage buffer, which DRM does not admit yet.
+	 * passthrough object stage), 2 with an API task stage.
 	 */
-	for (i = 0; i < nprograms; i++)
-		if (programs[i].threads != 0)
+	for (i = 0; i < nprograms; i++) {
+		if (programs[i].task)
+			mesh_class = 2;
+		else if (programs[i].threads != 0 && mesh_class == 0)
 			mesh_class = 1;
+	}
 	/* render_resources.rs M5Policy: every core of every cluster. */
 	error = agx_m5_render_plan(sc->id.core_masks, sc->id.num_clusters,
 	    sc->id.num_cores * sc->id.num_clusters, AGX_RENDER_PRIORITY,

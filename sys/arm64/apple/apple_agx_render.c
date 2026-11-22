@@ -1409,7 +1409,7 @@ build_fragment_registers(const struct agx_render_pass *p,
  */
 static int
 tiling_program(const struct rw *common, int n, bool scs, bool matrix,
-    bool j813, struct rw out[99], int *length)
+    bool j813, uint64_t mesh_storage, struct rw out[99], int *length)
 {
 	struct writer w = { out, 0, 99 };
 	int error, i;
@@ -1434,6 +1434,12 @@ tiling_program(const struct rw *common, int n, bool scs, bool matrix,
 			continue;
 		}
 		CHECK(wpush(&w, common[i].reg, common[i].value));
+		/*
+		 * A task kick's mesh rendering buffer follows the scratch window,
+		 * as in the M5 Pro form; Aurora's J813 form never binds it.
+		 */
+		if (common[i].reg == 0x10799 && mesh_storage != 0)
+			CHECK(wpush(&w, 0x1ca48, mesh_storage));
 	}
 	*length = w.count;
 	return (0);
@@ -1583,7 +1589,7 @@ workspace_write(struct workspace *ws, const struct agx_render_args *a,
 	j813 = c.board->j813_forms;
 	/* TaExtra: buffer/target.rs m5_extra has no brackets. */
 	CHECK(tiling_program(ws->base, 82, agx_scratch_enabled(&c.ta.scratch),
-	    false, j813, ws->ta, &ws->ta_count));
+	    false, j813, r->mesh_storage, ws->ta, &ws->ta_count));
 	lifecycle = (uint64_t)in->ta.predecessor_id << 32 |
 	    (uint32_t)in->ta.completion.key;
 	for (i = 0; i < ws->ta_count; i++)
