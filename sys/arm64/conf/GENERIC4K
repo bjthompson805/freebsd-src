@@ -1,0 +1,7 @@
+#
+# GENERIC4K -- the M5 GENERIC kernel with 4 KiB pages. Apple's DARTs and the
+# GPU's UAT keep their 16 KiB granule; their drivers map whole granules.
+#
+include		GENERIC
+ident		GENERIC4K
+nooptions	ARM64_16K_PAGES
