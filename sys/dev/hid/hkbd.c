@@ -851,6 +851,9 @@ hkbd_parse_hid(struct hkbd_softc *sc, const uint8_t *ptr, uint32_t len,
 			if (flags & HIO_VARIABLE)
 				sc->sc_flags |= HKBD_FLAG_APPLE_EJECT |
 				    HKBD_FLAG_APPLE_SWAP;
+			/* No ISO key: ` stays ` (0x35, not 0x64). */
+			if (hid_test_quirk(hw, HQ_APPLE_ANSI))
+				sc->sc_flags &= ~HKBD_FLAG_APPLE_SWAP;
 			DPRINTFN(1, "Found Apple eject-key\n");
 		}
 		/*

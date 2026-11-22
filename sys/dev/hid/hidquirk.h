@@ -61,7 +61,8 @@
 	HQ(MS_REVZ),		/* mouse has Z-axis reversed */		\
 	HQ(MS_VENDOR_BTN),	/* mouse has buttons in vendor usage page */ \
 	HQ(SPUR_BUT_UP),	/* spurious mouse button up events */	\
-	HQ(MT_TIMESTAMP)	/* Multitouch device exports HW timestamps */
+	HQ(MT_TIMESTAMP),	/* Multitouch device exports HW timestamps */ \
+	HQ(APPLE_ANSI)		/* Apple keyboard has no ISO key: no swap */
 
 #ifndef	HQ
 #define	HQ(x)	HQ_##x

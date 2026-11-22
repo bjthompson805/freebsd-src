@@ -896,6 +896,9 @@ apple_mtp_probe(device_t dev)
 static int
 apple_mtp_add_hid(struct apple_mtp_softc *sc, struct mtp_iface *ifc)
 {
+	phandle_t kbd;
+	pcell_t country;
+
 	ifc->sc = sc;
 	ifc->mt_ids[0] = ifc->mt_ids[1] = -1;
 	if (strcmp(ifc->name, "multi-touch") == 0) {
@@ -912,6 +915,15 @@ apple_mtp_add_hid(struct apple_mtp_softc *sc, struct mtp_iface *ifc)
 	ifc->hw.rdescsize = ifc->rdesc_len;
 	/* Writes (keyboard LEDs) become set_report, which we ignore. */
 	hid_add_dynamic_quirk(&ifc->hw, HQ_NOWRITE);
+	/*
+	 * m1n1 sets hid-country-code from the ADT keyboard layout. Only an
+	 * ISO keyboard (13) needs hkbd's `/< swap, as Linux's hid-apple.
+	 */
+	if (strcmp(ifc->name, "keyboard") == 0 && (kbd = ofw_bus_find_child(
+	    sc->hid_node, "keyboard")) > 0 && OF_getencprop(kbd,
+	    "hid-country-code", &country, sizeof(country)) == sizeof(country) &&
+	    country != 13)
+		hid_add_dynamic_quirk(&ifc->hw, HQ_APPLE_ANSI);
 
 	ifc->hidbus = device_add_child(sc->dev, "hidbus", DEVICE_UNIT_ANY);
 	if (ifc->hidbus == NULL)
