@@ -2235,6 +2235,7 @@ static int
 n1w_start(struct n1_softc *sc)
 {
 	static const uint8_t start[5] = { 0, 0x0b, 0, 0, 0 };
+	phandle_t node;
 	int error, ring, slot;
 
 	for (ring = 1; ring <= 4; ring++)
@@ -2251,8 +2252,18 @@ n1w_start(struct n1_softc *sc)
 	}
 	bus_write_4(sc->fnbar[1], 0x1004, 1);
 	pause("n1ws", hz * 4 / 10);
-	arc4rand(sc->w.mac, sizeof(sc->w.mac), 0);
-	sc->w.mac[0] = (sc->w.mac[0] & ~1) | 2;	/* local, unicast */
+	/*
+	 * The factory MAC m1n1 copies from the ADT keeps the DHCP address
+	 * stable across boots; a random one only if it is missing.
+	 */
+	node = OF_finddevice("wifi0");
+	if (node == -1 || OF_getprop(node, "local-mac-address", sc->w.mac,
+	    sizeof(sc->w.mac)) != sizeof(sc->w.mac) ||
+	    (sc->w.mac[0] | sc->w.mac[1] | sc->w.mac[2] | sc->w.mac[3] |
+	    sc->w.mac[4] | sc->w.mac[5]) == 0) {
+		arc4rand(sc->w.mac, sizeof(sc->w.mac), 0);
+		sc->w.mac[0] = (sc->w.mac[0] & ~1) | 2;	/* local, unicast */
+	}
 	if ((error = n1w_cmd(sc, 0, NULL, 0)) != 0 ||
 	    (error = n1w_cmd(sc, 1, sc->w.mac, 6)) != 0 ||
 	    (error = n1w_cmd(sc, 2, start, sizeof(start))) != 0)
