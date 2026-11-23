@@ -316,10 +316,13 @@ int m5_trace_init;
 SYSCTL_INT(_kern, OID_AUTO, m5_trace_init, CTLFLAG_RWTUN, &m5_trace_init, 0,
     "Log every syscall made by init (pid 1)");
 
-/* M5 SMP experiment: machdep.m5_idle_spin=1 keeps secondaries out of WFI. */
+/*
+ * M5 SMP experiment: machdep.m5_idle_spin keeps secondaries out of WFI.
+ * Bit mask by cluster (MPIDR Aff2): 1 = E cluster, 2 = P cluster, 3 = both.
+ */
 static int m5_idle_spin;
 SYSCTL_INT(_machdep, OID_AUTO, m5_idle_spin, CTLFLAG_RWTUN, &m5_idle_spin, 0,
-    "Idle by spinning instead of WFI on CPUs other than 0");
+    "Cluster mask (1 E, 2 P) of secondaries that spin instead of WFI");
 
 void
 cpu_idle(int busy)
@@ -335,7 +338,8 @@ cpu_idle(int busy)
 	 * callee-saved registers on the stack around the wait, and tell the
 	 * compiler that x0-x17 do not survive it.
 	 */
-	if (!sched_runnable() && !(m5_idle_spin && PCPU_GET(cpuid) != 0))
+	if (!sched_runnable() && !(PCPU_GET(cpuid) != 0 &&
+	    (m5_idle_spin & (1 << ((PCPU_GET(mpidr) >> 16) & 0x7)))))
 		__asm __volatile(
 		    "stp x29, x30, [sp, #-112]!	\n"
 		    "stp x19, x20, [sp, #16]	\n"
