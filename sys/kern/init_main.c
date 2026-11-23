@@ -743,6 +743,23 @@ start_init(void *dummy)
 	td = curthread;
 	p = td->td_proc;
 
+	/*
+	 * M5 SMP debug: kern.m5_init_cpu0=1 keeps init (PID 1 only) on the
+	 * boot CPU for its whole life. Natively init has only ever died on
+	 * other CPUs, after exec'ing pages the kernel prepared elsewhere.
+	 */
+	{
+		int cpu0 = 0;
+
+		TUNABLE_INT_FETCH("kern.m5_init_cpu0", &cpu0);
+		if (cpu0) {
+			thread_lock(td);
+			sched_bind(td, 0);
+			thread_unlock(td);
+			printf("m5: init bound to CPU 0\n");
+		}
+	}
+
 	vfs_mountroot();
 
 	/* Wipe GELI passphrase from the environment. */
