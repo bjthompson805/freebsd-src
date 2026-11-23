@@ -288,6 +288,61 @@ aic_cpu1_probe(void *arg)
 	}
 }
 
+/*
+ * M5 SMP experiment (hw.apple_aic.xnu_pm=1): the boot-time CPU power setup
+ * macOS 27 does on T8142 (m1n1 HV trace, NOTES 2026-11-22): allow every
+ * cluster power-gate word (PMGR reg[34] +0x0 E, +0x60 P, +0xa0, +0xa8) and
+ * configure both clusters' CPM (cpm-impl-reg) like AppleT8142PMGR. macOS sets
+ * these once and does no per-idle MMIO.
+ */
+/*
+ * M5 SMP experiment (hw.apple_aic.siq_cfg=1): macOS 27 writes SIQ_CFG_EL1
+ * (s3_4_c15_c10_4, EL2) = 0 on every core as it starts it (m1n1 HV trace with
+ * TIDCP on the secondaries); FreeBSD runs at EL2 (VHE) and can do the same.
+ */
+static int aic_siq_cfg;
+
+static void
+aic_write_siq_cfg(void)
+{
+
+	__asm __volatile("msr s3_4_c15_c10_4, xzr; isb");
+}
+
+static void
+aic_xnu_pm(int mode)
+{
+	static const uint64_t cpm_base[] = { 0x210e40000UL, 0x211e40000UL };
+	static const struct { u_int off; uint64_t val; } cpm_seq[] = {
+		{ 0x4180, 0 }, { 0x4188, 0 }, { 0x4190, ~0UL }, { 0x4198, ~0UL },
+		{ 0x41a0, ~0UL }, { 0x41a8, ~0UL }, { 0x41b0, 0x6665 },
+		{ 0x41b8, 0 }, { 0x4180, 3 },
+	};
+	static const u_int gate_off[] = { 0x0, 0x60, 0xa0, 0xa8 };
+	volatile uint32_t *gate;
+	volatile uint64_t *cpm;
+	u_int i, c;
+
+	/* mode bit 0: the gate words; bit 1: the CPM configuration */
+	gate = pmap_mapdev(0x380724000UL, PAGE_SIZE);
+	for (i = 0; i < nitems(gate_off) && (mode & 1); i++) {
+		printf("aic xnu_pm: gate +%#x %#x ->", gate_off[i],
+		    gate[gate_off[i] / 4]);
+		gate[gate_off[i] / 4] = 0x80000000;
+		printf(" %#x\n", gate[gate_off[i] / 4]);
+	}
+	pmap_unmapdev((void *)(uintptr_t)gate, PAGE_SIZE);
+
+	for (c = 0; c < nitems(cpm_base) && (mode & 2); c++) {
+		cpm = pmap_mapdev(cpm_base[c] + 0x4000, PAGE_SIZE);
+		for (i = 0; i < nitems(cpm_seq); i++)
+			cpm[(cpm_seq[i].off - 0x4000) / 8] = cpm_seq[i].val;
+		printf("aic xnu_pm: cpm %#lx +0x4180 = %#lx\n", cpm_base[c],
+		    cpm[0x180 / 8]);
+		pmap_unmapdev((void *)(uintptr_t)cpm, PAGE_SIZE);
+	}
+}
+
 static int
 apple_aic_attach(device_t dev)
 {
@@ -459,6 +514,16 @@ apple_aic_attach(device_t dev)
 	TUNABLE_ULONG_FETCH("hw.apple_aic.cpu1_probe_delay", &aic_probe_delay);
 	if (aic_probe_mode > 0)
 		kproc_create(aic_cpu1_probe, sc, NULL, 0, 0, "aic_cpu1_probe");
+	{
+		int xnu_pm = 0;
+
+		TUNABLE_INT_FETCH("hw.apple_aic.xnu_pm", &xnu_pm);
+		if (xnu_pm)
+			aic_xnu_pm(xnu_pm);
+	}
+	TUNABLE_INT_FETCH("hw.apple_aic.siq_cfg", &aic_siq_cfg);
+	if (aic_siq_cfg)
+		aic_write_siq_cfg();
 
 	return (0);
 
@@ -958,6 +1023,8 @@ apple_aic_init_secondary(device_t dev, uint32_t rootnum)
 		return;
 
 	apple_aic_init_cpu(sc);
+	if (aic_siq_cfg)
+		aic_write_siq_cfg();
 	if (sc->sc_version == 3)
 		return;
 
