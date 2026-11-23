@@ -208,6 +208,17 @@ syscallenter(struct thread *td)
 		td->td_dbgflags &= ~(TDB_SCE | TDB_BOUNDARY);
 		PROC_UNLOCK(p);
 	}
+#ifdef __aarch64__
+	/* M5 SMP debug (kern.m5_trace_init=1): log every syscall of init. */
+	{
+		extern int m5_trace_init;
+
+		if (__predict_false(m5_trace_init) && p->p_pid == 1)
+			printf("init cpu%d sc %d (%#lx %#lx) err %d ret %#lx pc %#lx\n",
+			    PCPU_GET(cpuid), sa->code, sa->args[0], sa->args[1],
+			    error, td->td_retval[0], td->td_frame->tf_elr);
+	}
+#endif
 	(p->p_sysent->sv_set_syscall_retval)(td, error);
 	if (error != 0 && (td->td_pflags2 & TDP2_UEXTERR) != 0)
 		exterr_copyout(td);

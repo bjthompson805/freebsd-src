@@ -311,6 +311,11 @@ cpu_idle_wakeup(int cpu)
 	return (0);
 }
 
+/* M5 SMP debug: kern.m5_trace_init=1 logs init's syscalls (subr_syscall.c). */
+int m5_trace_init;
+SYSCTL_INT(_kern, OID_AUTO, m5_trace_init, CTLFLAG_RWTUN, &m5_trace_init, 0,
+    "Log every syscall made by init (pid 1)");
+
 /* M5 SMP experiment: machdep.m5_idle_spin=1 keeps secondaries out of WFI. */
 static int m5_idle_spin;
 SYSCTL_INT(_machdep, OID_AUTO, m5_idle_spin, CTLFLAG_RWTUN, &m5_idle_spin, 0,
