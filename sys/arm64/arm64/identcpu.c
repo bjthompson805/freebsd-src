@@ -2827,6 +2827,12 @@ identify_cpu_sysinit(void *dummy __unused)
 		prev_desc = desc;
 	}
 
+#if defined(M5_HEAVY_MAINT) || defined(M5_HEAVY_ICACHE)
+	/* M5 SMP experiment: never trust DIC/IDC (clean to PoU + ic ialluis) */
+	if (dic || idc)
+		printf("M5_HEAVY_MAINT: ignoring CTR_EL0 DIC %d IDC %d\n", dic, idc);
+	dic = idc = false;
+#endif
 	if (dic && idc) {
 		arm64_icache_sync_range = &arm64_dic_idc_icache_sync_range;
 		if (bootverbose)

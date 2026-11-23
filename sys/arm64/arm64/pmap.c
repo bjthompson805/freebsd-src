@@ -192,7 +192,14 @@ pt_entry_t __read_mostly pmap_gp_attr;
 #define	PMAP_SAN_PTE_BITS	(ATTR_AF | ATTR_S1_XN | pmap_sh_attr | \
   ATTR_KERN_GP | ATTR_S1_IDX(VM_MEMATTR_WRITE_BACK) | ATTR_S1_AP(ATTR_S1_AP_RW))
 
+#if defined(M5_HEAVY_MAINT) || defined(M5_HEAVY_TLB)
+/* M5 SMP experiment: after every stage 1 TLBI, also invalidate everything */
+static bool __read_mostly pmap_multiple_tlbi = true;
+#define	PMAP_EXTRA_TLBI	"tlbi	vmalle1is"
+#else
 static bool __read_mostly pmap_multiple_tlbi = false;
+#define	PMAP_EXTRA_TLBI	"tlbi	vale1is, xzr"
+#endif
 
 struct pmap_large_md_page {
 	struct rwlock   pv_lock;
@@ -1985,7 +1992,7 @@ pmap_s1_invalidate_page(pmap_t pmap, vm_offset_t va, bool final_only)
 	}
 	if (pmap_multiple_tlbi) {
 		dsb(ish);
-		__asm __volatile("tlbi	vale1is, xzr" ::: "memory");
+		__asm __volatile(PMAP_EXTRA_TLBI ::: "memory");
 	}
 	dsb(ish);
 	isb();
@@ -2036,7 +2043,7 @@ pmap_s1_invalidate_strided(pmap_t pmap, vm_offset_t sva, vm_offset_t eva,
 	}
 	if (pmap_multiple_tlbi) {
 		dsb(ish);
-		__asm __volatile("tlbi	vale1is, xzr" ::: "memory");
+		__asm __volatile(PMAP_EXTRA_TLBI ::: "memory");
 	}
 	dsb(ish);
 	isb();
@@ -2079,7 +2086,7 @@ pmap_s1_invalidate_all_kernel(void)
 	__asm __volatile("tlbi vmalle1is");
 	if (pmap_multiple_tlbi) {
 		dsb(ish);
-		__asm __volatile("tlbi	vale1is, xzr" ::: "memory");
+		__asm __volatile(PMAP_EXTRA_TLBI ::: "memory");
 	}
 	dsb(ish);
 	isb();
@@ -2105,7 +2112,7 @@ pmap_s1_invalidate_all(pmap_t pmap)
 	}
 	if (pmap_multiple_tlbi) {
 		dsb(ish);
-		__asm __volatile("tlbi	vale1is, xzr" ::: "memory");
+		__asm __volatile(PMAP_EXTRA_TLBI ::: "memory");
 	}
 	dsb(ish);
 	isb();
