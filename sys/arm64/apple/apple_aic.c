@@ -301,6 +301,7 @@ aic_cpu1_probe(void *arg)
  * TIDCP on the secondaries); FreeBSD runs at EL2 (VHE) and can do the same.
  */
 static int aic_siq_cfg;
+static int aic_ipi_global;
 
 static void
 aic_write_siq_cfg(void)
@@ -522,8 +523,22 @@ apple_aic_attach(device_t dev)
 			aic_xnu_pm(xnu_pm);
 	}
 	TUNABLE_INT_FETCH("hw.apple_aic.siq_cfg", &aic_siq_cfg);
+	TUNABLE_INT_FETCH("hw.apple_aic.ipi_global", &aic_ipi_global);
 	if (aic_siq_cfg)
 		aic_write_siq_cfg();
+	{
+		/*
+		 * M5 SMP debug: the CTRR C/D ranges iBoot leaves enabled on the
+		 * secondaries (the boot CPU reads the same bounds, CTL 0).
+		 */
+		uint64_t cl, cu, dl, du;
+
+		__asm __volatile("mrs %0, s3_0_c11_c0_0" : "=r"(cl));
+		__asm __volatile("mrs %0, s3_0_c11_c0_1" : "=r"(cu));
+		__asm __volatile("mrs %0, s3_0_c11_c0_2" : "=r"(dl));
+		__asm __volatile("mrs %0, s3_0_c11_c0_3" : "=r"(du));
+		printf("aic: CTRR C %#lx..%#lx D %#lx..%#lx\n", cl, cu, dl, du);
+	}
 
 	return (0);
 
@@ -983,7 +998,12 @@ apple_aic_ipi_send(device_t dev, struct intr_irqsrc *isrc, cpuset_t cpus,
 			 */
 			dsb(ishst);
 
-			if (CPU_AFF1(aff) == localgrp) {
+			/*
+			 * M5 SMP experiment (hw.apple_aic.ipi_global=1): always
+			 * use the global register, as m1n1 does; the local one
+			 * is only reached when two CPUs share a cluster.
+			 */
+			if (CPU_AFF1(aff) == localgrp && !aic_ipi_global) {
 				WRITE_SPECIALREG(AIC_IPI_LOCAL_RR_EL1,
 				    sendmask);
 			} else {
