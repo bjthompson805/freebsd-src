@@ -131,7 +131,7 @@ void *bootstack;
 static void *bootstacks[MAXCPU];
 
 /* M5 SMP experiment: machdep.m5_ap_park, see init_secondary(). */
-static volatile int m5_ap_park;
+static volatile int m5_ap_park, m5_ap_minimal;
 
 /* Count of started APs, used to synchronize access to bootstack. */
 static volatile int aps_started;
@@ -286,13 +286,16 @@ init_secondary(uint64_t cpu)
 	 */
 	pcpup = cpuid_to_pcpu[cpu];
 	pcpup->pc_midr = get_midr();
-	identify_cpu(cpu);
+	/* M5 SMP experiment: machdep.m5_ap_minimal=1 skips both steps. */
+	if (!m5_ap_minimal) {
+		identify_cpu(cpu);
 
-	/* Ensure the stores in identify_cpu have completed */
-	atomic_thread_fence_acq_rel();
+		/* Ensure the stores in identify_cpu have completed */
+		atomic_thread_fence_acq_rel();
 
-	/* Detect early CPU feature support */
-	enable_cpu_feat(CPU_FEAT_EARLY_BOOT);
+		/* Detect early CPU feature support */
+		enable_cpu_feat(CPU_FEAT_EARLY_BOOT);
+	}
 
 	/* Signal we are waiting for aps_after_dev */
 	atomic_add_int(&aps_started, 1);
@@ -806,6 +809,9 @@ cpu_mp_start(void)
 
 			TUNABLE_INT_FETCH("machdep.m5_ap_park", &park);
 			m5_ap_park = park;
+			park = 0;
+			TUNABLE_INT_FETCH("machdep.m5_ap_minimal", &park);
+			m5_ap_minimal = park;
 			TUNABLE_INT_FETCH("machdep.m5_ap_delay", &delay_s);
 			if (delay_s > 0) {
 				uint64_t end;
