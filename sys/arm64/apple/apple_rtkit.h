@@ -37,6 +37,15 @@ struct apple_rtkit *apple_rtkit_create(device_t dev, vm_offset_t asc,
 	    vm_offset_t mbox, const struct apple_rtkit_ops *ops, void *arg,
 	    u_int flags);
 int	apple_rtkit_boot(struct apple_rtkit *rtk);
+
+/* A system-endpoint buffer of a session a previous stage left running. */
+struct apple_rtkit_inherited {
+	uint32_t	ep;
+	uint64_t	iova;
+	size_t		size;
+};
+int	apple_rtkit_adopt(struct apple_rtkit *rtk,
+	    const struct apple_rtkit_inherited *bufs, int n);
 void	apple_rtkit_poll(struct apple_rtkit *rtk);
 int	apple_rtkit_send(struct apple_rtkit *rtk, uint32_t ep, uint64_t msg);
 int	apple_rtkit_start_ep(struct apple_rtkit *rtk, uint32_t ep);

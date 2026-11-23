@@ -166,6 +166,9 @@ struct apple_mtp_softc {
 	vm_offset_t		asc;
 	vm_offset_t		mbox;
 	vm_offset_t		dc;		/* DockChannel "data" FIFO */
+	bus_addr_t		sram_pa;	/* the IOP's own SRAM */
+	bus_size_t		sram_size;
+	bool			live;		/* adopted from U-Boot, running */
 	phandle_t		hid_node;
 	struct apple_rtkit	*rtk;
 	uint64_t		iova_next, iova_end;	/* dma-range window */
@@ -196,6 +199,11 @@ mtp_buf_map(void *arg, vm_paddr_t pa, size_t size, uint64_t *iova)
 	struct apple_mtp_softc *sc = arg;
 	int error;
 
+	/* An adopted session keeps U-Boot's DART bypass: IOVA == PA. */
+	if (sc->live) {
+		*iova = pa;
+		return (0);
+	}
 	size = roundup2(size, 16384);
 	if (sc->iova_next + size > sc->iova_end)
 		return (ENOSPC);
@@ -207,11 +215,21 @@ mtp_buf_map(void *arg, vm_paddr_t pa, size_t size, uint64_t *iova)
 	return (0);
 }
 
-/* A buffer the firmware placed itself: find it in the DART table. */
+/*
+ * A buffer the firmware placed itself: in its own SRAM (where a previous
+ * stage's session, e.g. U-Boot's keyboard driver, left it; SRAM is addressed
+ * by its physical address), or else find it in the DART table.
+ */
 static int
 mtp_buf_lookup(void *arg, uint64_t iova, size_t size, vm_paddr_t *pa)
 {
+	struct apple_mtp_softc *sc = arg;
 
+	if (sc->sram_size != 0 && iova >= sc->sram_pa &&
+	    iova + size <= sc->sram_pa + sc->sram_size) {
+		*pa = iova;
+		return (0);
+	}
 	return (apple_dart_lookup(iova, size, pa));
 }
 
@@ -932,10 +950,50 @@ apple_mtp_add_hid(struct apple_mtp_softc *sc, struct mtp_iface *ifc)
 	return (0);
 }
 
+/*
+ * U-Boot's keyboard driver hands the MTP over running (aurora's
+ * "mtp-live-v1": its firmware can't be restarted once quiesced) and lists
+ * the system-endpoint buffers it gave the firmware, 5 cells each
+ * <endpoint, iova hi, iova lo, size, mapped>. Returns the buffer count, 0
+ * if there is no live session to adopt.
+ */
+#define	MTP_LIVE_MAX_BUFS	4
+static int
+mtp_live_handoff(struct apple_mtp_softc *sc, phandle_t node,
+    struct apple_rtkit_inherited *bufs)
+{
+	pcell_t cells[MTP_LIVE_MAX_BUFS * 5];
+	char handoff[16];
+	ssize_t len;
+	int i, n;
+
+	if (OF_getprop(node, "apple,rtkit-handoff", handoff,
+	    sizeof(handoff)) <= 0 ||
+	    strncmp(handoff, "mtp-live-v1", sizeof(handoff)) != 0)
+		return (0);
+	if ((*(volatile uint32_t *)(sc->asc + 0x44) & (1 << 4)) == 0) {
+		device_printf(sc->dev, "live handoff without a running IOP\n");
+		return (0);
+	}
+	len = OF_getencprop(node, "apple,rtkit-buffers", cells, sizeof(cells));
+	if (len <= 0 || len % (5 * sizeof(pcell_t)) != 0) {
+		device_printf(sc->dev, "live handoff without a buffer list\n");
+		return (0);
+	}
+	n = len / (5 * sizeof(pcell_t));
+	for (i = 0; i < n; i++) {
+		bufs[i].ep = cells[i * 5];
+		bufs[i].iova = (uint64_t)cells[i * 5 + 1] << 32 | cells[i * 5 + 2];
+		bufs[i].size = cells[i * 5 + 3];
+	}
+	return (n);
+}
+
 static int
 apple_mtp_attach(device_t dev)
 {
 	struct apple_mtp_softc *sc = device_get_softc(dev);
+	struct apple_rtkit_inherited live_bufs[MTP_LIVE_MAX_BUFS];
 	phandle_t node, hid;
 	pcell_t xref, helper;
 	bus_addr_t pa;
@@ -964,6 +1022,8 @@ apple_mtp_attach(device_t dev)
 	if (ofw_reg_to_paddr(node, 0, &pa, &size, NULL) != 0)
 		return (ENXIO);
 	sc->asc = (vm_offset_t)pmap_mapdev(pa, size);
+	if (ofw_reg_to_paddr(node, 1, &sc->sram_pa, &sc->sram_size, NULL) != 0)
+		sc->sram_size = 0;
 	if (OF_getencprop(node, "mboxes", &xref, sizeof(xref)) <= 0 ||
 	    ofw_reg_to_paddr(OF_node_from_xref(xref), 0, &pa, &size,
 	    NULL) != 0) {
@@ -975,22 +1035,31 @@ apple_mtp_attach(device_t dev)
 	if (mtp_map_reg(dev, hid, "data", &sc->dc) != 0)
 		return (ENXIO);
 
-	if (mtp_dma_window(sc, node) != 0)
-		return (ENXIO);
-	error = apple_dart_identity(dev);
-	if (error != 0) {
-		device_printf(dev, "DART setup failed: %d\n", error);
-		return (error);
-	}
+	n = mtp_live_handoff(sc, node, live_bufs);
+	sc->live = n > 0;
+	if (sc->live) {
+		/* Its DART stays in U-Boot's bypass; its FIFO holds the
+		 * interfaces' init messages, replayed for us. */
+		device_printf(dev, "adopting the running MTP session\n");
+	} else {
+		if (mtp_dma_window(sc, node) != 0)
+			return (ENXIO);
+		error = apple_dart_identity(dev);
+		if (error != 0) {
+			device_printf(dev, "DART setup failed: %d\n", error);
+			return (error);
+		}
 
-	/* Drop anything a previous stage left in the FIFO. */
-	while (DC_RD4(sc, DC_RX_COUNT) != 0)
-		(void)DC_RD4(sc, DC_RX_8);
+		/* Drop anything a previous stage left in the FIFO. */
+		while (DC_RD4(sc, DC_RX_COUNT) != 0)
+			(void)DC_RD4(sc, DC_RX_8);
+	}
 
 	sc->rtk = apple_rtkit_create(dev, sc->asc, sc->mbox, &mtp_rtkit_ops,
 	    sc, APPLE_RTKIT_EARLY_AP);
 	mtx_lock(&sc->mtx);
-	error = apple_rtkit_boot(sc->rtk);
+	error = sc->live ? apple_rtkit_adopt(sc->rtk, live_bufs, n) :
+	    apple_rtkit_boot(sc->rtk);
 	if (error != 0) {
 		mtx_unlock(&sc->mtx);
 		device_printf(dev, "RTKit boot failed: %d\n", error);

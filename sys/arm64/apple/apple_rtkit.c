@@ -422,12 +422,69 @@ apple_rtkit_poll(struct apple_rtkit *rtk)
 		rtkit_handle(rtk, ep, msg);
 }
 
+/*
+ * Take over a session a previous stage (U-Boot's keyboard) left running, as
+ * aurora's rtkit-helper "mtp-live-v1" handoff: the firmware can't be
+ * restarted once it has been quiesced, so its endpoints stay started and its
+ * buffers stay where the stage listed them. No HELLO, no power change; the
+ * syslog's geometry was announced to the stage, so its lines aren't printed
+ * (they are still acknowledged).
+ */
+int
+apple_rtkit_adopt(struct apple_rtkit *rtk,
+    const struct apple_rtkit_inherited *bufs, int n)
+{
+	struct rtkit_buffer *buf;
+	vm_paddr_t pa;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		switch (bufs[i].ep) {
+		case EP_CRASHLOG:
+			buf = &rtk->crashlog;
+			break;
+		case EP_SYSLOG:
+			buf = &rtk->syslog;
+			break;
+		case EP_IOREPORT:
+			buf = &rtk->ioreport;
+			break;
+		case EP_OSLOG:
+			buf = &rtk->oslog;
+			break;
+		default:
+			return (EINVAL);
+		}
+		pa = bufs[i].iova;
+		if (rtk->ops->buf_lookup != NULL &&
+		    rtk->ops->buf_lookup(rtk->arg, bufs[i].iova, bufs[i].size,
+		    &pa) != 0)
+			pa = bufs[i].iova;	/* DART bypass: IOVA == PA */
+		buf->size = bufs[i].size;
+		buf->iova = bufs[i].iova;
+		buf->pa = pa;
+		buf->va = pmap_mapdev(pa, buf->size);
+		buf->iop_owned = true;
+	}
+	rtk->iop_power = PWR_ON;
+	return (0);
+}
+
 int
 apple_rtkit_boot(struct apple_rtkit *rtk)
 {
 	uint64_t msg, eps = 0;
 	uint32_t ep, ver, base;
 	int error, i;
+
+	/*
+	 * A previous stage's session (U-Boot's keyboard) can leave its last
+	 * messages, such as its power-state ack, in the mailbox: drop them.
+	 */
+	for (i = 0; i < 64 && rtkit_recv(rtk, &ep, &msg); i++)
+		;
+	if (i != 0)
+		device_printf(rtk->dev, "dropped %d stale mailbox messages\n", i);
 
 	/* Start the IOP if a previous stage stopped it, then wake it. */
 	if ((ASC_RD4(rtk, ASC_CPU_CONTROL) & ASC_CPU_CONTROL_RUN) == 0) {
@@ -439,10 +496,16 @@ apple_rtkit_boot(struct apple_rtkit *rtk)
 	if (error != 0)
 		return (error);
 
-	if (rtkit_recv_timeout(rtk, &ep, &msg, 1000000) != 0 ||
-	    ep != EP_MGMT || MSG_TYPE(msg) != MGMT_HELLO) {
-		device_printf(rtk->dev, "no RTKit HELLO\n");
-		return (ENXIO);
+	/* Skip anything else (a late power ack) on the way to HELLO. */
+	for (i = 0;; i++) {
+		if (i == 16 || rtkit_recv_timeout(rtk, &ep, &msg, 1000000) != 0) {
+			device_printf(rtk->dev, "no RTKit HELLO\n");
+			return (ENXIO);
+		}
+		if (ep == EP_MGMT && MSG_TYPE(msg) == MGMT_HELLO)
+			break;
+		device_printf(rtk->dev, "before HELLO: ep %u msg %#jx\n", ep,
+		    (uintmax_t)msg);
 	}
 	ver = MIN(RTKIT_MAX_VERSION, (msg >> 16) & 0xffff);
 	if ((msg & 0xffff) > RTKIT_MAX_VERSION || ver < RTKIT_MIN_VERSION) {
