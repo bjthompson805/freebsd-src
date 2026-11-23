@@ -526,7 +526,7 @@ apple_aic_attach(device_t dev)
 	TUNABLE_INT_FETCH("hw.apple_aic.ipi_global", &aic_ipi_global);
 	if (aic_siq_cfg)
 		aic_write_siq_cfg();
-	{
+	if (in_vhe()) {
 		/*
 		 * M5 SMP debug: the CTRR C/D ranges iBoot leaves enabled on the
 		 * secondaries (the boot CPU reads the same bounds, CTL 0).

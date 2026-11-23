@@ -405,6 +405,10 @@ LENTRY(enter_kernel_el)
 	msr	sctlr_el1, x2
 
 	/* Check for VHE */
+#ifdef M5_NO_VHE
+	/* M5 SMP experiment: run the kernel at EL1 as under the m1n1 HV */
+	b	.Lno_vhe
+#endif
 	CHECK_CPU_FEAT(x2, ID_AA64MMFR1, VH, IMPL, .Lno_vhe)
 
 	/*
