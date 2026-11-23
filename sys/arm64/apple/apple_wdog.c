@@ -178,6 +178,9 @@ apple_wdog_attach(device_t dev)
 		    (u_int)(READ(sc, APPLE_WDOG_WD1_RESET) / sc->clk_freq));
 	} else
 		WRITE(sc, APPLE_WDOG_WD1_CNTL, 0);
+	device_printf(dev, "WD0_CNTL %#x WD1_CNTL %#x WD1_TIMER %#x WD1_RESET %#x\n",
+	    READ(sc, APPLE_WDOG_WD0_CNTL), READ(sc, APPLE_WDOG_WD1_CNTL),
+	    READ(sc, APPLE_WDOG_WD1_TIMER), READ(sc, APPLE_WDOG_WD1_RESET));
 
 	return (0);
 
