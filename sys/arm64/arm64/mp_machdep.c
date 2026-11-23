@@ -130,6 +130,9 @@ uint64_t ap_cpuid;
 void *bootstack;
 static void *bootstacks[MAXCPU];
 
+/* M5 SMP experiment: machdep.m5_ap_park, see init_secondary(). */
+static volatile int m5_ap_park;
+
 /* Count of started APs, used to synchronize access to bootstack. */
 static volatile int aps_started;
 
@@ -176,6 +179,18 @@ release_aps_after_dev(void *dummy __unused)
 	/* Only release CPUs if they exist */
 	if (mp_ncpus == 1)
 		return;
+
+	/* M5 SMP experiment: machdep.m5_release_delay=N holds the APs N s longer. */
+	{
+		int delay_s = 0;
+
+		TUNABLE_INT_FETCH("machdep.m5_release_delay", &delay_s);
+		if (delay_s > 0) {
+			printf("m5_release_delay: %d s\n", delay_s);
+			DELAY(delay_s * 1000000);
+			printf("m5_release_delay: done\n");
+		}
+	}
 
 	atomic_store_int(&aps_started, 0);
 	atomic_store_rel_int(&aps_after_dev, 1);
@@ -230,6 +245,18 @@ init_secondary(uint64_t cpu)
 	struct pcpu *pcpup;
 	pmap_t pmap0;
 	uint64_t mpidr;
+
+	/*
+	 * M5 SMP experiment: spin m5_ap_park seconds right after locore,
+	 * before any C init (the BSP waits for each AP in turn).
+	 */
+	if (m5_ap_park > 0) {
+		uint64_t end = READ_SPECIALREG(cntpct_el0) +
+		    READ_SPECIALREG(cntfrq_el0) * m5_ap_park;
+
+		while (READ_SPECIALREG(cntpct_el0) < end)
+			;
+	}
 
 	ptrauth_mp_start(cpu);
 
@@ -775,8 +802,10 @@ cpu_mp_start(void)
 		 * before starting the secondaries (does a reset move with it?).
 		 */
 		{
-			int delay_s = 0;
+			int delay_s = 0, park = 0;
 
+			TUNABLE_INT_FETCH("machdep.m5_ap_park", &park);
+			m5_ap_park = park;
 			TUNABLE_INT_FETCH("machdep.m5_ap_delay", &delay_s);
 			if (delay_s > 0) {
 				uint64_t end;

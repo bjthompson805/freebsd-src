@@ -84,6 +84,10 @@ static int ans_verbose = 1;
 SYSCTL_DECL(_hw_nvme);
 SYSCTL_INT(_hw_nvme, OID_AUTO, apple_ans_verbose, CTLFLAG_RWTUN, &ans_verbose,
     0, "Print Apple ANS firmware syslog");
+/* M5 SMP experiment: spin this many seconds before touching ANS at attach. */
+static int ans_attach_delay;
+SYSCTL_INT(_hw_nvme, OID_AUTO, apple_ans_delay, CTLFLAG_RDTUN,
+    &ans_attach_delay, 0, "Seconds to wait at attach before starting ANS");
 /* M5 SMP experiment: bind the nvme interrupt thread to this CPU (-1: no). */
 static int ans_bind_cpu = -1;
 SYSCTL_INT(_hw_nvme, OID_AUTO, apple_ans_bind_cpu, CTLFLAG_RDTUN, &ans_bind_cpu,
@@ -223,6 +227,12 @@ apple_ans_attach(device_t dev)
 	int error, i, rid;
 
 	sc->dev = dev;
+	if (ans_attach_delay > 0) {
+		device_printf(dev, "waiting %d s before starting ANS\n",
+		    ans_attach_delay);
+		DELAY(ans_attach_delay * 1000000);
+		device_printf(dev, "wait done\n");
+	}
 	mtx_init(&sc->mtx, "apple_ans mbox", NULL, MTX_DEF);
 	callout_init_mtx(&sc->poll, &sc->mtx, 0);
 
