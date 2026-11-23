@@ -8,6 +8,7 @@
 #include <sys/systm.h>
 #include <sys/efi.h>
 #include <sys/efi_map.h>
+#include <sys/kernel.h>
 #include <sys/physmem.h>
 
 #include <machine/efi.h>
@@ -56,6 +57,23 @@ static void
 handle_efi_map_entry(struct efi_md *p, void *argp)
 {
 	bool exclude = *(bool *)argp;
+
+	/*
+	 * M5 SMP debug: machdep.m5_keep_bootsvc=1 never hands out the
+	 * firmware's (U-Boot's) boot services memory, in case a controller
+	 * it left running still DMAs into it.
+	 */
+	if (exclude && (p->md_type == EFI_MD_TYPE_BS_CODE ||
+	    p->md_type == EFI_MD_TYPE_BS_DATA)) {
+		int keep = 0;
+
+		TUNABLE_INT_FETCH("machdep.m5_keep_bootsvc", &keep);
+		if (keep) {
+			physmem_exclude_region(p->md_phys,
+			    p->md_pages * EFI_PAGE_SIZE, EXFLAG_NOALLOC);
+			return;
+		}
+	}
 
 	switch (p->md_type) {
 	case EFI_MD_TYPE_RECLAIM:
