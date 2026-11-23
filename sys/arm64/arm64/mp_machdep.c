@@ -770,6 +770,27 @@ cpu_mp_start(void)
 #endif
 #ifdef FDT
 	case ARM64_BUS_FDT:
+		/*
+		 * M5 SMP experiment: machdep.m5_ap_delay=N waits N seconds
+		 * before starting the secondaries (does a reset move with it?).
+		 */
+		{
+			int delay_s = 0;
+
+			TUNABLE_INT_FETCH("machdep.m5_ap_delay", &delay_s);
+			if (delay_s > 0) {
+				uint64_t end;
+
+				/* DELAY() is not calibrated this early. */
+				printf("m5_ap_delay: %d s before starting APs\n",
+				    delay_s);
+				end = READ_SPECIALREG(cntpct_el0) +
+				    READ_SPECIALREG(cntfrq_el0) * delay_s;
+				while (READ_SPECIALREG(cntpct_el0) < end)
+					;
+				printf("m5_ap_delay: done\n");
+			}
+		}
 		cpu_init_fdt();
 		break;
 #endif
