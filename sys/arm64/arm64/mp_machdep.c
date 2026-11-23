@@ -132,6 +132,7 @@ static void *bootstacks[MAXCPU];
 
 /* M5 SMP experiment: machdep.m5_ap_park, see init_secondary(). */
 static volatile int m5_ap_park, m5_ap_minimal;
+static volatile uint64_t m5_ap_isr;
 
 /* Count of started APs, used to synchronize access to bootstack. */
 static volatile int aps_started;
@@ -192,6 +193,8 @@ release_aps_after_dev(void *dummy __unused)
 		}
 	}
 
+	printf("m5: parked APs saw pending IRQ %#lx FIQ %#lx\n",
+	    m5_ap_isr & 0xffffffff, m5_ap_isr >> 32);
 	atomic_store_int(&aps_started, 0);
 	atomic_store_rel_int(&aps_after_dev, 1);
 	/* Wake up the other CPUs */
@@ -300,9 +303,19 @@ init_secondary(uint64_t cpu)
 	/* Signal we are waiting for aps_after_dev */
 	atomic_add_int(&aps_started, 1);
 
-	/* Wait for devices to be ready */
-	while (!atomic_load_int(&aps_after_dev))
+	/*
+	 * Wait for devices to be ready. M5 SMP debug: note in m5_ap_isr which
+	 * parked APs see an interrupt pending (bit cpu: IRQ, bit 32+cpu: FIQ).
+	 */
+	while (!atomic_load_int(&aps_after_dev)) {
+		uint64_t isr = READ_SPECIALREG(isr_el1);
+
+		if (isr & (1UL << 7))		/* ISR_EL1.I */
+			atomic_set_64(&m5_ap_isr, 1UL << cpu);
+		if (isr & (1UL << 6))		/* ISR_EL1.F */
+			atomic_set_64(&m5_ap_isr, 1UL << (32 + cpu));
 		MP_WAIT_EVENT();
+	}
 
 	install_cpu_errata();
 	enable_cpu_feat(CPU_FEAT_AFTER_DEV);
