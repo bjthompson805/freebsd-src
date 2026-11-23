@@ -574,7 +574,10 @@ start_cpu(u_int cpuid, uint64_t target_cpu, int domain, vm_paddr_t release_addr)
 	naps = atomic_load_int(&aps_started);
 	bootstack = (char *)bootstacks[cpuid] + MP_BOOTSTACK_SIZE;
 
-	printf("Starting CPU %u (%lx)\n", cpuid, target_cpu);
+	printf("Starting CPU %u (%lx) pcpu pa %#lx stack pa %#lx-%#lx\n",
+	    cpuid, target_cpu, pmap_kextract((vm_offset_t)pcpup),
+	    pmap_kextract((vm_offset_t)bootstacks[cpuid]),
+	    pmap_kextract((vm_offset_t)bootstack - 1));
 
 	/*
 	 * A limited set of hardware we support can only do spintables and
