@@ -51,6 +51,7 @@
 #include <sys/malloc.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
+#include <sys/exec.h>
 #include <sys/procdesc.h>
 #include <sys/ptrace.h>
 #include <sys/racct.h>
@@ -242,6 +243,31 @@ exit1(struct thread *td, int rval, int signo)
 	 * failing.
 	 */
 	if (p == initproc && rebooting == 0) {
+		/*
+		 * M5 SMP debug: what did init see? The crunched /rescue
+		 * picks its program from argv[0]; compare the user's
+		 * argv[0] with the kernel's record of the exec.
+		 */
+		{
+			struct ps_strings pss;
+			char *uarg0, buf[64];
+			size_t done;
+
+			printf("init exit: comm '%s' cpu %d\n", p->p_comm,
+			    PCPU_GET(cpuid));
+			if (p->p_args != NULL)
+				printf("init exit: p_args '%.*s' (%u bytes)\n",
+				    (int)MIN(p->p_args->ar_length, 63),
+				    p->p_args->ar_args, p->p_args->ar_length);
+			if (copyin((void *)PROC_PS_STRINGS(p), &pss,
+			    sizeof(pss)) == 0 &&
+			    copyin(pss.ps_argvstr, &uarg0, sizeof(uarg0)) == 0 &&
+			    copyinstr(uarg0, buf, sizeof(buf), &done) == 0)
+				printf("init exit: user argc %u argv[0] '%s' "
+				    "at %p\n", pss.ps_nargvstr, buf, uarg0);
+			else
+				printf("init exit: user argv unreadable\n");
+		}
 		printf("init died (signal %d, exit %d)\n", signo, rval);
 		panic("Going nowhere without my init!");
 	}
