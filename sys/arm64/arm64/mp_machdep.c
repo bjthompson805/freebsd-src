@@ -656,6 +656,22 @@ start_cpu_fdt(u_int id, phandle_t node, u_int addr_size, pcell_t *reg)
 		target_cpu |= reg[1];
 	}
 
+	/*
+	 * M5 SMP experiment: machdep.m5_cpu_skip is a mask of devicetree CPU
+	 * node indices never to start (they take no CPU id), to choose which
+	 * cores run without reordering the devicetree.
+	 */
+	{
+		u_long skip = 0;
+
+		TUNABLE_ULONG_FETCH("machdep.m5_cpu_skip", &skip);
+		if (!is_boot_cpu(target_cpu) && id < 64 && (skip & (1UL << id)) != 0) {
+			printf("CPU %#lx (node %u) skipped (machdep.m5_cpu_skip)\n",
+			    target_cpu, id);
+			return (true);
+		}
+	}
+
 	if (is_boot_cpu(target_cpu))
 		cpuid = 0;
 	else
