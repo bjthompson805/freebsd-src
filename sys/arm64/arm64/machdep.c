@@ -324,10 +324,11 @@ cpu_idle(int busy)
 	if (!busy)
 		cpu_idleclock();
 	/*
-	 * Apple M5 (T8142) secondary cores can come back from WFI with x18-x30
-	 * cleared (aurora-silicon/linux "preserve M5 registers across WFI").
-	 * x18 is our pcpu pointer: keep it and the callee-saved registers on
-	 * the stack, which survives, around the wait.
+	 * Apple M5 (T8142) secondary cores can come back from WFI with every
+	 * general register cleared (x0-x30; only sp survives, m1n1-env
+	 * tools/smp_wfi_regs.py). x18 is our pcpu pointer: keep it and the
+	 * callee-saved registers on the stack around the wait, and tell the
+	 * compiler that x0-x17 do not survive it.
 	 */
 	if (!sched_runnable() && !(m5_idle_spin && PCPU_GET(cpuid) != 0))
 		__asm __volatile(
@@ -348,7 +349,9 @@ cpu_idle(int busy)
 		    "ldp x25, x26, [sp, #64]	\n"
 		    "ldp x27, x28, [sp, #80]	\n"
 		    "ldp x29, x30, [sp], #112	\n"
-		    ::: "memory");
+		    ::: "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
+		    "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
+		    "memory");
 	if (!busy)
 		cpu_activeclock();
 	spinlock_exit();
