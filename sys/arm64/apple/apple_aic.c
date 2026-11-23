@@ -33,9 +33,13 @@
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/kernel.h>
+#include <sys/kthread.h>
+#include <sys/lock.h>
 #include <sys/module.h>
+#include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/rman.h>
+#include <sys/sched.h>
 #include <sys/smp.h>
 
 #include <machine/bus.h>
@@ -44,6 +48,9 @@
 #include <machine/intr.h>
 #include <machine/smp.h>
 #endif
+
+#include <vm/vm.h>
+#include <vm/pmap.h>
 
 #include <dev/fdt/fdt_intr.h>
 
@@ -245,6 +252,42 @@ apple_aic_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+static int aic_probe_mode;
+static u_long aic_probe_pa, aic_probe_off, aic_probe_delay;
+
+static void
+aic_cpu1_probe(void *arg)
+{
+	struct apple_aic_softc *sc = arg;
+	volatile uint32_t *reg = NULL;
+	uint32_t v = 0, n = 0;
+
+	/* Mode 2: read the register at hw.apple_aic.cpu1_probe_pa + _off. */
+	if (aic_probe_mode == 2 && aic_probe_pa != 0)
+		reg = (volatile uint32_t *)((char *)pmap_mapdev(aic_probe_pa,
+		    roundup2(aic_probe_off + 4, PAGE_SIZE)) + aic_probe_off);
+	while (!smp_started)
+		pause("aicpw", hz);
+	thread_lock(curthread);
+	sched_bind(curthread, 1);
+	thread_unlock(curthread);
+	printf("aic cpu1 probe mode %d pa %#lx+%#lx: running on CPU %d\n",
+	    aic_probe_mode, aic_probe_pa, aic_probe_off, PCPU_GET(cpuid));
+	for (;;) {
+		pause("aicp1", hz / 50);
+		/* hw.apple_aic.cpu1_probe_delay: microseconds between wake and read. */
+		if (aic_probe_delay != 0)
+			DELAY(aic_probe_delay);
+		if (reg != NULL)
+			v = *reg;
+		else
+			v = bus_read_4(sc->sc_mem, AIC_INFO);
+		if (++n % 250 == 0)
+			printf("aic cpu1 probe %u: cpu %d value %#x\n", n,
+			    PCPU_GET(cpuid), v);
+	}
+}
+
 static int
 apple_aic_attach(device_t dev)
 {
@@ -405,6 +448,17 @@ apple_aic_attach(device_t dev)
 #endif
 
 	OF_device_register_xref(xref, dev);
+
+	/*
+	 * M5 SMP experiment: hw.apple_aic.cpu1_probe=1 runs a thread bound
+	 * to CPU 1 that sleeps (WFI) and reads an AIC register on each wake.
+	 */
+	TUNABLE_INT_FETCH("hw.apple_aic.cpu1_probe", &aic_probe_mode);
+	TUNABLE_ULONG_FETCH("hw.apple_aic.cpu1_probe_pa", &aic_probe_pa);
+	TUNABLE_ULONG_FETCH("hw.apple_aic.cpu1_probe_off", &aic_probe_off);
+	TUNABLE_ULONG_FETCH("hw.apple_aic.cpu1_probe_delay", &aic_probe_delay);
+	if (aic_probe_mode > 0)
+		kproc_create(aic_cpu1_probe, sc, NULL, 0, 0, "aic_cpu1_probe");
 
 	return (0);
 

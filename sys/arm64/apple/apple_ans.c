@@ -15,11 +15,15 @@
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/kernel.h>
+#include <sys/kthread.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/proc.h>
 #include <sys/rman.h>
+#include <sys/sched.h>
+#include <sys/smp.h>
 #include <sys/sysctl.h>
 
 #include <vm/vm.h>
@@ -80,6 +84,54 @@ static int ans_verbose = 1;
 SYSCTL_DECL(_hw_nvme);
 SYSCTL_INT(_hw_nvme, OID_AUTO, apple_ans_verbose, CTLFLAG_RWTUN, &ans_verbose,
     0, "Print Apple ANS firmware syslog");
+/* M5 SMP experiment: bind the nvme interrupt thread to this CPU (-1: no). */
+static int ans_bind_cpu = -1;
+SYSCTL_INT(_hw_nvme, OID_AUTO, apple_ans_bind_cpu, CTLFLAG_RDTUN, &ans_bind_cpu,
+    0, "CPU the ANS interrupt thread is bound to (-1: unbound)");
+/*
+ * M5 SMP experiment: a thread bound to CPU 1 that sleeps (WFI) and touches
+ * the controller on each wake. 1: read CSTS and NVMMU TCB_STAT, 2: write
+ * INTMS then INTMC, 3: read the ASC CPU_CONTROL register.
+ */
+static int ans_probe_mode;
+SYSCTL_INT(_hw_nvme, OID_AUTO, apple_ans_cpu1_probe, CTLFLAG_RDTUN,
+    &ans_probe_mode, 0, "CPU 1 wake-and-touch probe mode (0: off)");
+
+static void
+ans_cpu1_probe(void *arg)
+{
+	struct apple_ans_softc *sc = arg;
+	struct nvme_controller *ctrlr = &sc->ctrlr;
+	uint32_t v = 0, n = 0;
+
+	while (!smp_started)
+		pause("anspw", hz);
+	thread_lock(curthread);
+	sched_bind(curthread, 1);
+	thread_unlock(curthread);
+	device_printf(sc->dev, "cpu1 probe mode %d: running on CPU %d\n",
+	    ans_probe_mode, PCPU_GET(cpuid));
+	for (;;) {
+		pause("ansp1", hz / 50);
+		switch (ans_probe_mode) {
+		case 1:
+			v = nvme_mmio_read_4(ctrlr, csts);
+			v += bus_read_4(ctrlr->apple_nvmmu,
+			    NVME_APPLE_NVMMU_TCB_STAT) << 16;
+			break;
+		case 2:
+			nvme_mmio_write_4(ctrlr, intms, 1);
+			nvme_mmio_write_4(ctrlr, intmc, 1);
+			break;
+		case 3:
+			v = bus_read_4(sc->asc_res, ASC_CPU_CONTROL);
+			break;
+		}
+		if (++n % 250 == 0)
+			device_printf(sc->dev, "cpu1 probe %u: cpu %d v %#x\n",
+			    n, PCPU_GET(cpuid), v);
+	}
+}
 
 #define	SART_RD4(sc, o)		(*(volatile uint32_t *)((sc)->sart + (o)))
 #define	SART_WR4(sc, o, v)	(*(volatile uint32_t *)((sc)->sart + (o)) = (v))
@@ -275,9 +327,22 @@ apple_ans_attach(device_t dev)
 		device_printf(dev, "can't set up interrupt\n");
 		return (ENXIO);
 	}
+	/*
+	 * M5 SMP experiment: hw.nvme.apple_ans_bind_cpu=N binds the interrupt
+	 * thread to CPU N (the AIC v3 has no per-IRQ target, so the IRQ itself
+	 * keeps landing on the boot CPU).
+	 */
+	if (ans_bind_cpu >= 0) {
+		error = bus_bind_intr(dev, ctrlr->res, ans_bind_cpu);
+		device_printf(dev, "interrupt thread bound to CPU %d: %d\n",
+		    ans_bind_cpu, error);
+	}
 	ctrlr->tag = (void *)0x1;
 	/* Not on PCI: QUIRK_AHCI keeps nvme(4) away from config space. */
 	ctrlr->quirks |= QUIRK_APPLE_ANS | QUIRK_AHCI;
+
+	if (ans_probe_mode > 0)
+		kproc_create(ans_cpu1_probe, sc, NULL, 0, 0, "ans_cpu1_probe");
 
 	return (nvme_attach(dev));
 }

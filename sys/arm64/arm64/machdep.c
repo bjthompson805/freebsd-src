@@ -59,6 +59,7 @@
 #include <sys/sched.h>
 #include <sys/signalvar.h>
 #include <sys/syscallsubr.h>
+#include <sys/sysctl.h>
 #include <sys/sysent.h>
 #include <sys/sysproto.h>
 #include <sys/ucontext.h>
@@ -310,6 +311,11 @@ cpu_idle_wakeup(int cpu)
 	return (0);
 }
 
+/* M5 SMP experiment: machdep.m5_idle_spin=1 keeps secondaries out of WFI. */
+static int m5_idle_spin;
+SYSCTL_INT(_machdep, OID_AUTO, m5_idle_spin, CTLFLAG_RWTUN, &m5_idle_spin, 0,
+    "Idle by spinning instead of WFI on CPUs other than 0");
+
 void
 cpu_idle(int busy)
 {
@@ -323,7 +329,7 @@ cpu_idle(int busy)
 	 * x18 is our pcpu pointer: keep it and the callee-saved registers on
 	 * the stack, which survives, around the wait.
 	 */
-	if (!sched_runnable())
+	if (!sched_runnable() && !(m5_idle_spin && PCPU_GET(cpuid) != 0))
 		__asm __volatile(
 		    "stp x29, x30, [sp, #-112]!	\n"
 		    "stp x19, x20, [sp, #16]	\n"
