@@ -473,6 +473,15 @@ hardclock_itimer(struct thread *td, struct pstats *pstats, int cnt, int usermode
 		ast_sched_mask(td, ast);
 }
 
+#ifdef __aarch64__
+#include <machine/armreg.h>
+
+SYSCTL_DECL(_machdep);
+static int m5_heartbeat;
+SYSCTL_INT(_machdep, OID_AUTO, m5_heartbeat, CTLFLAG_RWTUN, &m5_heartbeat, 0,
+    "M5 SMP debug: print CPU 0's ticks and uptime every 2 s");
+#endif
+
 void
 hardclock(int cnt, int usermode)
 {
@@ -496,6 +505,24 @@ hardclock(int cnt, int usermode)
 			break;
 		}
 	} while (!atomic_fcmpset_long(&ticksl, &global, *t));
+
+#ifdef __aarch64__
+	/*
+	 * M5 SMP debug: machdep.m5_heartbeat=1 prints CPU 0's tick count,
+	 * uptime and the raw counter every 2 s, to see whether the kernel's
+	 * clock stops advancing once the secondaries are started.
+	 */
+	if (m5_heartbeat && PCPU_GET(cpuid) == 0) {
+		static long m5_hb_last;
+
+		if (*t - m5_hb_last >= 2 * hz) {
+			m5_hb_last = *t;
+			printf("hb: cpu0 ticks %ld uptime %jd s cntvct %#lx\n",
+			    *t, (intmax_t)time_uptime,
+			    READ_SPECIALREG(cntvct_el0));
+		}
+	}
+#endif
 
 	/*
 	 * Run current process's virtual and profile time, as needed.

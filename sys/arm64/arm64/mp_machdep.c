@@ -230,7 +230,8 @@ release_aps(void *dummy __unused)
 	    "sev	\n"
 	    ::: "memory");
 
-	printf("Release APs...");
+	printf("Release APs (ticks %d uptime %jd cntvct %#lx)...", ticks,
+	    (intmax_t)time_uptime, READ_SPECIALREG(cntvct_el0));
 
 	if (wait_for_aps())
 		printf("done\n");
@@ -574,10 +575,12 @@ start_cpu(u_int cpuid, uint64_t target_cpu, int domain, vm_paddr_t release_addr)
 	naps = atomic_load_int(&aps_started);
 	bootstack = (char *)bootstacks[cpuid] + MP_BOOTSTACK_SIZE;
 
-	printf("Starting CPU %u (%lx) pcpu pa %#lx stack pa %#lx-%#lx\n",
+	printf("Starting CPU %u (%lx) pcpu pa %#lx stack pa %#lx-%#lx "
+	    "ticks %d uptime %jd cntvct %#lx\n",
 	    cpuid, target_cpu, pmap_kextract((vm_offset_t)pcpup),
 	    pmap_kextract((vm_offset_t)bootstacks[cpuid]),
-	    pmap_kextract((vm_offset_t)bootstack - 1));
+	    pmap_kextract((vm_offset_t)bootstack - 1), ticks,
+	    (intmax_t)time_uptime, READ_SPECIALREG(cntvct_el0));
 
 	/*
 	 * A limited set of hardware we support can only do spintables and
