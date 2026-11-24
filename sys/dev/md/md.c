@@ -103,6 +103,9 @@
 #include <vm/uma.h>
 
 #include <machine/bus.h>
+#ifdef __aarch64__
+#include <machine/cpufunc.h>
+#endif
 
 #define MD_MODVER 1
 
@@ -2044,6 +2047,24 @@ md_preloaded(u_char *image, size_t length, const char *name)
 	struct md_s *sc;
 	int error;
 
+#ifdef __aarch64__
+	/*
+	 * M5 SMP debug: machdep.m5_md_clean=1 cleans the loader-written image
+	 * out of the boot CPU's caches to memory before anything reads it.
+	 * init (reading /rescue from this image) only ever went wrong on
+	 * CPUs other than the boot CPU.
+	 */
+	{
+		int clean = 0;
+
+		TUNABLE_INT_FETCH("machdep.m5_md_clean", &clean);
+		if (clean) {
+			cpu_dcache_wbinv_range(image, length);
+			printf("m5: md image %p+%#zx cleaned to PoC\n", image,
+			    length);
+		}
+	}
+#endif
 	sc = mdnew(-1, &error, MD_PRELOAD);
 	if (sc == NULL)
 		return;
