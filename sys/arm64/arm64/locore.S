@@ -559,7 +559,12 @@ LENTRY(create_pagetables)
 	mov	x7, LPA2_VAL
 	and	x6, x6, LPA2_MASK
 	cmp	x6, x7
+#ifdef M5_OUTER_SHAREABLE
+	/* M5 SMP experiment: map normal memory Outer Shareable. */
+	ldr	x22, =(ATTR_SH(ATTR_SH_OS))
+#else
 	ldr	x22, =(ATTR_SH(ATTR_SH_IS))
+#endif
 	csel	x22, xzr, x22, eq
 #undef LPA2_MASK
 #undef LPA2_VAL
@@ -1126,9 +1131,15 @@ tcr:
 #error Unsupported page size
 #endif
 
+#ifdef M5_OUTER_SHAREABLE
+	.quad (TCR_TxSZ(64 - VIRT_BITS) | TCR_TG |			\
+	    (UL(2) << TCR_SH1_SHIFT) | TCR_ORGN1_WBWA | TCR_IRGN1_WBWA |	\
+	    (UL(2) << TCR_SH0_SHIFT) | TCR_ORGN0_WBWA | TCR_IRGN0_WBWA)
+#else
 	.quad (TCR_TxSZ(64 - VIRT_BITS) | TCR_TG |			\
 	    TCR_SH1_IS | TCR_ORGN1_WBWA | TCR_IRGN1_WBWA |		\
 	    TCR_SH0_IS | TCR_ORGN0_WBWA | TCR_IRGN0_WBWA)
+#endif
 LEND(start_mmu)
 
 ENTRY(abort)

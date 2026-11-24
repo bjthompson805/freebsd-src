@@ -230,8 +230,9 @@ release_aps(void *dummy __unused)
 	    "sev	\n"
 	    ::: "memory");
 
-	printf("Release APs (ticks %d uptime %jd cntvct %#lx)...", ticks,
-	    (intmax_t)time_uptime, READ_SPECIALREG(cntvct_el0));
+	printf("Release APs (ticks %d uptime %jd cntvct %#lx sh %#lx)...", ticks,
+	    (intmax_t)time_uptime, READ_SPECIALREG(cntvct_el0),
+	    (u_long)pmap_sh_attr);
 
 	if (wait_for_aps())
 		printf("done\n");
