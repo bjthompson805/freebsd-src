@@ -166,6 +166,16 @@ static SYSCTL_NODE(_hw, OID_AUTO, apple_agx, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
 static int agx_stage = 1;
 SYSCTL_INT(_hw_apple_agx, OID_AUTO, stage, CTLFLAG_RDTUN, &agx_stage, 0,
     "Bring-up stage to run at attach");
+/*
+ * initdata.rs publish_effort: the effort word of Region C, which the
+ * firmware takes as a floor for its performance state (power.rs
+ * FULL_EFFORT 0x10000). Published at each kick; -1 leaves it alone.
+ */
+#define	AGX_REGION_C_EFFORT		0xe8
+#define	AGX_REGION_C_EFFORT_OVERRIDE	0xec
+static int agx_effort = 0x10000;
+SYSCTL_INT(_hw_apple_agx, OID_AUTO, effort, CTLFLAG_RWTUN, &agx_effort, 0,
+    "Effort published to the firmware at each kick (-1: none)");
 /* Experiment: a render for another context waits for the GPU to drain. */
 static int agx_ctx_drain = 0;
 SYSCTL_INT(_hw_apple_agx, OID_AUTO, ctx_drain, CTLFLAG_RWTUN, &agx_ctx_drain,
@@ -1013,6 +1023,23 @@ agx_control_state(struct apple_agx_softc *sc)
 	    agx_graph_state_grids[0] + AGX_CONTROL_STATE));
 }
 
+/* initdata.rs publish_effort: the override, then the effort, then a barrier. */
+static void
+agx_publish_effort(struct apple_agx_softc *sc)
+{
+	volatile uint32_t *effort;
+	int rc;
+
+	if (agx_effort < 0 || (rc = agx_graph_find("region_c")) < 0)
+		return;
+	effort = (volatile uint32_t *)(sc->graph_va[rc] + AGX_REGION_C_EFFORT);
+	if (*effort == (uint32_t)agx_effort)
+		return;
+	effort[(AGX_REGION_C_EFFORT_OVERRIDE - AGX_REGION_C_EFFORT) / 4] = 0;
+	*effort = agx_effort;
+	dsb(sy);
+}
+
 /*
  * Rings::publish_control and InitData::publish_control: the record, the
  * power-assert tally, barrier, producer, barrier; then the primary's
@@ -1562,6 +1589,7 @@ agx_kick(struct apple_agx_softc *sc, struct agx_compute_queue *queue,
 	queue->stamp = d.stamp_value;
 	queue->items_end = end;
 	queue->ordinal = ordinal + 1;
+	agx_publish_effort(sc);
 	return (apple_rtkit_send(sc->roles[0].rtk, AGX_EP_DOORBELL,
 	    AGX_MSG_WORK_NOTIFY | 0x02 | AGX_Q_PRIORITY << 2));
 }
@@ -2752,6 +2780,7 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	r->ts = ts + 1;
 	r->next_id += 2;
 	r->ordinal = ordinal + 1;
+	agx_publish_effort(sc);
 	return (apple_rtkit_send(sc->roles[0].rtk, AGX_EP_DOORBELL,
 	    AGX_MSG_WORK_NOTIFY | AGX_RENDER_PRIORITY << 2));
 }
