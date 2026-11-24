@@ -361,6 +361,15 @@ cpu_idle(int busy)
 		    ::: "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8",
 		    "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17",
 		    "memory");
+	/*
+	 * The same WFI can also lose the FP/SIMD registers, which may still
+	 * hold the lazily switched state of the thread that last used the
+	 * FPU here: if that thread comes back to this CPU, vfp would skip the
+	 * reload (fpcurthread == td) and it would run on whatever the wake
+	 * left behind. Forget the owner so the next FPU use reloads it from
+	 * its pcb.
+	 */
+	PCPU_SET(fpcurthread, NULL);
 	if (!busy)
 		cpu_activeclock();
 	spinlock_exit();
