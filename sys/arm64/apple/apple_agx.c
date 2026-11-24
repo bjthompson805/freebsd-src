@@ -108,6 +108,7 @@
 #define	AGX_EVENT_SLOTS		256
 #define	AGX_EVENT_WORDS		18
 #define	AGX_EVENT_STAMP		1
+#define	AGX_EVENT_RESTART	4
 /* Device control (g17/fw/channels.rs). */
 #define	AGX_CONTROL_SLOTS	256
 #define	AGX_CONTROL_RECORD_SIZE	0x40
@@ -3168,7 +3169,41 @@ agx_stage2(struct apple_agx_softc *sc, phandle_t node)
 	return (0);
 }
 
-/* Drain firmware events. A stamp event carries a bit mask of ready QIDs. */
+/*
+ * regs.rs fault_banks: G15+ has two MMU fault banks behind one INFO/ADDR
+ * window. Aurora reads them on a restart event, with the firmware halted.
+ */
+#define	AGX_FAULT_BANK_SELECT	0xd800
+#define	AGX_FAULT_INFO		0xd8c0
+#define	AGX_FAULT_ADDR		0xd8c8
+
+static void
+agx_report_mmu_fault(struct apple_agx_softc *sc)
+{
+	volatile uint64_t *sel = (volatile uint64_t *)(sc->sgx +
+	    AGX_FAULT_BANK_SELECT);
+	uint64_t saved, info, addr;
+	u_int bank;
+
+	saved = *sel;
+	for (bank = 0; bank < 2; bank++) {
+		*sel = bank;
+		dsb(sy);
+		info = *(volatile uint64_t *)(sc->sgx + AGX_FAULT_INFO);
+		addr = *(volatile uint64_t *)(sc->sgx + AGX_FAULT_ADDR);
+		device_printf(sc->dev, "MMU fault bank %u: info %#jx addr %#jx\n",
+		    bank, (uintmax_t)info, (uintmax_t)addr);
+	}
+	*sel = saved;
+	dsb(sy);
+}
+
+/*
+ * Drain firmware events. A stamp event carries a bit mask of ready QIDs.
+ * g17/fw/channels.rs: 4 restart {generation u64, stamp}, 6 TVB grow,
+ * 7 compute fault, 12 context killed, 13 free-list grow. Only stamps are
+ * serviced; every other event is logged in full.
+ */
 static void
 agx_drain_events(struct agx_role *r)
 {
@@ -3202,6 +3237,13 @@ agx_drain_events(struct agx_role *r)
 			device_printf(sc->dev, "%s: event %u tag %u: %#x %#x %#x "
 			    "%#x %#x\n", r->name, c, rec[0], rec[1], rec[2],
 			    rec[3], rec[4], rec[5]);
+		if (rec[0] != AGX_EVENT_STAMP) {
+			device_printf(sc->dev, "%s: event %u type %u: %#x %#x %#x "
+			    "%#x %#x %#x %#x %#x\n", r->name, c, rec[0], rec[1],
+			    rec[2], rec[3], rec[4], rec[5], rec[6], rec[7], rec[8]);
+			if (rec[0] == AGX_EVENT_RESTART)
+				agx_report_mmu_fault(sc);
+		}
 		if (idx == 0 && rec[0] == AGX_EVENT_STAMP && (rec[1] & 3) != 0) {
 			sc->render.stamp_events++;
 			if (sc->render.in_flight != 0)
