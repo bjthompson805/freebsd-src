@@ -10,8 +10,9 @@
  * the codec the clock consumer. Playback is "cout" (stereo), capture "cin"
  * (the headset microphone, mono).
  *
- * Stage 1: the jack only. The speakers stay off (their amplifiers' shutdown
- * line is never raised here) until speaker protection exists.
+ * The "Speaker" link is apple_macaudio_spk.c: two more sound(4) devices
+ * (speakers, speaker sense) as children of this one, so the jack stays pcm0,
+ * and macaudio's speaker protection interlock.
  *
  * sound(4) calls trigger and the mixer with locks held, but the firmware and
  * the codec sleep, so power changes and volume run on a taskqueue. The DMA
@@ -42,6 +43,7 @@
 
 #include <arm64/apple/apple_admac.h>
 #include <arm64/apple/apple_aop_audio.h>
+#include <arm64/apple/apple_macaudio_spk.h>
 #include <arm64/apple/cs42l84.h>
 
 #define	MA_RATE		48000
@@ -92,6 +94,7 @@ struct ma_softc {
 	struct task		vol_task;
 	struct ma_chan		play;
 	struct ma_chan		rec;
+	struct ma_spk		*spk;		/* the speakers, if admitted */
 };
 
 static struct ofw_compat_data compat_data[] = {
@@ -557,6 +560,7 @@ ma_init(void *arg)
 		return;
 	}
 	mixer_init(sc->dev, &ma_mixer_class, sc);
+	(void)ma_spk_attach(sc->dev, sc->aop_audio, &sc->spk);
 }
 
 static int
@@ -600,6 +604,9 @@ ma_detach(device_t dev)
 	struct ma_chan *chans[] = { &sc->play, &sc->rec };
 	int error, i;
 
+	if ((error = ma_spk_detach(sc->spk)) != 0)
+		return (error);
+	sc->spk = NULL;
 	if ((error = pcm_unregister(dev)) != 0)
 		return (error);
 	mtx_lock(&sc->mtx);
@@ -638,4 +645,5 @@ MODULE_DEPEND(apple_macaudio, sound, SOUND_MINVER, SOUND_PREFVER,
 MODULE_DEPEND(apple_macaudio, apple_aop, 1, 1, 1);
 MODULE_DEPEND(apple_macaudio, apple_admac, 1, 1, 1);
 MODULE_DEPEND(apple_macaudio, cs42l84, 1, 1, 1);
+MODULE_DEPEND(apple_macaudio, tas2764, 1, 1, 1);
 MODULE_VERSION(apple_macaudio, 1);

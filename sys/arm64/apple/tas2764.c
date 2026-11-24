@@ -91,6 +91,9 @@
 #define	 TAS2764_PWR_CTRL_MUTE		0x01
 #define	 TAS2764_PWR_CTRL_SHUTDOWN	0x02
 #define	 TAS2764_PWR_CTRL_RESET		0x1a	/* reset value */
+/* TAS2764_VSENSE_POWER_EN / _ISENSE_POWER_EN: set = sense ADC down */
+#define	 TAS2764_PWR_CTRL_VSNS_PD	0x08
+#define	 TAS2764_PWR_CTRL_ISNS_PD	0x10
 #define	 TAS2764_PWR_CTRL_BOP_SRC	0x80
 #define	TAS2764_CHNL_0			TAS2764_REG(0x0, 0x03)
 #define	 TAS2764_CHNL_0_GAIN_SHIFT	1
@@ -296,6 +299,8 @@ struct tas2764_softc {
 	uint32_t		rate, width;
 	u_int			vol;
 	u_int			gain;
+	bool			vsense, isense;	/* "VSENSE/ISENSE Switch" */
+	char			prefix[64];	/* sound-name-prefix */
 
 	/* Faults. */
 	uint8_t			fault_bits;
@@ -538,6 +543,20 @@ tas2764_write_gain(struct tas2764_softc *sc)
 	    gain << TAS2764_CHNL_0_GAIN_SHIFT));
 }
 
+/*
+ * The V/I sense ADCs: Linux's "VSENSE Switch" / "ISENSE Switch", DAPM
+ * switches on PWR_CTRL bits 3 and 4 (inverted).  Leaves the mode bits.
+ */
+static int
+tas2764_write_sense(struct tas2764_softc *sc)
+{
+
+	return (tas2764_update(sc, TAS2764_PWR_CTRL,
+	    TAS2764_PWR_CTRL_VSNS_PD | TAS2764_PWR_CTRL_ISNS_PD,
+	    (sc->vsense ? 0 : TAS2764_PWR_CTRL_VSNS_PD) |
+	    (sc->isense ? 0 : TAS2764_PWR_CTRL_ISNS_PD)));
+}
+
 /* tas2764_write_sdout_idle_mask(): slots 0-31 */
 static int
 tas2764_write_idle_mask(struct tas2764_softc *sc, uint32_t mask)
@@ -595,7 +614,7 @@ tas2764_program(struct tas2764_softc *sc)
 		W(TAS2764_INT_MASK4, 0xff);
 	}
 
-	/* tas2764_set_ivsense_transmit() (the sense ADCs stay powered off) */
+	/* tas2764_set_ivsense_transmit(); the ADCs follow the switches */
 	if (sc->imon >= 0 && sc->vmon >= 0) {
 		U(TAS2764_TDM_CFG5, TAS2764_TDM_CFG5_VSNS_ENABLE |
 		    TAS2764_TDM_CFG5_50_MASK,
@@ -722,6 +741,9 @@ tas2764_program(struct tas2764_softc *sc)
 	}
 	U(TAS2764_TDM_CFG0, TAS2764_TDM_CFG0_SMP_MASK | TAS2764_TDM_CFG0_MASK,
 	    v);
+
+	if ((error = tas2764_write_sense(sc)) != 0)
+		return (error);
 
 	/* Gain and volume, capped; reset left them at maximum and 0 dB. */
 	if ((error = tas2764_write_gain(sc)) != 0)
@@ -1028,6 +1050,57 @@ tas2764_set_amp_gain(device_t dev, u_int level)
 	return (error);
 }
 
+u_int
+tas2764_get_amp_gain(device_t dev)
+{
+	struct tas2764_softc *sc = device_get_softc(dev);
+	u_int gain;
+
+	sx_xlock(&tas2764_sx);
+	gain = sc->gain;
+	sx_xunlock(&tas2764_sx);
+	return (gain);
+}
+
+u_int
+tas2764_get_amp_gain_max(device_t dev)
+{
+	struct tas2764_softc *sc = device_get_softc(dev);
+
+	return (tas2764_gain_limit(sc));
+}
+
+int
+tas2764_get_adt_level(device_t dev)
+{
+	struct tas2764_softc *sc = device_get_softc(dev);
+
+	return (sc->adt_level);
+}
+
+int
+tas2764_set_sense(device_t dev, bool vsense, bool isense)
+{
+	struct tas2764_softc *sc = device_get_softc(dev);
+	int error = 0;
+
+	sx_xlock(&tas2764_sx);
+	sc->vsense = vsense;
+	sc->isense = isense;
+	if (sc->powered)
+		error = tas2764_write_sense(sc);
+	sx_xunlock(&tas2764_sx);
+	return (error);
+}
+
+const char *
+tas2764_get_prefix(device_t dev)
+{
+	struct tas2764_softc *sc = device_get_softc(dev);
+
+	return (sc->prefix);
+}
+
 bool
 tas2764_is_tweeter(device_t dev)
 {
@@ -1085,6 +1158,7 @@ tas2764_parse_dt(struct tas2764_softc *sc, phandle_t node)
 	    sizeof(prefix) - 1);
 	if (len > 0) {
 		prefix[len] = '\0';
+		strlcpy(sc->prefix, prefix, sizeof(sc->prefix));
 		sc->tweeter = strstr(prefix, "Tweeter") != NULL;
 		device_printf(sc->dev, "%s\n", prefix);
 	}

@@ -45,8 +45,8 @@
  *
  * For the J815 speaker link: tas2764_set_fmt(dev, TAS2764_FMT_I2S,
  * TAS2764_INV_NB_IF); amp k of the dai-link's codec list (ADT
- * speaker-config order) gets tas2764_set_tdm(dev, k, -1, -1, 32, 8)
- * (macaudio: nslots = fls(tdm_mask), MACAUDIO_SLOTWIDTH 32); then
+ * speaker-config order) gets tas2764_set_tdm(dev, k, -1, -1, 32, 6)
+ * (macaudio: nslots = fls(tdm_mask 0x3f), MACAUDIO_SLOTWIDTH 32); then
  * tas2764_hw_params(dev, 48000, 24).
  *
  * HARD LIMITS, enforced inside the driver whatever the caller asks:
@@ -105,8 +105,8 @@ int	tas2764_set_fmt(device_t dev, int fmt, int inv);
  * the amp takes that one slot for its "Left" input), the frame's slot count
  * and slot width (16, 24 or 32).  imon_slot / vmon_slot are the V/I sense
  * transmit slots (0..63); -1 keeps the device tree's ti,imon-slot-no /
- * ti,vmon-slot-no.  The sense ADCs stay powered off: nothing captures them
- * yet.  EBUSY while powered.
+ * ti,vmon-slot-no.  The sense ADCs are powered by tas2764_set_sense().
+ * EBUSY while powered.
  */
 int	tas2764_set_tdm(device_t dev, int tx_slot, int imon_slot, int vmon_slot,
 	    int slot_width, int nslots);
@@ -145,6 +145,24 @@ u_int	tas2764_get_volume(device_t dev);
 
 /* Amp gain level (see above).  Clamped; applies immediately when powered. */
 int	tas2764_set_amp_gain(device_t dev, u_int level);
+
+u_int	tas2764_get_amp_gain(device_t dev);
+/* The highest amp gain level the driver takes (its cap and the ADT level). */
+u_int	tas2764_get_amp_gain_max(device_t dev);
+/*
+ * The amp's operating level from the boot loader (apple,speaker-config
+ * byte 1, macaudio_sn012776_level()), or -1 when the DT has none.
+ */
+int	tas2764_get_adt_level(device_t dev);
+
+/*
+ * The V/I sense ADCs ("VSENSE Switch", "ISENSE Switch"); off by default.
+ * Applies immediately when powered, else at the next power-on.
+ */
+int	tas2764_set_sense(device_t dev, bool vsense, bool isense);
+
+/* sound-name-prefix ("Left Woofer 1"), "" if none. */
+const char *tas2764_get_prefix(device_t dev);
 
 /* True when this amp is a tweeter (sound-name-prefix). */
 bool	tas2764_is_tweeter(device_t dev);
