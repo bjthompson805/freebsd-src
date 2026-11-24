@@ -284,6 +284,7 @@ static inline int
 dev_err_probe(const struct device *dev, int err, const char *fmt, ...)
 {
 	va_list args;
+	char buf[256];
 
 	va_start(args, fmt);
 
@@ -291,7 +292,8 @@ dev_err_probe(const struct device *dev, int err, const char *fmt, ...)
 	 * On Linux, they look at the error code to determine if the message
 	 * should be logged (not logged if -ENOMEM) and at which log level.
 	 */
-	device_printf(dev->bsddev, fmt, args);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	device_printf(dev->bsddev, "%s", buf);
 
 	va_end(args);
 
