@@ -368,8 +368,10 @@ nvme_qpair_apple_submit(struct nvme_qpair *qpair, struct nvme_tracker *tr)
 	bus_dmamap_sync(qpair->dma_tag, qpair->queuemem_map,
 	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 	wmb();
+	mtx_lock_spin(&ctrlr->apple_lock);
 	bus_write_4(ctrlr->apple_nvmmu, qpair->id == 0 ?
 	    NVME_APPLE_LSQ_ASQ_DB : NVME_APPLE_LSQ_IOSQ_DB, tr->cid);
+	mtx_unlock_spin(&ctrlr->apple_lock);
 	qpair->num_cmds++;
 }
 
@@ -392,6 +394,7 @@ _nvme_qpair_process_completions(struct nvme_qpair *qpair)
 	struct nvme_completion	cpl;
 	bool done = false;
 	bool in_panic = dumping || SCHEDULER_STOPPED();
+	bool apple = (qpair->ctrlr->quirks & QUIRK_APPLE_ANS) != 0;
 
 	mtx_assert(&qpair->recovery, MA_OWNED);
 
@@ -489,9 +492,23 @@ _nvme_qpair_process_completions(struct nvme_qpair *qpair)
 		else
 			tr = NULL;
 
-		if (tr != NULL &&
-		    (qpair->ctrlr->quirks & QUIRK_APPLE_ANS) != 0)
-			nvme_qpair_apple_inval(qpair, cpl.cid);
+		/*
+		 * Apple ANS2: release the TCB and hand the CQ slot back under
+		 * apple_lock before completing the tracker, so no SQ doorbell
+		 * (including one from the completion callback) lands in between.
+		 */
+		if (apple) {
+			mtx_lock_spin(&qpair->ctrlr->apple_lock);
+			if (tr != NULL)
+				nvme_qpair_apple_inval(qpair, cpl.cid);
+			if (++qpair->cq_head == qpair->num_entries) {
+				qpair->cq_head = 0;
+				qpair->phase = !qpair->phase;
+			}
+			bus_write_4(qpair->ctrlr->resource, qpair->cq_hdbl_off,
+			    qpair->cq_head);
+			mtx_unlock_spin(&qpair->ctrlr->apple_lock);
+		}
 
 		done = true;
 		if (tr != NULL) {
@@ -524,13 +541,15 @@ _nvme_qpair_process_completions(struct nvme_qpair *qpair)
 		 * using the atomic store to force strong ordering (at least when
 		 * viewed in the aftermath of a panic).
 		 */
+		if (apple)
+			continue;
 		if (++qpair->cq_head == qpair->num_entries) {		/* 1 */
 			atomic_store_rel_int(&qpair->cq_head, 0);	/* 2 */
 			qpair->phase = !qpair->phase;			/* 3 */
 		}
 	}
 
-	if (done) {
+	if (done && !apple) {
 		bus_write_4(qpair->ctrlr->resource, qpair->cq_hdbl_off,
 		    qpair->cq_head);
 	}

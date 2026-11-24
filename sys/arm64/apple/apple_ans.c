@@ -56,6 +56,14 @@
 #define	ANS_BOOT_STATUS_OK		0xde71ce55
 #define	ANS_FLUSH_PAGE_SIZE		16384
 
+/*
+ * ANS raises one interrupt per completion, and it can arrive before the entry
+ * is visible in the CQ (2-16 us on T6040, per Linux apple.c). No second
+ * interrupt follows, so an empty pass would leave the command waiting for the
+ * I/O timeout. Give a late entry time to land.
+ */
+#define	ANS_LATE_CQE_US			100
+
 struct apple_ans_softc {
 	struct nvme_controller	ctrlr;		/* must be first: DEVICE2SOFTC */
 	device_t		dev;
@@ -214,6 +222,35 @@ apple_ans_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+static bool
+apple_ans_process(struct nvme_controller *ctrlr)
+{
+	bool found;
+
+	found = nvme_qpair_process_completions(&ctrlr->adminq);
+	if (ctrlr->ioq != NULL && ctrlr->ioq[0].cpl != NULL)
+		found |= nvme_qpair_process_completions(&ctrlr->ioq[0]);
+	return (found);
+}
+
+/* nvme_ctrlr_shared_handler, plus the late-entry wait. */
+static void
+apple_ans_intr(void *arg)
+{
+	struct nvme_controller *ctrlr = arg;
+	int us;
+
+	nvme_mmio_write_4(ctrlr, intms, 1);
+	if (!apple_ans_process(ctrlr)) {
+		for (us = 0; us < ANS_LATE_CQE_US; us++) {
+			DELAY(1);
+			if (apple_ans_process(ctrlr))
+				break;
+		}
+	}
+	nvme_mmio_write_4(ctrlr, intmc, 1);
+}
+
 static int
 apple_ans_attach(device_t dev)
 {
@@ -323,6 +360,7 @@ apple_ans_attach(device_t dev)
 	}
 	device_printf(dev, "RTKit up\n");
 
+	mtx_init(&ctrlr->apple_lock, "nvme apple", NULL, MTX_SPIN);
 	ctrlr->rid = 0;
 	ctrlr->res = bus_alloc_resource_any(dev, SYS_RES_IRQ, &ctrlr->rid,
 	    RF_SHAREABLE | RF_ACTIVE);
@@ -333,7 +371,7 @@ apple_ans_attach(device_t dev)
 	ctrlr->msi_count = 0;
 	ctrlr->num_io_queues = 1;
 	if (bus_setup_intr(dev, ctrlr->res, INTR_TYPE_MISC | INTR_MPSAFE,
-	    NULL, nvme_ctrlr_shared_handler, ctrlr, &ctrlr->tag) != 0) {
+	    NULL, apple_ans_intr, ctrlr, &ctrlr->tag) != 0) {
 		device_printf(dev, "can't set up interrupt\n");
 		return (ENXIO);
 	}

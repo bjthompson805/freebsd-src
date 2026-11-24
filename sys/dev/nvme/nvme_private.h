@@ -326,6 +326,12 @@ struct nvme_controller {
 	struct nvme_apple_tcb	*apple_tcb[2];	/* admin, I/O: indexed by cid */
 	uint64_t		apple_tcb_bus[2];
 	uint64_t		apple_flush_bus;	/* scratch PRP, if required */
+	/*
+	 * Keeps SQ doorbells out of a completion's TCB invalidate .. CQ
+	 * doorbell window: a doorbell inside it can lose the next completion
+	 * interrupt (ANS firmware bug, see Linux apple.c).
+	 */
+	struct mtx		apple_lock;
 
 	struct nvme_qpair	adminq;
 	struct nvme_qpair	*ioq;
