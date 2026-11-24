@@ -333,6 +333,14 @@ static device_method_t apple_i2c_methods[] = {
 
 	DEVMETHOD(ofw_bus_get_node,	apple_i2c_get_node),
 
+	/* Children's interrupts (codec jack, amp faults) go up the tree. */
+	DEVMETHOD(bus_alloc_resource,	bus_generic_alloc_resource),
+	DEVMETHOD(bus_release_resource,	bus_generic_release_resource),
+	DEVMETHOD(bus_activate_resource, bus_generic_activate_resource),
+	DEVMETHOD(bus_deactivate_resource, bus_generic_deactivate_resource),
+	DEVMETHOD(bus_setup_intr,	bus_generic_setup_intr),
+	DEVMETHOD(bus_teardown_intr,	bus_generic_teardown_intr),
+
 	DEVMETHOD(iicbus_callback,	iicbus_null_callback),
 	DEVMETHOD(iicbus_reset,		apple_i2c_reset),
 	DEVMETHOD(iicbus_transfer,	apple_i2c_transfer),
