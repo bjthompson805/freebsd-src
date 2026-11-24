@@ -944,6 +944,7 @@ cpufreq_curr_sysctl(SYSCTL_HANDLER_ARGS)
 	struct cpufreq_softc *sc;
 	struct cf_level *levels;
 	int best, count, diff, bdiff, devcount, error, freq, i, n;
+	int own_count, own_max, own_min;
 	device_t *devs;
 
 	devs = NULL;
@@ -962,7 +963,18 @@ cpufreq_curr_sysctl(SYSCTL_HANDLER_ARGS)
 	 * While we only call cpufreq_get() on one device (assuming all
 	 * CPUs have equal levels), we call cpufreq_set() on all CPUs.
 	 * This is needed for some MP systems.
+	 *
+	 * On a heterogeneous system each cluster is its own frequency
+	 * domain with its own levels, set through its own CPU's sysctl:
+	 * skip the devices whose levels differ from this one's.
 	 */
+	count = CF_MAX_LEVELS;
+	error = CPUFREQ_LEVELS(sc->dev, levels, &count);
+	if (error)
+		goto out;
+	own_count = count;
+	own_max = levels[0].total_set.freq;
+	own_min = levels[count - 1].total_set.freq;
 	error = devclass_get_devices(devclass_find("cpufreq"), &devs, &devcount);
 	if (error)
 		goto out;
@@ -975,6 +987,10 @@ cpufreq_curr_sysctl(SYSCTL_HANDLER_ARGS)
 			"cpufreq: need to increase CF_MAX_LEVELS\n");
 			break;
 		}
+		if (devs[n] != sc->dev && (count != own_count ||
+		    levels[0].total_set.freq != own_max ||
+		    levels[count - 1].total_set.freq != own_min))
+			continue;
 		best = 0;
 		bdiff = 1 << 30;
 		for (i = 0; i < count; i++) {
