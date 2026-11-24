@@ -29,8 +29,11 @@
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/ofw/ofw_subr.h>
 
+#include <arm64/apple/apple_smc.h>
+
 #include "clock_if.h"
 
+#define	SPMI_CMD_EXT_WRITEL	0x30
 #define	SPMI_CMD_EXT_READL	0x38
 #define	SPMI_CMD_PARITY		(1u << 15)
 #define	SPMI_REPLY_CMD(r)	((r) & 0xff)
@@ -56,6 +59,8 @@ struct apple_pmu_rtc_softc {
 	uint8_t			sid;
 	uint16_t		offset_reg;
 };
+
+static struct apple_pmu_rtc_softc *apple_pmu_rtc_sc;
 
 #define	SPMI_RD4(sc, o)		(*(volatile uint32_t *)((sc)->spmi + (o)))
 #define	SPMI_WR4(sc, o, v)	(*(volatile uint32_t *)((sc)->spmi + (o)) = (v))
@@ -103,6 +108,65 @@ spmi_readl(struct apple_pmu_rtc_softc *sc, uint16_t addr, uint8_t *buf,
 		return (EIO);
 	}
 	return (0);
+}
+
+/* Extended register write long: the data words follow the command word. */
+static int
+spmi_writel(struct apple_pmu_rtc_softc *sc, uint16_t addr, const uint8_t *buf,
+    size_t len)
+{
+	uint8_t opc = SPMI_CMD_EXT_WRITEL | (len - 1);
+	uint32_t reply, word;
+	size_t i;
+	int n;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+	for (n = 0; n < 64 && !spmi_rx_empty(sc); n++)
+		(void)SPMI_RD4(sc, sc->regs->reply);
+
+	SPMI_WR4(sc, sc->regs->command, opc | sc->sid << 8 |
+	    (uint32_t)addr << 16 | SPMI_CMD_PARITY);
+	for (i = 0; i < len; i += 4) {
+		word = 0;
+		memcpy(&word, buf + i, MIN(4, len - i));
+		SPMI_WR4(sc, sc->regs->command, word);
+	}
+	for (n = 0; spmi_rx_empty(sc); n++) {
+		if (n == 5000)
+			return (ETIMEDOUT);
+		DELAY(10);
+	}
+	reply = SPMI_RD4(sc, sc->regs->reply);
+	if (SPMI_REPLY_CMD(reply) != opc || SPMI_REPLY_SID(reply) != sc->sid)
+		return (EIO);
+	return (0);
+}
+
+/*
+ * Read-modify-write of one byte of PMU scratch space (same PMIC as the RTC
+ * offset), for the SMC reboot driver's nvmem cells. Verified by read-back.
+ */
+int
+apple_pmu_update(uint16_t addr, uint8_t mask, uint8_t val)
+{
+	struct apple_pmu_rtc_softc *sc = apple_pmu_rtc_sc;
+	uint8_t b, nb;
+	int error;
+
+	if (sc == NULL)
+		return (ENXIO);
+	mtx_lock(&sc->mtx);
+	error = spmi_readl(sc, addr, &b, 1);
+	nb = (b & ~mask) | (val & mask);
+	if (error == 0 && nb != b) {
+		error = spmi_writel(sc, addr, &nb, 1);
+		if (error == 0)
+			error = spmi_readl(sc, addr, &b, 1);
+		if (error == 0 && b != nb)
+			error = EIO;
+	}
+	mtx_unlock(&sc->mtx);
+	return (error);
 }
 
 static int
@@ -185,6 +249,7 @@ apple_pmu_rtc_attach(device_t dev)
 	    &spmi_gen4 : &spmi_gen1;
 	sc->spmi = (vm_offset_t)pmap_mapdev(pa, size);
 	mtx_init(&sc->mtx, "apple_pmu_rtc", NULL, MTX_DEF);
+	apple_pmu_rtc_sc = sc;
 
 	/* XXX bring-up: N1 low-power-mode state (ADT info-scrpad_lpm_ctrl/_log) */
 	{
