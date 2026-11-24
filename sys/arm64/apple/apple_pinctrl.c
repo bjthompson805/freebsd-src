@@ -86,6 +86,8 @@ struct apple_pinctrl_softc {
 	device_t		sc_busdev;
 	struct mtx		sc_mtx;
 	int			sc_ngpios;
+	/* gpio-reserved-ranges: pins that are not the AP's (a read can SError). */
+	uint8_t			*sc_reserved;
 
 	void			*sc_intrhand;
 	struct resource		*sc_res[APPLE_PINCTRL_NRES];
@@ -98,8 +100,37 @@ struct apple_pinctrl_softc {
 
 static struct ofw_compat_data compat_data[] = {
 	{"apple,pinctrl",	1},
+	{"apple,t8103-pinctrl",	1},
 	{NULL,			0},
 };
+
+/* A pin we may touch: in range and not in gpio-reserved-ranges. */
+static bool
+apple_pinctrl_pin_ok(struct apple_pinctrl_softc *sc, uint32_t pin)
+{
+
+	return (pin < sc->sc_ngpios &&
+	    (sc->sc_reserved == NULL || !sc->sc_reserved[pin]));
+}
+
+static void
+apple_pinctrl_read_reserved(struct apple_pinctrl_softc *sc, phandle_t node)
+{
+	pcell_t *ranges;
+	ssize_t len;
+	uint32_t i, pin;
+
+	len = OF_getencprop_alloc_multi(node, "gpio-reserved-ranges",
+	    sizeof(*ranges) * 2, (void **)&ranges);
+	if (len <= 0)
+		return;
+	sc->sc_reserved = malloc(sc->sc_ngpios, M_DEVBUF, M_WAITOK | M_ZERO);
+	for (i = 0; i < len; i++)
+		for (pin = ranges[2 * i]; pin < ranges[2 * i] +
+		    ranges[2 * i + 1] && pin < sc->sc_ngpios; pin++)
+			sc->sc_reserved[pin] = 1;
+	OF_prop_free(ranges);
+}
 
 static struct resource_spec apple_pinctrl_res_spec[] = {
 	{ SYS_RES_MEMORY,	0,	RF_ACTIVE },
@@ -161,15 +192,15 @@ apple_pinctrl_attach(device_t dev)
 		goto error;
 	}
 
+	apple_pinctrl_read_reserved(sc, node);
+
 	fdt_pinctrl_register(dev, "pinmux");
 	fdt_pinctrl_configure_tree(dev);
 
-	if (OF_hasprop(node, "interrupt-controller")) {
-		sc->sc_irqs = mallocarray(sc->sc_ngpios,
-		    sizeof(*sc->sc_irqs), M_DEVBUF, M_ZERO | M_WAITOK);
-		intr_pic_register(dev,
-		    OF_xref_from_node(ofw_bus_get_node(dev)));
-	}
+	/*
+	 * The nodes say interrupt-controller, but this driver has no PIC methods
+	 * yet, so it does not register as one (that would hand out dead interrupts).
+	 */
 
 	sc->sc_busdev = gpiobus_add_bus(dev);
 	if (sc->sc_busdev == NULL) {
@@ -260,7 +291,7 @@ apple_pinctrl_pin_getflags(device_t dev, uint32_t pin, uint32_t *flags)
 	uint32_t reg;
 
 	sc = device_get_softc(dev);
-	if (pin >= sc->sc_ngpios)
+	if (!apple_pinctrl_pin_ok(sc, pin))
 		return (EINVAL);
 
 	*flags = 0;
@@ -268,10 +299,12 @@ apple_pinctrl_pin_getflags(device_t dev, uint32_t pin, uint32_t *flags)
 	APPLE_PINCTRL_LOCK(sc);
 
 	reg = HREAD4(sc, GPIO_PIN(pin));
-	if ((reg & GPIO_PIN_MODE_INPUT) != 0)
-		*flags |= GPIO_PIN_INPUT;
-	else if ((reg & GPIO_PIN_MODE_OUTPUT) != 0)
-		*flags |= GPIO_PIN_OUTPUT;
+	if ((reg & GPIO_PIN_FUNC_MASK) == 0) {
+		if ((reg & GPIO_PIN_MODE_MASK) == GPIO_PIN_MODE_OUTPUT)
+			*flags |= GPIO_PIN_OUTPUT;
+		else
+			*flags |= GPIO_PIN_INPUT;
+	}
 
 	APPLE_PINCTRL_UNLOCK(sc);
 
@@ -292,7 +325,7 @@ apple_pinctrl_pin_setflags(device_t dev, uint32_t pin, uint32_t flags)
 	struct apple_pinctrl_softc *sc;
 
 	sc = device_get_softc(dev);
-	if (pin >= sc->sc_ngpios)
+	if (!apple_pinctrl_pin_ok(sc, pin))
 		return (EINVAL);
 
 	APPLE_PINCTRL_LOCK(sc);
@@ -309,7 +342,7 @@ apple_pinctrl_pin_get(device_t dev, uint32_t pin, unsigned int *val)
 	uint32_t reg;
 
 	sc = device_get_softc(dev);
-	if (pin >= sc->sc_ngpios)
+	if (!apple_pinctrl_pin_ok(sc, pin))
 		return (EINVAL);
 
 	APPLE_PINCTRL_LOCK(sc);
@@ -326,7 +359,7 @@ apple_pinctrl_pin_set(device_t dev, uint32_t pin, unsigned int value)
 	struct apple_pinctrl_softc *sc;
 
 	sc = device_get_softc(dev);
-	if (pin >= sc->sc_ngpios)
+	if (!apple_pinctrl_pin_ok(sc, pin))
 		return (EINVAL);
 
 	APPLE_PINCTRL_LOCK(sc);
@@ -334,8 +367,6 @@ apple_pinctrl_pin_set(device_t dev, uint32_t pin, unsigned int value)
 		HSET4(sc, GPIO_PIN(pin), GPIO_PIN_DATA);
 	else
 		HCLR4(sc, GPIO_PIN(pin), GPIO_PIN_DATA);
-	device_printf(sc->sc_dev, "set pin %d to %x\n",
-	    pin, HREAD4(sc, GPIO_PIN(pin)));
 	APPLE_PINCTRL_UNLOCK(sc);
 	return (0);
 }
@@ -348,7 +379,7 @@ apple_pinctrl_pin_toggle(device_t dev, uint32_t pin)
 	uint32_t reg;
 
 	sc = device_get_softc(dev);
-	if (pin >= sc->sc_ngpios)
+	if (!apple_pinctrl_pin_ok(sc, pin))
 		return (EINVAL);
 
 	APPLE_PINCTRL_LOCK(sc);
@@ -383,9 +414,11 @@ apple_pinctrl_pin_config_32(device_t dev, uint32_t first_pin, uint32_t num_pins,
 	 * adjacent groups of 8 pins that line up the same as the config regs.
 	 */
 	APPLE_PINCTRL_LOCK(sc);
-	for (pin = first_pin; pin < num_pins; ++pin) {
-		if (pin_flags[pin] & (GPIO_PIN_INPUT | GPIO_PIN_OUTPUT))
-			apple_pinctrl_pin_configure(sc, pin, pin_flags[pin]);
+	for (pin = 0; pin < num_pins; ++pin) {
+		if (apple_pinctrl_pin_ok(sc, first_pin + pin) &&
+		    (pin_flags[pin] & (GPIO_PIN_INPUT | GPIO_PIN_OUTPUT)))
+			apple_pinctrl_pin_configure(sc, first_pin + pin,
+			    pin_flags[pin]);
 	}
 	APPLE_PINCTRL_UNLOCK(sc);
 
@@ -422,6 +455,8 @@ apple_pinctrl_configure(device_t dev, phandle_t cfgxref)
 	for (i = 0; i < len / sizeof(pcell_t); i++) {
 		pin = APPLE_PIN(pinmux[i]);
 		func = APPLE_FUNC(pinmux[i]);
+		if (!apple_pinctrl_pin_ok(sc, pin))
+			continue;
 		reg = HREAD4(sc, GPIO_PIN(pin));
 		reg &= ~GPIO_PIN_FUNC_MASK;
 		reg |= (func << GPIO_PIN_FUNC_SHIFT) & GPIO_PIN_FUNC_MASK;
