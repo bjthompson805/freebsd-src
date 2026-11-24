@@ -50,6 +50,7 @@
 #include <sys/lock.h>
 #include <sys/module.h>
 #include <sys/sx.h>
+#include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 
 #include <dev/gpio/gpiobusvar.h>
@@ -413,10 +414,42 @@ cs42l84_unlock_deliver(struct cs42l84_softc *sc)
 	sc->nevents = 0;
 	sx_xunlock(&sc->lock);
 
+	/* devd/userland: system CS42L84, subsystem JACK or BUTTON. */
+	for (i = 0; i < n; i++) {
+		char data[48];
+
+		if (events[i] & CS42L84_JACK_BTN_MASK) {
+			snprintf(data, sizeof(data), "button=%s",
+			    events[i] & CS42L84_JACK_BTN_PLAY ? "play" :
+			    events[i] & CS42L84_JACK_BTN_VOLUP ? "volup" :
+			    "voldown");
+			devctl_notify("CS42L84", device_get_nameunit(sc->dev),
+			    "BUTTON", data);
+		} else {
+			snprintf(data, sizeof(data), "headphone=%d mic=%d",
+			    (events[i] & CS42L84_JACK_HEADPHONE) != 0,
+			    (events[i] & CS42L84_JACK_MIC) != 0);
+			devctl_notify("CS42L84", device_get_nameunit(sc->dev),
+			    "JACK", data);
+		}
+	}
 	if (cb == NULL)
 		return;
 	for (i = 0; i < n; i++)
 		cb(arg, events[i]);
+}
+
+/* dev.cs42l84.N.headphone / .mic: arg2 is the CS42L84_JACK_* bit. */
+static int
+cs42l84_jack_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct cs42l84_softc *sc = arg1;
+	int val;
+
+	sx_xlock(&sc->lock);
+	val = (sc->hs_type & arg2) != 0;
+	sx_xunlock(&sc->lock);
+	return (sysctl_handle_int(oidp, &val, 0, req));
 }
 
 /*
@@ -1462,6 +1495,16 @@ cs42l84_attach(device_t dev)
 	sc->nevents = 0;
 	sx_xunlock(&sc->lock);
 
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "headphone",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
+	    CS42L84_JACK_HEADPHONE, cs42l84_jack_sysctl, "I",
+	    "Headphones plugged in");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "mic",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
+	    CS42L84_JACK_MIC, cs42l84_jack_sysctl, "I",
+	    "Headset with a microphone plugged in");
 	OF_device_register_xref(OF_xref_from_node(node), dev);
 	return (0);
 
