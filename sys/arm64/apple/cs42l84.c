@@ -32,9 +32,10 @@
  * (Asahi Linux contributors, based on Cirrus' cs42l42), register for
  * register.  The ASoC DAPM graph is flattened into fixed power-up and
  * power-down sequences per stream direction (cs42l84_set_power()); the
- * plug interrupt thread is run from a poll, since the jack line's pin
- * controller has no interrupt support yet.  The interface for the sound
- * glue is in cs42l84.h.
+ * plug interrupt thread runs as the handler of the level-low jack line
+ * in the interrupt thread (the pin controller masks the line until it
+ * returns), or from a poll when the interrupt cannot be set up.  The
+ * interface for the sound glue is in cs42l84.h.
  *
  * Registers are 16-bit (big-endian on the wire), values 8-bit, one
  * register per transfer (regmap use_single_read/write).  There is no
@@ -49,6 +50,8 @@
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/module.h>
+#include <sys/proc.h>
+#include <sys/rman.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
@@ -260,6 +263,9 @@ struct cs42l84_softc {
 	struct sx		lock;
 	gpio_pin_t		reset_gpio;
 	struct timeout_task	poll_task;
+	struct resource		*irq_res;
+	void			*irq_cookie;
+	bool			irq_ok;		/* plug events by interrupt */
 	bool			detaching;
 	bool			poll_plug;
 
@@ -702,12 +708,61 @@ cs42l84_poll(void *arg, int pending __unused)
 		sx_xunlock(&sc->lock);
 		return;
 	}
-	if (sc->poll_plug)
+	if (sc->poll_plug) {
 		cs42l84_irq_handle(sc);
+		/* The attach pass is done; the interrupt takes over. */
+		if (sc->irq_ok)
+			sc->poll_plug = false;
+	}
 	if (sc->remote_active)
 		cs42l84_remote_poll(sc);
 	cs42l84_schedule(sc);
 	cs42l84_unlock_deliver(sc);
+}
+
+/*
+ * Jack line handler, in the interrupt thread: the pin controller masks
+ * the level-low line before the thread runs and unmasks it when this
+ * returns (a Linux oneshot threaded IRQ).  The I2C work sleeps, as
+ * iichid's does from its interrupt thread.
+ */
+static void
+cs42l84_intr(void *arg)
+{
+	struct cs42l84_softc *sc = arg;
+
+	THREAD_SLEEPING_OK();
+	cs42l84_jack_event(sc->dev);
+	THREAD_NO_SLEEPING();
+}
+
+/* The jack interrupt; without it the plug poll keeps running. */
+static void
+cs42l84_setup_irq(struct cs42l84_softc *sc)
+{
+	int error, rid;
+
+	rid = 0;
+	sc->irq_res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ, &rid,
+	    RF_ACTIVE);
+	if (sc->irq_res == NULL) {
+		device_printf(sc->dev, "no IRQ: polling the jack\n");
+		return;
+	}
+	error = bus_setup_intr(sc->dev, sc->irq_res,
+	    INTR_TYPE_MISC | INTR_MPSAFE, NULL, cs42l84_intr, sc,
+	    &sc->irq_cookie);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "IRQ setup failed (%d): polling the jack\n", error);
+		bus_release_resource(sc->dev, SYS_RES_IRQ, rid, sc->irq_res);
+		sc->irq_res = NULL;
+		sc->irq_cookie = NULL;
+		return;
+	}
+	sx_xlock(&sc->lock);
+	sc->irq_ok = true;
+	sx_xunlock(&sc->lock);
 }
 
 /*
@@ -1495,6 +1550,9 @@ cs42l84_attach(device_t dev)
 	sc->nevents = 0;
 	sx_xunlock(&sc->lock);
 
+	/* The plug poll's first pass still runs the attach detection. */
+	cs42l84_setup_irq(sc);
+
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "headphone",
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc,
@@ -1527,6 +1585,16 @@ cs42l84_detach(device_t dev)
 	sc->detaching = true;
 	sc->jack_cb = NULL;
 	sx_xunlock(&sc->lock);
+	if (sc->irq_cookie != NULL) {
+		/* Waits for a running handler (which sees detaching). */
+		bus_teardown_intr(dev, sc->irq_res, sc->irq_cookie);
+		sc->irq_cookie = NULL;
+	}
+	if (sc->irq_res != NULL) {
+		bus_release_resource(dev, SYS_RES_IRQ,
+		    rman_get_rid(sc->irq_res), sc->irq_res);
+		sc->irq_res = NULL;
+	}
 	while (taskqueue_cancel_timeout(taskqueue_thread, &sc->poll_task,
 	    NULL) != 0)
 		taskqueue_drain_timeout(taskqueue_thread, &sc->poll_task);

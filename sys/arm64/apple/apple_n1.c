@@ -23,6 +23,8 @@
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/callout.h>
+#include <sys/conf.h>
+#include <sys/devctl.h>
 #include <sys/endian.h>
 #include <sys/eventhandler.h>
 #include <sys/firmware.h>
@@ -32,7 +34,11 @@
 #include <sys/mbuf.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/priv.h>
+#include <sys/proc.h>
 #include <sys/rman.h>
+#include <sys/sbuf.h>
+#include <sys/sx.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 
@@ -65,6 +71,7 @@
 #include <netgraph/bluetooth/include/ng_hci.h>
 
 #include <arm64/apple/apple_dart.h>
+#include <arm64/apple/apple_n1_wifi.h>
 #include <arm64/apple/apple_smc.h>
 
 /* hw.apple_n1.debug=1: bring-up diagnostics (register/ring/context dumps, firmware log) */
@@ -199,16 +206,33 @@ struct n1_softc {
 		uint32_t	reply_cmd, channels, scans, beacons;
 		int		reply_valid;
 		uint8_t		mac[6];
-		uint8_t		bss[32][6];
+		/* scan results, updated from ring 4 (under mtx) */
+		struct n1wifi_bss bss[N1WIFI_MAXBSS];
 		int		nbss;
-		/* join target, from hw.apple_n1.ssid / hw.apple_n1.pmk */
+		uint32_t	scan_gen;
+		/*
+		 * Join target: from hw.apple_n1.ssid / hw.apple_n1.pmk at boot,
+		 * from N1WIFI_JOIN later.
+		 */
 		char		ssid[33];
 		uint8_t		pmk[32];
 		int		have_pmk, found;
 		uint8_t		bssid[6], chan, band;
+		int8_t		rssi;
 		uint16_t	rsn_caps;
 		int		connecting, connect_event, associated;
 		uint16_t	connect_status;
+		/* control device (/dev/n1wifi) */
+		struct cdev	*cdev;
+		struct sx	cmd_sx;		/* one command sequence */
+		struct taskqueue *tq;		/* scan, join, link */
+		struct task	scan_task, join_task, link_task;
+		int		scanning, joining, radio_off, booted;
+		int		disconnect_event;
+		uint8_t		want_bssid[6];
+		int		want_flags;
+		uint32_t	join_gen;
+		int		join_error;
 		/* data path (aurora data_probe, drain_data_rx/tx) */
 		uint32_t	data_done;
 		int		connected;
@@ -1095,6 +1119,8 @@ static int n1w_data_ring(struct n1_softc *, unsigned int);
 static void n1w_target(struct n1_softc *);
 static int n1_alpha_start(struct n1_softc *);
 static int n1w_scan(struct n1_softc *);
+static int n1w_pick(struct n1_softc *);
+static void n1w_ctl_attach(struct n1_softc *);
 static int n1_bt_start(struct n1_softc *);
 static struct ng_type n1bt_typestruct;
 
@@ -1405,11 +1431,15 @@ n1_start_ipc(struct n1_softc *sc)
 		return (error);
 	}
 	n1w_target(sc);
-	if ((error = n1_alpha_start(sc)) == 0 && (error = n1w_start(sc)) == 0)
+	if ((error = n1_alpha_start(sc)) == 0 &&
+	    (error = n1w_start(sc)) == 0) {
 		error = n1w_scan(sc);
-	if (error == 0 && sc->w.ssid[0] != '\0' && sc->w.have_pmk &&
-	    (error = n1w_join(sc)) == 0)
-		error = n1w_attach_if(sc);
+		if (error == 0 && sc->w.ssid[0] != '\0' && sc->w.have_pmk &&
+		    (error = n1w_pick(sc)) == 0 && (error = n1w_join(sc)) == 0)
+			error = n1w_attach_if(sc);
+		/* /dev/n1wifi: whatever the boot-time join did */
+		n1w_ctl_attach(sc);
+	}
 	device_printf(sc->dev, "wifi: %d\n", error);
 	/* Beta as before (btcentauri needs only control booted, beta at 2) */
 	if ((error = n1_fn_start(sc, 2, &sc->beta)) != 0)
@@ -2035,58 +2065,180 @@ n1w_post(struct n1_softc *sc, int ring, uint16_t slot)
 	cpu_dcache_wb_range(d, 16);
 }
 
-/* A beacon or probe response (ring 4): 0x60-byte descriptor, then the frame */
+/*
+ * RSN element (48): version, group cipher, pairwise and AKM suite lists,
+ * capabilities. The security bits are what aurora's wifi_connect checks
+ * before a join (AKM PSK offered, CCMP pairwise and group), plus the AKMs it
+ * refuses, so a panel can say why a network cannot be joined.
+ */
+static uint16_t
+n1w_rsn(const uint8_t *q, const uint8_t *e, uint16_t *caps)
+{
+	static const uint8_t oui[3] = { 0x00, 0x0f, 0xac };
+	uint16_t sec = N1WIFI_SEC_RSN, n;
+	int ccmp = 0;
+
+	q += 2;					/* version */
+	if (q + 4 > e)
+		return (sec);
+	if (memcmp(q, oui, 3) != 0 || q[3] != 4)	/* group cipher */
+		ccmp = -1;
+	q += 4;
+	if (q + 2 > e)
+		return (sec);
+	for (n = le16dec(q), q += 2; n != 0 && q + 4 <= e; n--, q += 4)
+		if (memcmp(q, oui, 3) == 0 && q[3] == 4 && ccmp == 0)
+			ccmp = 1;
+	if (ccmp == 1)
+		sec |= N1WIFI_SEC_CCMP;
+	if (q + 2 > e)
+		return (sec);
+	for (n = le16dec(q), q += 2; n != 0 && q + 4 <= e; n--, q += 4) {
+		if (memcmp(q, oui, 3) != 0)
+			continue;
+		switch (q[3]) {
+		case 1: case 5:
+			sec |= N1WIFI_SEC_8021X;
+			break;
+		case 2:
+			sec |= N1WIFI_SEC_PSK;
+			break;
+		case 6:
+			sec |= N1WIFI_SEC_PSK256;
+			break;
+		case 8:
+			sec |= N1WIFI_SEC_SAE;
+			break;
+		}
+	}
+	if (q + 2 <= e) {
+		*caps = le16dec(q);
+		if (*caps & 0x40)
+			sec |= N1WIFI_SEC_PMF_REQ;
+	}
+	return (sec);
+}
+
+/*
+ * A beacon or probe response (ring 4): 0x60-byte descriptor, then the frame
+ * (aurora report_beacon: channel from DS parameters or HT operation, signal
+ * the larger of the two chains at 0x16/0x17). Called with the mutex held.
+ * Entries are kept per BSSID and refreshed on every frame.
+ */
 static void
 n1w_beacon(struct n1_softc *sc, const uint8_t *p, size_t size)
 {
+	static const uint8_t wpa[4] = { 0x00, 0x50, 0xf2, 0x01 };
 	const uint8_t *f = p + 0x60, *ie, *end;
-	char ssid[33];
-	int chan = 0, rssi, i;
+	struct n1wifi_bss *b;
+	uint16_t sec = 0, caps = 0;
+	int chan = 0, rssi, i, slen = 0;
+	const uint8_t *ssid = NULL;
 
 	if (size < 0x60 + 36 || (f[0] != 0x80 && f[0] != 0x50))
 		return;
 	sc->w.beacons++;
-	for (i = 0; i < sc->w.nbss; i++)
-		if (memcmp(sc->w.bss[i], f + 16, 6) == 0)
-			return;
-	if (sc->w.nbss < (int)nitems(sc->w.bss))
-		memcpy(sc->w.bss[sc->w.nbss++], f + 16, 6);
 	end = p + size;
-	ssid[0] = '\0';
 	for (ie = f + 36; ie + 2 <= end && ie + 2 + ie[1] <= end;
 	    ie += 2 + ie[1]) {
-		if (ie[0] == 0 && ie[1] <= 32) {
-			memcpy(ssid, ie + 2, ie[1]);
-			ssid[ie[1]] = '\0';
+		if (ie[0] == 0 && ie[1] <= 32 && ssid == NULL) {
+			ssid = ie + 2;
+			slen = ie[1];
 		}
 		if ((ie[0] == 3 || ie[0] == 61) && ie[1] != 0)
 			chan = ie[2];
+		if (ie[0] == 48 && ie[1] >= 2)
+			sec |= n1w_rsn(ie + 2, ie + 2 + ie[1], &caps);
+		if (ie[0] == 221 && ie[1] >= 4 && memcmp(ie + 2, wpa, 4) == 0)
+			sec |= N1WIFI_SEC_WPA1;
 	}
+	if (chan == 0)		/* aurora drops these */
+		return;
+	if (le16dec(f + 34) & 0x10)
+		sec |= N1WIFI_SEC_PRIVACY;
+	/* What wifi_connect accepts: RSN offering PSK, CCMP */
+	if ((sec & (N1WIFI_SEC_PSK | N1WIFI_SEC_CCMP)) ==
+	    (N1WIFI_SEC_PSK | N1WIFI_SEC_CCMP))
+		sec |= N1WIFI_SEC_JOINABLE;
 	rssi = MAX((int8_t)p[0x16], (int8_t)p[0x17]);
-	if (sc->w.ssid[0] != '\0' && strcmp(ssid, sc->w.ssid) == 0 &&
-	    !sc->w.found) {
-		sc->w.found = 1;
-		memcpy(sc->w.bssid, f + 16, 6);
-		sc->w.chan = chan;
-		sc->w.band = chan > 14;
-		/* RSN element: version, group, pairwise and AKM lists, caps */
-		for (ie = f + 36; ie + 2 <= end && ie + 2 + ie[1] <= end;
-		    ie += 2 + ie[1]) {
-			const uint8_t *q = ie + 2, *e = ie + 2 + ie[1];
-
-			if (ie[0] != 48 || ie[1] < 8)
-				continue;
-			q += 2 + 4;
-			if (q + 2 <= e)
-				q += 2 + 4 * le16dec(q);
-			if (q + 2 <= e)
-				q += 2 + 4 * le16dec(q);
-			if (q + 2 <= e)
-				sc->w.rsn_caps = le16dec(q);
-		}
+	if (rssi >= 0 || rssi < -127)
+		rssi = -95;		/* as aurora */
+	for (i = 0; i < sc->w.nbss; i++)
+		if (memcmp(sc->w.bss[i].bssid, f + 16, 6) == 0)
+			break;
+	if (i == sc->w.nbss) {
+		if (sc->w.nbss == N1WIFI_MAXBSS) {
+			/* replace the weakest */
+			for (i = 0; i < sc->w.nbss; i++)
+				if (sc->w.bss[i].rssi < rssi)
+					break;
+			if (i == sc->w.nbss)
+				return;
+			for (int j = i + 1; j < sc->w.nbss; j++)
+				if (sc->w.bss[j].rssi < sc->w.bss[i].rssi)
+					i = j;
+		} else
+			sc->w.nbss++;
+		b = &sc->w.bss[i];
+		memset(b, 0, sizeof(*b));
+		memcpy(b->bssid, f + 16, 6);
+		if (!sc->w.booted)
+			device_printf(sc->dev, "wifi: bss %6D chan %3d rssi %4d "
+			    "\"%.*s\"\n", f + 16, ":", chan, rssi, slen,
+			    ssid != NULL ? (const char *)ssid : "");
 	}
-	device_printf(sc->dev, "wifi: bss %6D chan %3d rssi %4d \"%s\"\n",
-	    f + 16, ":", chan, rssi, ssid);
+	b = &sc->w.bss[i];
+	/* A probe response names a hidden network; a beacon may not */
+	if (slen != 0 && ssid[0] != '\0') {
+		b->ssid_len = slen;
+		memcpy(b->ssid, ssid, slen);
+	}
+	b->channel = chan;
+	b->band = chan > 14;
+	b->rssi = rssi;
+	b->security = sec;
+	b->rsn_caps = caps;
+	b->scan_gen = sc->w.scan_gen + 1;
+	if (sc->w.connected && memcmp(b->bssid, sc->w.bssid, 6) == 0)
+		sc->w.rssi = rssi;
+}
+
+/*
+ * The join target: the strongest BSS with the target SSID (or the requested
+ * BSSID) that wifi_connect would accept. Sets the BSSID, channel, band and
+ * the AP's RSN capabilities the join copies into its RSN element.
+ */
+static int
+n1w_pick(struct n1_softc *sc)
+{
+	struct n1wifi_bss *b, *best = NULL;
+	size_t len = strlen(sc->w.ssid);
+	int i;
+
+	mtx_lock(&sc->w.mtx);
+	for (i = 0; i < sc->w.nbss; i++) {
+		b = &sc->w.bss[i];
+		if (b->ssid_len != len || memcmp(b->ssid, sc->w.ssid, len) != 0)
+			continue;
+		if ((sc->w.want_flags & N1WIFI_J_BSSID) &&
+		    memcmp(b->bssid, sc->w.want_bssid, 6) != 0)
+			continue;
+		if (best == NULL || b->rssi > best->rssi)
+			best = b;
+	}
+	sc->w.found = best != NULL;
+	if (best != NULL) {
+		memcpy(sc->w.bssid, best->bssid, 6);
+		sc->w.chan = best->channel;
+		sc->w.band = best->band;
+		sc->w.rssi = best->rssi;
+		sc->w.rsn_caps = best->rsn_caps;
+	}
+	/* The boot-time (tunable) join is tried whatever the parse says */
+	i = best == NULL ? ENOENT : sc->w.booted &&
+	    (best->security & N1WIFI_SEC_JOINABLE) == 0 ? EOPNOTSUPP : 0;
+	mtx_unlock(&sc->w.mtx);
+	return (i);
 }
 
 static void
@@ -2094,6 +2246,7 @@ n1w_drain(struct n1_softc *sc)
 {
 	int ring, posted = 0;
 
+	mtx_assert(&sc->w.mtx, MA_OWNED);
 	for (ring = 2; ring <= 4; ring++) {
 		int budget = w_rsize[ring];
 
@@ -2136,7 +2289,17 @@ n1w_drain(struct n1_softc *sc)
 					device_printf(sc->dev, "wifi: "
 					    "supplicant result %u phase %u\n",
 					    le32dec(p + 0x18), p[0x1c]);
-				else
+				else if (cmd == 0x80000003 ||
+				    cmd == 0x80000004) {
+					/* aurora: link_worker disconnects */
+					device_printf(sc->dev, "wifi: "
+					    "disconnect event %#x status %u\n",
+					    cmd, status);
+					sc->w.disconnect_event = 1;
+					if (sc->w.connected && sc->w.booted)
+						taskqueue_enqueue(sc->w.tq,
+						    &sc->w.link_task);
+				} else
 					N1_DPRINTF(sc, "wifi: event %#x status "
 					    "%u size %u\n", cmd, status, size);
 			} else {
@@ -2187,14 +2350,23 @@ n1w_dump(struct n1_softc *sc)
 static int
 n1w_cmd(struct n1_softc *sc, uint32_t id, const void *payload, size_t size)
 {
-	uint16_t slot = sc->w.cmd_head, seq = ++sc->w.seq;
+	uint16_t slot, seq;
 	uint8_t *p, *d;
 	int i;
 
+	/*
+	 * Commands are serialized by cmd_sx (or the boot task); the mutex
+	 * keeps the poll callout's drain off the rings meanwhile.
+	 */
 	if (size + 24 > W_BUFSZ)
 		return (EMSGSIZE);
-	if ((slot + 1) % w_rsize[1] == n1w_idx(sc, 1, 1))
+	mtx_lock(&sc->w.mtx);
+	slot = sc->w.cmd_head;
+	seq = ++sc->w.seq;
+	if ((slot + 1) % w_rsize[1] == n1w_idx(sc, 1, 1)) {
+		mtx_unlock(&sc->w.mtx);
 		return (ENOSPC);
+	}
 	p = sc->w.win + W_TX_BUF + slot * W_BUFSZ;
 	memset(p, 0, 24 + size);
 	le16enc(p + 0x10, 24 + size);
@@ -2214,17 +2386,23 @@ n1w_cmd(struct n1_softc *sc, uint32_t id, const void *payload, size_t size)
 	bus_write_4(sc->fnbar[1], 0x1004, 1);
 	for (i = 0; i < 150; i++) {
 		n1w_drain(sc);
-		if (!n1w_up(sc))
+		if (!n1w_up(sc)) {
+			mtx_unlock(&sc->w.mtx);
 			return (EIO);
+		}
 		if (sc->w.reply_valid && sc->w.reply_seq == seq &&
 		    sc->w.reply_cmd == id) {
+			mtx_unlock(&sc->w.mtx);
 			if (sc->w.reply_status != 0)
 				device_printf(sc->dev, "wifi: command %#x "
 				    "status %u\n", id, sc->w.reply_status);
 			return (sc->w.reply_status != 0 ? EIO : 0);
 		}
+		mtx_unlock(&sc->w.mtx);
 		pause("n1wc", hz / 100 + 1);
+		mtx_lock(&sc->w.mtx);
 	}
+	mtx_unlock(&sc->w.mtx);
 	device_printf(sc->dev, "wifi: command %#x timed out\n", id);
 	n1w_dump(sc);
 	return (ETIMEDOUT);
@@ -2238,6 +2416,10 @@ n1w_start(struct n1_softc *sc)
 	phandle_t node;
 	int error, ring, slot;
 
+	mtx_init(&sc->w.mtx, "n1w", NULL, MTX_DEF);
+	sx_init(&sc->w.cmd_sx, "n1wcmd");
+	callout_init_mtx(&sc->w.poll, &sc->w.mtx, 0);
+	mbufq_init(&sc->w.txq, 64);
 	for (ring = 1; ring <= 4; ring++)
 		if ((error = n1w_open_pair(sc, ring)) != 0) {
 			device_printf(sc->dev, "wifi: ring pair %d: %d\n",
@@ -2348,7 +2530,9 @@ n1w_scan(struct n1_softc *sc)
 		/* ticks of 10 ms */
 		limit = MAX(800, (count * 2 * W_DWELL + 2000) / 10);
 		for (i = progress = 0; i < limit; i++) {
+			mtx_lock(&sc->w.mtx);
 			n1w_drain(sc);
+			mtx_unlock(&sc->w.mtx);
 			if (!n1w_up(sc)) {
 				error = EIO;
 				break;
@@ -2378,9 +2562,24 @@ n1w_scan(struct n1_softc *sc)
 				n1w_cmd(sc, 0x10001, NULL, 0);
 		}
 	}
-	device_printf(sc->dev, "wifi: scan %d: %u of %zu channels, %u beacons, "
-	    "%d networks\n", error, sc->w.channels - ch0, W_NCHAN,
-	    sc->w.beacons, sc->w.nbss);
+	/* Drop what this scan did not see, except the joined BSS */
+	mtx_lock(&sc->w.mtx);
+	if (error == 0) {
+		int j;
+
+		for (i = j = 0; i < sc->w.nbss; i++)
+			if (sc->w.bss[i].scan_gen == sc->w.scan_gen + 1 ||
+			    (sc->w.connected && memcmp(sc->w.bss[i].bssid,
+			    sc->w.bssid, 6) == 0))
+				sc->w.bss[j++] = sc->w.bss[i];
+		sc->w.nbss = j;
+		sc->w.scan_gen++;
+	}
+	mtx_unlock(&sc->w.mtx);
+	if (!sc->w.booted || error != 0)
+		device_printf(sc->dev, "wifi: scan %d: %u of %zu channels, "
+		    "%u beacons, %d networks\n", error, sc->w.channels - ch0,
+		    W_NCHAN, sc->w.beacons, sc->w.nbss);
 	return (error);
 }
 
@@ -2413,7 +2612,8 @@ n1w_join(struct n1_softc *sc)
 	for (i = 0; i < 4; i++) {
 		static const unsigned int ids[4] = { 76, 24, 15, 12 };
 
-		if ((error = n1w_data_ring(sc, ids[i])) != 0)
+		/* EBUSY: already open from an earlier join */
+		if ((error = n1w_data_ring(sc, ids[i])) != 0 && error != EBUSY)
 			device_printf(sc->dev, "wifi: data ring %u: %d\n",
 			    ids[i], error);
 	}
@@ -2447,7 +2647,10 @@ n1w_join(struct n1_softc *sc)
 	n1w_tlv(pay, &size, 48, rsn, sizeof(rsn));
 	n1w_tlv(pay, &size, 316, &pmf, 1);
 	n1w_tlv(pay, &size, 376, mld, sizeof(mld));
+	explicit_bzero(sc->w.pmk, sizeof(sc->w.pmk));
+	sc->w.have_pmk = 0;
 	sc->w.connecting = 1;
+	sc->w.disconnect_event = 0;
 	sc->w.connect_event = sc->w.associated = 0;
 	sc->w.connect_status = 0;
 	error = n1w_cmd(sc, 0x20000, pay, size);
@@ -2455,7 +2658,9 @@ n1w_join(struct n1_softc *sc)
 	explicit_bzero(sc->w.win + W_TX_BUF, w_rsize[1] * W_BUFSZ);
 	cpu_dcache_wb_range(sc->w.win + W_TX_BUF, w_rsize[1] * W_BUFSZ);
 	for (i = 0; error == 0 && !sc->w.connect_event && i < 1500; i++) {
+		mtx_lock(&sc->w.mtx);
 		n1w_drain(sc);
+		mtx_unlock(&sc->w.mtx);
 		if (!n1w_up(sc))
 			error = EIO;
 		pause("n1wj", hz / 100 + 1);
@@ -2856,10 +3061,9 @@ n1w_attach_if(struct n1_softc *sc)
 
 	if ((error = n1w_data_ring(sc, 25)) != 0)
 		return (error);
-	mtx_init(&sc->w.mtx, "n1w", NULL, MTX_DEF);
-	callout_init_mtx(&sc->w.poll, &sc->w.mtx, 0);
-	mbufq_init(&sc->w.txq, 64);
+	mtx_lock(&sc->w.mtx);
 	sc->w.connected = 1;
+	mtx_unlock(&sc->w.mtx);
 	ifp = sc->w.ifp = if_alloc(IFT_ETHER);
 	if_setsoftc(ifp, sc);
 	if_initname(ifp, "n1w", 0);
@@ -2891,6 +3095,333 @@ n1w_attach_if(struct n1_softc *sc)
 	mtx_unlock(&sc->w.mtx);
 	device_printf(sc->dev, "wifi: n1w0 up, %6D\n", sc->w.mac, ":");
 	return (0);
+}
+
+/*
+ * Userland control: /dev/n1wifi (apple_n1_wifi.h, documented in m1n1-env
+ * docs/n1-wifi-interface.md). Scan and join run on the driver's own
+ * taskqueue, since each takes seconds of polling; their results come back
+ * as devctl notifications (system N1WIFI) and in N1WIFI_STATUS. Firmware
+ * commands are those of aurora-silicon's centauri_wifi.c (cfg80211 ops
+ * wifi_scan, wifi_connect, wifi_disconnect; link_worker).
+ */
+static void
+n1w_notify(struct n1_softc *sc, const char *what, int error)
+{
+	struct sbuf *sb;
+	char ssid[33];
+	size_t i, len;
+
+	sb = sbuf_new_auto();
+	len = strlen(sc->w.ssid);
+	for (i = 0; i < len; i++)
+		ssid[i] = sc->w.ssid[i] >= 0x20 && sc->w.ssid[i] < 0x7f ?
+		    sc->w.ssid[i] : '?';
+	ssid[len] = '\0';
+	if (strcmp(what, "SCAN_DONE") == 0)
+		sbuf_printf(sb, "count=%d scan_gen=%u", sc->w.nbss,
+		    sc->w.scan_gen);
+	else if (strcmp(what, "RADIO") == 0)
+		sbuf_printf(sb, "state=%s", sc->w.radio_off ? "off" : "on");
+	else {
+		sbuf_cat(sb, "ssid=\"");
+		devctl_safe_quote_sb(sb, ssid);
+		sbuf_cat(sb, "\" ssid_hex=");
+		for (i = 0; i < len; i++)
+			sbuf_printf(sb, "%02x", (uint8_t)sc->w.ssid[i]);
+		sbuf_printf(sb, " bssid=%6D channel=%u", sc->w.bssid, ":",
+		    sc->w.chan);
+	}
+	if (error != 0)
+		sbuf_printf(sb, " error=%d status=%u", error,
+		    sc->w.connect_status);
+	if (sbuf_finish(sb) == 0)
+		devctl_notify("N1WIFI", what, "n1w0", sbuf_data(sb));
+	sbuf_delete(sb);
+}
+
+/* n1w0's link and the transmit gate follow the connection */
+static void
+n1w_set_link(struct n1_softc *sc, int up)
+{
+	mtx_lock(&sc->w.mtx);
+	sc->w.connected = up;
+	if (!up)
+		mbufq_drain(&sc->w.txq);
+	mtx_unlock(&sc->w.mtx);
+	if (sc->w.ifp != NULL)
+		if_link_state_change(sc->w.ifp,
+		    up ? LINK_STATE_UP : LINK_STATE_DOWN);
+}
+
+/*
+ * Disconnect (aurora wifi_disconnect): command 0x20001, 16 bytes: the reason
+ * code, then TLV 328 of 4 bytes with the firmware's default disconnect
+ * budget, 500. Status 326 means there was no connection.
+ */
+static int
+n1w_disconnect(struct n1_softc *sc)
+{
+	uint8_t pay[16];
+	int error, was;
+
+	sx_assert(&sc->w.cmd_sx, SA_XLOCKED);
+	memset(pay, 0, sizeof(pay));
+	le16enc(pay, 3);		/* WLAN_REASON_DEAUTH_LEAVING */
+	le16enc(pay + 8, 328);
+	le16enc(pay + 10, 4);
+	le32enc(pay + 12, 500);
+	error = n1w_cmd(sc, 0x20001, pay, sizeof(pay));
+	if (error == EIO && sc->w.reply_status == 326)
+		error = 0;
+	was = sc->w.connected;
+	n1w_set_link(sc, 0);
+	device_printf(sc->dev, "wifi: disconnect \"%s\": %d\n", sc->w.ssid,
+	    error);
+	if (was)
+		n1w_notify(sc, "LINK_DOWN", 0);
+	return (error);
+}
+
+static void
+n1w_scan_task(void *arg, int pending __unused)
+{
+	struct n1_softc *sc = arg;
+	int error;
+
+	sx_xlock(&sc->w.cmd_sx);
+	error = sc->w.radio_off ? ENETDOWN : n1w_scan(sc);
+	mtx_lock(&sc->w.mtx);
+	sc->w.scanning = 0;
+	mtx_unlock(&sc->w.mtx);
+	sx_xunlock(&sc->w.cmd_sx);
+	n1w_notify(sc, "SCAN_DONE", error);
+}
+
+/*
+ * Join (aurora wifi_connect and connect_worker, as the boot-time join): an
+ * existing connection is dropped first (cfg80211 does the same before a
+ * connect), the target comes from the scan results (a scan is run when the
+ * SSID is not among them), then n1w_join and, the first time, n1w0.
+ */
+static void
+n1w_join_task(void *arg, int pending __unused)
+{
+	struct n1_softc *sc = arg;
+	int error = 0;
+
+	sx_xlock(&sc->w.cmd_sx);
+	sc->w.connect_status = 0;
+	if (sc->w.radio_off)
+		error = ENETDOWN;
+	else if (sc->w.connected)
+		(void)n1w_disconnect(sc);
+	if (error == 0 && (error = n1w_pick(sc)) == ENOENT &&
+	    (error = n1w_scan(sc)) == 0)
+		error = n1w_pick(sc);
+	if (error == 0)
+		error = n1w_join(sc);
+	explicit_bzero(sc->w.pmk, sizeof(sc->w.pmk));
+	sc->w.have_pmk = 0;
+	if (error == 0) {
+		if (sc->w.ifp == NULL)
+			error = n1w_attach_if(sc);
+		else
+			n1w_set_link(sc, 1);
+	}
+	mtx_lock(&sc->w.mtx);
+	sc->w.joining = 0;
+	sc->w.join_error = error;
+	sc->w.join_gen++;
+	mtx_unlock(&sc->w.mtx);
+	sx_xunlock(&sc->w.cmd_sx);
+	n1w_notify(sc, error == 0 ? "LINK_UP" : "JOIN_FAILED", error);
+}
+
+/* A disconnect event while connected (aurora link_worker) */
+static void
+n1w_link_task(void *arg, int pending __unused)
+{
+	struct n1_softc *sc = arg;
+	int lost;
+
+	sx_xlock(&sc->w.cmd_sx);
+	mtx_lock(&sc->w.mtx);
+	lost = sc->w.connected && sc->w.disconnect_event && !sc->w.joining;
+	sc->w.disconnect_event = 0;
+	mtx_unlock(&sc->w.mtx);
+	if (lost) {
+		device_printf(sc->dev, "wifi: link to \"%s\" lost\n",
+		    sc->w.ssid);
+		n1w_set_link(sc, 0);
+	}
+	sx_xunlock(&sc->w.cmd_sx);
+	if (lost)
+		n1w_notify(sc, "LINK_DOWN", 0);
+}
+
+static int
+n1w_ctl_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag,
+    struct thread *td)
+{
+	struct n1_softc *sc = dev->si_drv1;
+	struct n1wifi_status *st;
+	struct n1wifi_list *l;
+	struct n1wifi_join *j;
+	int error = 0, i, k;
+
+	switch (cmd) {
+	case N1WIFI_STATUS:
+		st = (struct n1wifi_status *)data;
+		memset(st, 0, sizeof(*st));
+		st->version = N1WIFI_VERSION;
+		mtx_lock(&sc->w.mtx);
+		st->flags = (n1w_up(sc) ? N1WIFI_F_UP : 0) |
+		    (sc->w.radio_off ? 0 : N1WIFI_F_RADIO) |
+		    (sc->w.scanning ? N1WIFI_F_SCANNING : 0) |
+		    (sc->w.joining ? N1WIFI_F_JOINING : 0) |
+		    (sc->w.connected ? N1WIFI_F_CONNECTED : 0) |
+		    (sc->w.ifp != NULL ? N1WIFI_F_IFNET : 0);
+		st->scan_gen = sc->w.scan_gen;
+		st->join_gen = sc->w.join_gen;
+		st->join_error = sc->w.join_error;
+		st->join_status = sc->w.connect_status;
+		memcpy(st->mac, sc->w.mac, 6);
+		st->ssid_len = strlen(sc->w.ssid);
+		memcpy(st->ssid, sc->w.ssid, st->ssid_len);
+		memcpy(st->bssid, sc->w.bssid, 6);
+		st->channel = sc->w.chan;
+		st->band = sc->w.band;
+		st->rssi = sc->w.rssi;
+		mtx_unlock(&sc->w.mtx);
+		return (0);
+	case N1WIFI_LIST:
+		l = (struct n1wifi_list *)data;
+		memset(l, 0, sizeof(*l));
+		mtx_lock(&sc->w.mtx);
+		l->count = sc->w.nbss;
+		l->scan_gen = sc->w.scan_gen;
+		memcpy(l->bss, sc->w.bss, sc->w.nbss * sizeof(l->bss[0]));
+		mtx_unlock(&sc->w.mtx);
+		/* strongest first */
+		for (i = 1; i < (int)l->count; i++) {
+			struct n1wifi_bss b = l->bss[i];
+
+			for (k = i; k > 0 && l->bss[k - 1].rssi < b.rssi; k--)
+				l->bss[k] = l->bss[k - 1];
+			l->bss[k] = b;
+		}
+		return (0);
+	case N1WIFI_SCAN:
+		if (priv_check(td, PRIV_DRIVER) != 0 &&
+		    !groupmember(GID_WHEEL, td->td_ucred) &&
+		    !groupmember(GID_OPERATOR, td->td_ucred))
+			return (EPERM);
+		mtx_lock(&sc->w.mtx);
+		if (sc->w.radio_off)
+			error = ENETDOWN;
+		else if (sc->w.scanning || sc->w.joining)
+			error = EBUSY;
+		else
+			sc->w.scanning = 1;
+		mtx_unlock(&sc->w.mtx);
+		if (error == 0)
+			taskqueue_enqueue(sc->w.tq, &sc->w.scan_task);
+		return (error);
+	case N1WIFI_JOIN:
+		j = (struct n1wifi_join *)data;
+		if ((error = priv_check(td, PRIV_DRIVER)) != 0)
+			goto out;
+		if (j->ssid_len == 0 || j->ssid_len > 32 ||
+		    memchr(j->ssid, '\0', j->ssid_len) != NULL ||
+		    (j->flags & ~N1WIFI_J_BSSID) != 0) {
+			error = EINVAL;
+			goto out;
+		}
+		mtx_lock(&sc->w.mtx);
+		if (sc->w.radio_off)
+			error = ENETDOWN;
+		else if (sc->w.scanning || sc->w.joining)
+			error = EBUSY;
+		else {
+			sc->w.joining = 1;
+			memset(sc->w.ssid, 0, sizeof(sc->w.ssid));
+			memcpy(sc->w.ssid, j->ssid, j->ssid_len);
+			memcpy(sc->w.pmk, j->pmk, sizeof(sc->w.pmk));
+			sc->w.have_pmk = 1;
+			sc->w.want_flags = j->flags;
+			memcpy(sc->w.want_bssid, j->bssid, 6);
+		}
+		mtx_unlock(&sc->w.mtx);
+		if (error == 0)
+			taskqueue_enqueue(sc->w.tq, &sc->w.join_task);
+out:
+		explicit_bzero(j->pmk, sizeof(j->pmk));
+		return (error);
+	case N1WIFI_DISCONNECT:
+	case N1WIFI_RADIO:
+		if ((error = priv_check(td, PRIV_DRIVER)) != 0)
+			return (error);
+		if (sc->w.joining)	/* as wifi_disconnect */
+			return (EBUSY);
+		if ((error = sx_xlock_sig(&sc->w.cmd_sx)) != 0)
+			return (error);
+		if (sc->w.joining)
+			error = EBUSY;
+		else if (cmd == N1WIFI_DISCONNECT)
+			error = n1w_disconnect(sc);
+		else {
+			/*
+			 * No radio power command is known (aurora has none);
+			 * off drops the connection and refuses scans and
+			 * joins, the RF stays as the firmware keeps it.
+			 */
+			if (*(int *)data == 0 && sc->w.connected)
+				error = n1w_disconnect(sc);
+			sc->w.radio_off = *(int *)data == 0;
+		}
+		sx_xunlock(&sc->w.cmd_sx);
+		if (cmd == N1WIFI_RADIO && error == 0)
+			n1w_notify(sc, "RADIO", 0);
+		return (error);
+	default:
+		return (ENOTTY);
+	}
+}
+
+static struct cdevsw n1w_cdevsw = {
+	.d_version =	D_VERSION,
+	.d_name =	"n1wifi",
+	.d_ioctl =	n1w_ctl_ioctl,
+};
+
+/*
+ * After the boot-time scan and join: from now on scans and joins come from
+ * userland. The device is 0644 root:wheel; each command checks its caller.
+ */
+static void
+n1w_ctl_attach(struct n1_softc *sc)
+{
+	struct make_dev_args args;
+	int error;
+
+	TASK_INIT(&sc->w.scan_task, 0, n1w_scan_task, sc);
+	TASK_INIT(&sc->w.join_task, 0, n1w_join_task, sc);
+	TASK_INIT(&sc->w.link_task, 0, n1w_link_task, sc);
+	sc->w.tq = taskqueue_create("n1wifi", M_WAITOK,
+	    taskqueue_thread_enqueue, &sc->w.tq);
+	taskqueue_start_threads(&sc->w.tq, 1, PWAIT, "n1wifi");
+	if (sc->w.connected)
+		sc->w.join_gen = 1;
+	sc->w.booted = 1;
+	make_dev_args_init(&args);
+	args.mda_devsw = &n1w_cdevsw;
+	args.mda_uid = UID_ROOT;
+	args.mda_gid = GID_WHEEL;
+	args.mda_mode = 0644;
+	args.mda_si_drv1 = sc;
+	if ((error = make_dev_s(&args, &sc->w.cdev, "n1wifi")) != 0)
+		device_printf(sc->dev, "wifi: /dev/n1wifi: %d\n", error);
 }
 
 /*

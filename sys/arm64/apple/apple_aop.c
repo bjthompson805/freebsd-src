@@ -11,7 +11,7 @@
  *
  *  1. The setup port (a second, small mailbox, "setup" in mbox-names) gets
  *     an arena of message pages mapped through its own DART stream, and
- *     is serviced from the poll thread from then on: it runs a HELLO /
+ *     is serviced from its interrupt from then on: it runs a HELLO /
  *     endpoint map handshake while the firmware boots.
  *  2. apple_rtkit_boot() starts the CPU and runs the RTKit handshake up to
  *     AP power on.
@@ -25,8 +25,15 @@
  * The children (the DT node's subnodes: "audio") attach after that and
  * reach their services through apple_aop.h.
  *
- * Everything is polled: a kernel thread services both mailboxes every
- * millisecond, and callers sleep until it completes their call.
+ * Both mailboxes are serviced from their "recv-not-empty" interrupts (the
+ * mailbox nodes' lines, as aurora's mailbox.c requests them), and callers
+ * sleep until a handler completes their call. The mailboxes have no
+ * interrupt controls of their own: the lines are level and drop once the
+ * FIFO is drained; the AIC masks them while the handler's ithread runs.
+ * A kernel thread delivers reports to listeners outside the lock and, as a
+ * safety net for a miswired line, polls every hw.apple_aop.poll_ms (100 ms
+ * by default, 0 for never). A line that keeps firing with nothing to read
+ * is torn down, and the thread then polls every millisecond as before.
  *
  * DMA: the AOP's DART (aop_dart) is set up by iBoot and holds the
  * firmware's own mappings, so its stream tables are never replaced: host
@@ -53,6 +60,8 @@
 #include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/queue.h>
+#include <sys/rman.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
 
 #include <vm/vm.h>
@@ -149,6 +158,9 @@ static MALLOC_DEFINE(M_APPLEAOP, "apple_aop", "Apple AOP");
 #define	EPIC_ANNOUNCE_LEN		44
 
 /* The setup port (aurora's SETUP_* constants). */
+/* The ASC mailbox's receive control word (apple_rtkit.c's MBOX_I2A_CONTROL). */
+#define	ASC_MBOX_I2A_CONTROL		0x114
+
 #define	SETUP_A2I_CONTROL		0x000
 #define	SETUP_I2A_CONTROL		0x004
 #define	SETUP_A2I_SEND0			0x180
@@ -273,6 +285,32 @@ struct aop_report {
 	uint8_t		data[];
 };
 
+/* The mailboxes' recv-not-empty lines. */
+#define	AOP_IRQ_SETUP		0
+#define	AOP_IRQ_RTKIT		1
+#define	AOP_IRQ_COUNT		2
+/* Consecutive interrupts that found nothing to read before a line is cut. */
+#define	AOP_IRQ_STORM_LIMIT	1000
+
+struct apple_aop_softc;
+
+struct aop_irq {
+	struct apple_aop_softc	*sc;
+	int			which;
+	struct resource		*res;
+	void			*tag;
+	bool			live;		/* handler installed */
+	bool			kill;		/* the thread tears it down */
+	u_int			empty_run;
+	u_long			count;
+};
+
+static int aop_poll_ms = 100;
+SYSCTL_NODE(_hw, OID_AUTO, apple_aop, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "Apple AOP");
+SYSCTL_INT(_hw_apple_aop, OID_AUTO, poll_ms, CTLFLAG_RWTUN, &aop_poll_ms, 0,
+    "Fallback mailbox poll period with interrupts (ms, 0 = none)");
+
 struct apple_aop_softc {
 	struct simplebus_softc	sb;		/* must be first */
 	device_t		dev;
@@ -280,7 +318,7 @@ struct apple_aop_softc {
 	vm_offset_t		asc, mbox, setup_mbox;
 	bus_size_t		asc_size, mbox_size, setup_size;
 	struct apple_rtkit	*rtk;
-	bool			rtk_live;	/* the poll thread services it */
+	bool			rtk_live;	/* the handlers service it */
 	bool			running;	/* boot completed */
 	bool			crashed;
 	bool			closing;
@@ -288,6 +326,9 @@ struct apple_aop_softc {
 	struct proc		*thread;
 	bool			thread_stop;
 	bool			thread_running;
+	struct aop_irq		irqs[AOP_IRQ_COUNT];
+	bool			polled;		/* a line is missing: 1 ms poll */
+	u_long			poll_hits;	/* messages the slow poll found */
 	struct apple_dart_fw	*dart[2];	/* the AOP's, the setup port's */
 	struct aop_afk_ep	eps[AFK_ENDPOINT_COUNT];
 	struct aop_setup	setup;
@@ -307,7 +348,8 @@ static int	aop_afk_index(uint32_t ep);
 
 /*
  * Sleep on chan until woken or deadline (an sbinuptime); EWOULDBLOCK once it
- * has passed. The poll thread wakes sc after every message it handles.
+ * has passed. The interrupt handlers (and the thread) wake sc after every
+ * pass over the mailboxes.
  */
 static int
 aop_sleep(struct apple_aop_softc *sc, sbintime_t deadline, const char *wmesg)
@@ -597,7 +639,7 @@ aop_setup_handle(struct apple_aop_softc *sc, uint8_t ep, uint64_t word)
 /*
  * After the RTKit side reached AP power on: the setup port's AP power
  * request, then wait for it and for every endpoint's buffers. Sleeps with
- * the lock held across the waits (the poll thread drops nothing it needs).
+ * the lock held across the waits (msleep drops it for the handlers).
  */
 static int
 aop_setup_finish_boot(struct apple_aop_softc *sc)
@@ -785,7 +827,7 @@ aop_register_service(struct apple_aop_softc *sc, struct aop_afk_ep *e,
 	return (0);
 }
 
-/* A report with a listener goes to the poll thread's delivery queue. */
+/* A report with a listener goes to the thread's delivery queue. */
 static int
 aop_process_report(struct apple_aop_softc *sc, struct aop_afk_ep *e,
     uint32_t channel, uint16_t subtype, const uint8_t *data, size_t len)
@@ -810,6 +852,7 @@ aop_process_report(struct apple_aop_softc *sc, struct aop_afk_ep *e,
 	rep->len = len;
 	memcpy(rep->data, data, len);
 	STAILQ_INSERT_TAIL(&sc->reports, rep, link);
+	wakeup(&sc->thread);
 	return (0);
 }
 
@@ -1348,16 +1391,28 @@ apple_aop_report_unlisten(device_t aop, const struct apple_aop_service *svc,
 	mtx_unlock(&sc->mtx);
 }
 
-/* ---- the poll thread ---- */
+/* ---- the interrupts and the thread ---- */
 
-static void
+/*
+ * Service both mailboxes until empty. Returns the AOP_IRQ_* lines (as bits)
+ * whose FIFO held a message on entry.
+ */
+static u_int
 aop_poll_locked(struct apple_aop_softc *sc)
 {
 	uint64_t word;
 	uint8_t ep;
+	u_int pending;
 	int error;
 
 	mtx_assert(&sc->mtx, MA_OWNED);
+	pending = 0;
+	if (sc->setup_mbox != 0 &&
+	    (RD4(sc->setup_mbox, SETUP_I2A_CONTROL) & MBOX_CONTROL_EMPTY) == 0)
+		pending |= 1u << AOP_IRQ_SETUP;
+	if (sc->rtk_live && !sc->crashed &&
+	    (RD4(sc->mbox, ASC_MBOX_I2A_CONTROL) & MBOX_CONTROL_EMPTY) == 0)
+		pending |= 1u << AOP_IRQ_RTKIT;
 	while (sc->setup_mbox != 0 && aop_setup_recv(sc, &ep, &word)) {
 		error = aop_setup_handle(sc, ep, word);
 		if (error != 0) {
@@ -1374,8 +1429,156 @@ aop_poll_locked(struct apple_aop_softc *sc)
 			device_printf(sc->dev, "AOP firmware crashed\n");
 		}
 	}
+	return (pending);
 }
 
+/*
+ * A mailbox's recv-not-empty line (level; the AIC masks it while this
+ * ithread handler runs). Draining the FIFO drops the line: the mailboxes
+ * have no interrupt controls to acknowledge (aurora's has_irq_controls is
+ * false for both).
+ */
+static void
+aop_intr(void *arg)
+{
+	struct aop_irq *irq = arg;
+	struct apple_aop_softc *sc = irq->sc;
+	u_int pending;
+
+	mtx_lock(&sc->mtx);
+	irq->count++;
+	if (irq->kill) {
+		mtx_unlock(&sc->mtx);
+		return;
+	}
+	pending = aop_poll_locked(sc);
+	if ((pending & (1u << irq->which)) != 0)
+		irq->empty_run = 0;
+	else if (++irq->empty_run >= AOP_IRQ_STORM_LIMIT) {
+		/* As aurora's ASCWrap v8 storm guard: cut it and poll. */
+		device_printf(sc->dev, "%s mailbox interrupt fired %u times "
+		    "without a message; disabled, polling every millisecond\n",
+		    irq->which == AOP_IRQ_SETUP ? "setup" : "RTKit",
+		    irq->empty_run);
+		irq->kill = true;
+		sc->polled = true;
+		wakeup(&sc->thread);
+	}
+	/* A crashed RTKit is no longer read: its line would stay up. */
+	if (irq->which == AOP_IRQ_RTKIT && sc->crashed && !irq->kill) {
+		irq->kill = true;
+		wakeup(&sc->thread);
+	}
+	wakeup(sc);
+	mtx_unlock(&sc->mtx);
+}
+
+/* The mailbox node's "recv-not-empty" line as our IRQ rid "which". */
+static int
+aop_irq_setup(struct apple_aop_softc *sc, phandle_t mb, int which)
+{
+	struct aop_irq *irq = &sc->irqs[which];
+	pcell_t *cells;
+	phandle_t iparent;
+	int error, idx, n, ncells, rid;
+	u_int vec;
+
+	if (ofw_bus_find_string_index(mb, "interrupt-names", "recv-not-empty",
+	    &idx) != 0)
+		return (ENXIO);
+	iparent = ofw_bus_find_iparent(mb);	/* an xref */
+	if (OF_searchencprop(OF_node_from_xref(iparent), "#interrupt-cells",
+	    &ncells, sizeof(ncells)) == -1 || ncells < 1 || ncells > 4)
+		return (ENXIO);
+	n = OF_getencprop_alloc_multi(mb, "interrupts", sizeof(*cells),
+	    (void **)&cells);
+	if (n < (idx + 1) * ncells) {
+		if (n > 0)
+			OF_prop_free(cells);
+		return (ENXIO);
+	}
+	vec = ofw_bus_map_intr(sc->dev, iparent, ncells, &cells[idx * ncells]);
+	OF_prop_free(cells);
+	irq->sc = sc;
+	irq->which = which;
+	rid = which;
+	error = bus_set_resource(sc->dev, SYS_RES_IRQ, rid, vec, 1);
+	if (error != 0)
+		return (error);
+	irq->res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ, &rid,
+	    RF_ACTIVE);
+	if (irq->res == NULL)
+		return (ENXIO);
+	error = bus_setup_intr(sc->dev, irq->res, INTR_TYPE_MISC |
+	    INTR_MPSAFE, NULL, aop_intr, irq, &irq->tag);
+	if (error != 0) {
+		bus_release_resource(sc->dev, SYS_RES_IRQ, rid, irq->res);
+		irq->res = NULL;
+		return (error);
+	}
+	bus_describe_intr(sc->dev, irq->res, irq->tag, which == AOP_IRQ_SETUP ?
+	    "setup" : "rtkit");
+	mtx_lock(&sc->mtx);
+	irq->live = true;
+	mtx_unlock(&sc->mtx);
+	return (0);
+}
+
+/* Without the line, the thread polls every millisecond, as it used to. */
+static void
+aop_irq_start(struct apple_aop_softc *sc, phandle_t mb, int which)
+{
+	int error;
+
+	error = aop_irq_setup(sc, mb, which);
+	if (error == 0)
+		return;
+	device_printf(sc->dev, "%s mailbox: no interrupt (%d); polling every "
+	    "millisecond\n", which == AOP_IRQ_SETUP ? "setup" : "RTKit", error);
+	mtx_lock(&sc->mtx);
+	sc->polled = true;
+	wakeup(&sc->thread);
+	mtx_unlock(&sc->mtx);
+}
+
+/* Tear down the lines marked kill (all = every line). Drops the lock. */
+static void
+aop_irq_teardown(struct apple_aop_softc *sc, bool all)
+{
+	struct aop_irq *irq;
+	int i;
+
+	mtx_assert(&sc->mtx, MA_OWNED);
+	for (i = 0; i < AOP_IRQ_COUNT; i++) {
+		irq = &sc->irqs[i];
+		if (!irq->live || (!all && !irq->kill))
+			continue;
+		irq->live = false;
+		irq->kill = true;
+		mtx_unlock(&sc->mtx);
+		bus_teardown_intr(sc->dev, irq->res, irq->tag);
+		bus_release_resource(sc->dev, SYS_RES_IRQ, i, irq->res);
+		mtx_lock(&sc->mtx);
+		irq->res = NULL;
+		irq->tag = NULL;
+	}
+}
+
+static int
+aop_thread_timo(struct apple_aop_softc *sc)
+{
+	if (sc->polled)
+		return (MAX(1, hz / 1000));
+	if (aop_poll_ms <= 0)
+		return (0);
+	return (MAX(1, (int)((int64_t)aop_poll_ms * hz / 1000)));
+}
+
+/*
+ * Delivers reports outside the lock, tears down a line its handler gave
+ * up on, and polls: every millisecond without interrupts, else every
+ * hw.apple_aop.poll_ms as a net for a lost or miswired line.
+ */
 static void
 aop_thread(void *arg)
 {
@@ -1385,7 +1588,14 @@ aop_thread(void *arg)
 
 	mtx_lock(&sc->mtx);
 	while (!sc->thread_stop) {
-		aop_poll_locked(sc);
+		if (aop_poll_locked(sc) != 0 && !sc->polled &&
+		    sc->poll_hits++ == 0)
+			device_printf(sc->dev, "the fallback poll found a "
+			    "message before its interrupt (a rare race, or a "
+			    "line that never fires)\n");
+		if (sc->irqs[AOP_IRQ_SETUP].kill ||
+		    sc->irqs[AOP_IRQ_RTKIT].kill)
+			aop_irq_teardown(sc, false);
 		while ((rep = STAILQ_FIRST(&sc->reports)) != NULL) {
 			STAILQ_REMOVE_HEAD(&sc->reports, link);
 			l = &sc->listeners[rep->listener];
@@ -1401,8 +1611,15 @@ aop_thread(void *arg)
 			free(rep, M_APPLEAOP);
 		}
 		wakeup(sc);
+		/* Work that came while the lock was dropped. */
+		if (!STAILQ_EMPTY(&sc->reports) ||
+		    (sc->irqs[AOP_IRQ_SETUP].kill &&
+		    sc->irqs[AOP_IRQ_SETUP].live) ||
+		    (sc->irqs[AOP_IRQ_RTKIT].kill &&
+		    sc->irqs[AOP_IRQ_RTKIT].live))
+			continue;
 		mtx_sleep(&sc->thread, &sc->mtx, 0, "aoppoll",
-		    MAX(1, hz / 1000));
+		    aop_thread_timo(sc));
 	}
 	sc->thread_running = false;
 	wakeup(&sc->thread_running);
@@ -1539,12 +1756,13 @@ aop_start(struct apple_aop_softc *sc)
 		sc->thread_running = false;
 		return (error);
 	}
+	aop_irq_start(sc, setup_node, AOP_IRQ_SETUP);
 
 	ctl = RD4(sc->asc, ASC_CPU_CONTROL);
 	device_printf(sc->dev, "CPU_CONTROL %#x: %s\n", ctl,
 	    (ctl & ASC_CPU_CONTROL_RUN) ? "running, waking it" :
 	    "halted, starting it");
-	/* RTKit up to AP power on; the thread services the setup port. */
+	/* RTKit up to AP power on; the setup port's handler runs meanwhile. */
 	error = apple_rtkit_boot(sc->rtk);
 	mtx_lock(&sc->mtx);
 	if (error != 0) {
@@ -1552,6 +1770,14 @@ aop_start(struct apple_aop_softc *sc)
 		goto out;
 	}
 	sc->rtk_live = true;
+	mtx_unlock(&sc->mtx);
+	/*
+	 * Only now: the boot reads the mailbox itself, and a level line
+	 * nobody drains would fire back to back. Messages already queued
+	 * raise it as soon as it is unmasked.
+	 */
+	aop_irq_start(sc, mbox_node, AOP_IRQ_RTKIT);
+	mtx_lock(&sc->mtx);
 	error = aop_setup_finish_boot(sc);
 	if (error != 0)
 		goto out;
@@ -1657,6 +1883,7 @@ aop_start_hook(void *arg)
 		device_printf(sc->dev, "AOP start failed: %d\n", error);
 		mtx_lock(&sc->mtx);
 		sc->closing = true;
+		aop_irq_teardown(sc, true);
 		mtx_unlock(&sc->mtx);
 		if (sc->thread_running)
 			aop_thread_stop(sc);
@@ -1681,6 +1908,8 @@ static int
 apple_aop_attach(device_t dev)
 {
 	struct apple_aop_softc *sc = device_get_softc(dev);
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid_list *tree;
 	int i;
 
 	sc->dev = dev;
@@ -1691,6 +1920,16 @@ apple_aop_attach(device_t dev)
 	sc->setup.wait_system = true;
 	for (i = 0; i < AFK_ENDPOINT_COUNT; i++)
 		sc->eps[i].index = AFK_ENDPOINT_START + i;
+	ctx = device_get_sysctl_ctx(dev);
+	tree = SYSCTL_CHILDREN(device_get_sysctl_tree(dev));
+	SYSCTL_ADD_ULONG(ctx, tree, OID_AUTO, "setup_irqs", CTLFLAG_RD,
+	    &sc->irqs[AOP_IRQ_SETUP].count, "Setup mailbox interrupts");
+	SYSCTL_ADD_ULONG(ctx, tree, OID_AUTO, "rtkit_irqs", CTLFLAG_RD,
+	    &sc->irqs[AOP_IRQ_RTKIT].count, "RTKit mailbox interrupts");
+	SYSCTL_ADD_ULONG(ctx, tree, OID_AUTO, "poll_hits", CTLFLAG_RD,
+	    &sc->poll_hits, "Messages the fallback poll found first");
+	SYSCTL_ADD_BOOL(ctx, tree, OID_AUTO, "polled", CTLFLAG_RD,
+	    &sc->polled, 0, "Polling every millisecond (a line is missing)");
 	/* The boot sleeps for seconds: after interrupts are up when cold. */
 	if (cold)
 		config_intrhook_oneshot(aop_start_hook, sc);
@@ -1715,6 +1954,8 @@ apple_aop_detach(device_t dev)
 	if (sc->running && !sc->crashed && aop_stop(sc) != 0)
 		device_printf(sc->dev, "failed to stop the AOP\n");
 	sc->running = false;
+	/* Lines first: an undrained RTKit line would fire back to back. */
+	aop_irq_teardown(sc, true);
 	sc->rtk_live = false;
 	mtx_unlock(&sc->mtx);
 	if (sc->thread_running)

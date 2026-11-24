@@ -34,8 +34,12 @@
  * ASoC component probe, DAI ops and mute_stream are folded into one
  * power-up sequence (tas2764_power_on()), since every amp on the shared
  * shutdown (SDZ) line comes back from a power-on reset whenever the line
- * has been low.  The fault interrupt is polled while an amp is on: the
- * GPIO controller has no interrupt support yet.
+ * has been low.  The amps share one level-low fault line (IRQZ), which
+ * only one amp node describes (interrupts-extended); its handler runs in
+ * the interrupt thread with the pin masked by the pin controller until it
+ * returns (a oneshot threaded IRQ, as on Linux) and services every powered
+ * amp of the group.  Without the interrupt, the fault latch is polled
+ * while an amp is on.
  *
  * SAFETY.  There is no speakersafetyd: macaudio then holds the SN012776
  * volume at its lock ceiling, and its configured safe level is
@@ -63,7 +67,9 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/proc.h>
 #include <sys/queue.h>
+#include <sys/rman.h>
 #include <sys/sx.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
@@ -176,8 +182,11 @@ CTASSERT(TAS2764_AMP_GAIN_CAP == 0);
 /* tas2764_mute(): ramp-down, then the wait after shutdown */
 #define	TAS2764_RAMP_DOWN_MS		7
 #define	TAS2764_SHUTDOWN_MS		3
-/* Fault latch poll while powered (no interrupt support) */
+/* Fault latch poll while powered (when the IRQ line is not set up) */
 #define	TAS2764_POLL_MS			250
+/* IRQ line low with nothing latched this many times: rate-limit it */
+#define	TAS2764_IRQ_EMPTY_MAX		4
+#define	TAS2764_IRQ_EMPTY_PAUSE_MS	100
 
 /* The fault latch names (Linux tas2764_int_ltch0_msgs). */
 static const char *tas2764_ltch0_msgs[8] = {
@@ -264,6 +273,8 @@ struct tas2764_group {
 	int			votes;
 	bool			high;
 	bool			failed;
+	/* The amp whose interrupt serves the group's IRQZ line, or NULL. */
+	struct tas2764_softc	*irq_owner;
 };
 
 struct tas2764_softc {
@@ -271,6 +282,10 @@ struct tas2764_softc {
 	LIST_ENTRY(tas2764_softc) glink;
 	struct tas2764_group	*group;
 	struct timeout_task	poll_task;
+	struct resource		*irq_res;
+	void			*irq_cookie;
+	u_int			irq_empty;	/* consecutive empty IRQs */
+	bool			has_irq_active;	/* group's irq_owner */
 	bool			detaching;
 	int			devid;
 	int			page;		/* selected page, -1 unknown */
@@ -854,8 +869,9 @@ tas2764_power_on(struct tas2764_softc *sc)
 		tas2764_vote_drop(sc);
 		return (error);
 	}
-	taskqueue_enqueue_timeout(taskqueue_thread, &sc->poll_task,
-	    MAX(1, TAS2764_POLL_MS * hz / 1000));
+	if (g->irq_owner == NULL)
+		taskqueue_enqueue_timeout(taskqueue_thread, &sc->poll_task,
+		    MAX(1, TAS2764_POLL_MS * hz / 1000));
 	return (0);
 }
 
@@ -876,19 +892,17 @@ tas2764_power_off(struct tas2764_softc *sc)
 	return (error != 0 ? error : error2);
 }
 
-/* Linux tas2764_irq_locked(), polled. */
-static void
-tas2764_poll(void *arg, int pending __unused)
+/*
+ * Linux tas2764_irq_locked() for one powered amp.  Returns whether a
+ * latch was set.  A group fault drops the line (every amp unpowered).
+ */
+static bool
+tas2764_service(struct tas2764_softc *sc)
 {
-	struct tas2764_softc *sc = arg;
 	uint8_t latched, new;
 	int i;
 
-	sx_xlock(&tas2764_sx);
-	if (sc->detaching || !sc->powered) {
-		sx_xunlock(&tas2764_sx);
-		return;
-	}
+	sx_assert(&tas2764_sx, SA_XLOCKED);
 	if (tas2764_read(sc, TAS2764_INT_LTCH0, &latched) == 0 &&
 	    latched != 0) {
 		new = latched & ~sc->fault_bits;
@@ -905,10 +919,144 @@ tas2764_poll(void *arg, int pending __unused)
 			(void)tas2764_update(sc, TAS2764_INT_CLK_CFG,
 			    TAS2764_INT_CLK_CFG_IRQZ_CLR,
 			    TAS2764_INT_CLK_CFG_IRQZ_CLR);
+		return (true);
 	}
-	if (sc->powered)
+	return (false);
+}
+
+/* The poll, while powered and the group has no interrupt. */
+static void
+tas2764_poll(void *arg, int pending __unused)
+{
+	struct tas2764_softc *sc = arg;
+
+	sx_xlock(&tas2764_sx);
+	if (sc->detaching || !sc->powered) {
+		sx_xunlock(&tas2764_sx);
+		return;
+	}
+	(void)tas2764_service(sc);
+	if (sc->powered && sc->group->irq_owner == NULL)
 		taskqueue_enqueue_timeout(taskqueue_thread, &sc->poll_task,
 		    MAX(1, TAS2764_POLL_MS * hz / 1000));
+	sx_xunlock(&tas2764_sx);
+}
+
+/*
+ * IRQZ handler, in the interrupt thread.  The pin controller masks the
+ * level-low line before the thread runs and unmasks it when this returns,
+ * so the I2C work (which sleeps) is done here, as a Linux oneshot threaded
+ * IRQ would; iichid does I2C from its interrupt thread the same way.  The
+ * line is shared by the whole group: service every powered amp.
+ */
+static void
+tas2764_intr(void *arg)
+{
+	struct tas2764_softc *sc = arg;
+	struct tas2764_softc *m;
+	struct tas2764_group *g;
+	bool any;
+
+	THREAD_SLEEPING_OK();
+	sx_xlock(&tas2764_sx);
+	g = sc->group;
+	if (sc->detaching || g == NULL) {
+		sx_xunlock(&tas2764_sx);
+		THREAD_NO_SLEEPING();
+		return;
+	}
+	any = false;
+	LIST_FOREACH(m, &g->members, glink) {
+		if (m->detaching || !m->powered)
+			continue;
+		if (tas2764_service(m))
+			any = true;
+	}
+	if (any)
+		sc->irq_empty = 0;
+	else {
+		/* Nothing latched: release IRQZ on every powered amp. */
+		LIST_FOREACH(m, &g->members, glink)
+			if (!m->detaching && m->powered)
+				(void)tas2764_update(m, TAS2764_INT_CLK_CFG,
+				    TAS2764_INT_CLK_CFG_IRQZ_CLR,
+				    TAS2764_INT_CLK_CFG_IRQZ_CLR);
+		if (sc->irq_empty < UINT_MAX)
+			sc->irq_empty++;
+		if (sc->irq_empty == TAS2764_IRQ_EMPTY_MAX)
+			device_printf(sc->dev, "IRQZ low with no latched "
+			    "fault: rate-limiting the interrupt\n");
+	}
+	sx_xunlock(&tas2764_sx);
+	if (sc->irq_empty >= TAS2764_IRQ_EMPTY_MAX)
+		pause("tasirq", MAX(1, TAS2764_IRQ_EMPTY_PAUSE_MS * hz / 1000));
+	THREAD_NO_SLEEPING();
+}
+
+/*
+ * The group's interrupt: on the amp whose node has it.  Falls back to
+ * polling (nothing set up) when it cannot be allocated.
+ */
+static void
+tas2764_setup_irq(struct tas2764_softc *sc)
+{
+	int error, rid;
+
+	if (!sc->has_irq)
+		return;
+	rid = 0;
+	sc->irq_res = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ, &rid,
+	    RF_ACTIVE | RF_SHAREABLE);
+	if (sc->irq_res == NULL) {
+		device_printf(sc->dev, "no IRQ: polling the fault latch\n");
+		return;
+	}
+	error = bus_setup_intr(sc->dev, sc->irq_res,
+	    INTR_TYPE_MISC | INTR_MPSAFE, NULL, tas2764_intr, sc,
+	    &sc->irq_cookie);
+	if (error != 0) {
+		device_printf(sc->dev,
+		    "IRQ setup failed (%d): polling the fault latch\n", error);
+		bus_release_resource(sc->dev, SYS_RES_IRQ, rid, sc->irq_res);
+		sc->irq_res = NULL;
+		sc->irq_cookie = NULL;
+		return;
+	}
+	sx_xlock(&tas2764_sx);
+	if (sc->group->irq_owner == NULL) {
+		sc->group->irq_owner = sc;
+		sc->has_irq_active = true;
+	}
+	sx_xunlock(&tas2764_sx);
+	if (sc->has_irq_active)
+		device_printf(sc->dev, "fault IRQ for the SDZ group\n");
+}
+
+/* Drop the group's interrupt; powered amps go back to polling. */
+static void
+tas2764_teardown_irq(struct tas2764_softc *sc)
+{
+	struct tas2764_softc *m;
+
+	if (sc->irq_cookie == NULL)
+		return;
+	/* Waits for a running handler, which takes tas2764_sx. */
+	bus_teardown_intr(sc->dev, sc->irq_res, sc->irq_cookie);
+	bus_release_resource(sc->dev, SYS_RES_IRQ,
+	    rman_get_rid(sc->irq_res), sc->irq_res);
+	sc->irq_cookie = NULL;
+	sc->irq_res = NULL;
+
+	sx_xlock(&tas2764_sx);
+	if (sc->group->irq_owner == sc) {
+		sc->group->irq_owner = NULL;
+		sc->has_irq_active = false;
+		LIST_FOREACH(m, &sc->group->members, glink)
+			if (!m->detaching && m->powered)
+				taskqueue_enqueue_timeout(taskqueue_thread,
+				    &m->poll_task,
+				    MAX(1, TAS2764_POLL_MS * hz / 1000));
+	}
 	sx_xunlock(&tas2764_sx);
 }
 
@@ -1372,6 +1520,10 @@ tas2764_attach(device_t dev)
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    tas2764_temp_sysctl, "I", "Die temperature, C (-1000: none)");
 
+	tas2764_setup_irq(sc);
+	SYSCTL_ADD_BOOL(ctx, tree, OID_AUTO, "irq", CTLFLAG_RD,
+	    &sc->has_irq_active, 0, "Group faults serviced by this amp's IRQ");
+
 	OF_device_register_xref(OF_xref_from_node(node), dev);
 	return (0);
 }
@@ -1385,6 +1537,7 @@ tas2764_detach(device_t dev)
 	sc->detaching = true;
 	(void)tas2764_power_off(sc);
 	sx_xunlock(&tas2764_sx);
+	tas2764_teardown_irq(sc);
 	while (taskqueue_cancel_timeout(taskqueue_thread, &sc->poll_task,
 	    NULL) != 0)
 		taskqueue_drain_timeout(taskqueue_thread, &sc->poll_task);
