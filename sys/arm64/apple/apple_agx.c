@@ -1834,6 +1834,37 @@ apple_agx_vm_map(device_t dev, u_int context, uint64_t va, vm_paddr_t pa,
 }
 
 int
+apple_agx_vm_map_list(device_t dev, u_int context, uint64_t va,
+    vm_page_t *pages, u_int npages, u_int flags)
+{
+	struct apple_agx_softc *sc = device_get_softc(dev);
+	struct agx_client_root *root;
+	int error, prot;
+
+	switch (flags) {
+	case APPLE_AGX_VM_READ:
+		prot = AGX_PROT_GPU_SHARED_RO;
+		break;
+	case APPLE_AGX_VM_WRITE:
+		prot = AGX_PROT_GPU_SHARED_WO;
+		break;
+	case APPLE_AGX_VM_READ | APPLE_AGX_VM_WRITE:
+		prot = AGX_PROT_GPU_SHARED_RW;
+		break;
+	default:
+		return (EINVAL);
+	}
+	if (!apple_agx_vm_valid(dev, va, (vm_size_t)npages * AGX_UAT_PGSZ))
+		return (EINVAL);
+	mtx_lock(&sc->mtx);
+	root = agx_client_root(sc, context);
+	error = root == NULL || !root->live ? ENOENT :
+	    agx_uat_map_list(&sc->uat, root->pa, va, pages, npages, prot);
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
+int
 apple_agx_vm_unmap(device_t dev, u_int context, uint64_t va, vm_size_t size)
 {
 	struct apple_agx_softc *sc = device_get_softc(dev);

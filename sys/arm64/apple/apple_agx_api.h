@@ -40,6 +40,9 @@ void	apple_agx_queue_destroy(device_t dev, u_int slot);
 /* Map physical pages at va in the client VM. SINGLE repeats the first page. */
 int	apple_agx_vm_map(device_t dev, u_int context, uint64_t va, vm_paddr_t pa,
 	    vm_size_t size, u_int flags);
+/* Map npages scattered pages at va, invalidating the TLBs once. No SINGLE. */
+int	apple_agx_vm_map_list(device_t dev, u_int context, uint64_t va,
+	    vm_page_t *pages, u_int npages, u_int flags);
 int	apple_agx_vm_unmap(device_t dev, u_int context, uint64_t va, vm_size_t size);
 /*
  * Run one compute command (its CDM stream at cdm_va..cdm_end, terminator

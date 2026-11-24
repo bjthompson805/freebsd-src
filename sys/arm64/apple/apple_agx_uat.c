@@ -17,6 +17,7 @@
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_page.h>
 
 #include <machine/atomic.h>
 #include <machine/cpufunc.h>
@@ -306,6 +307,51 @@ agx_uat_map_pages(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
 		if (error != 0)
 			return (error);
 		*leaf = (pa + (single_page ? 0 : off)) | bits;
+	}
+	agx_uat_tlbi_all();
+	return (0);
+}
+
+/*
+ * map_pages over a list of npages scattered pages, with one invalidation for
+ * the lot: the invalidation broadcasts to every CPU, so a per-page loop of
+ * agx_uat_map_pages stalls the whole system for a large buffer.
+ */
+int
+agx_uat_map_list(struct agx_uat *uat, vm_paddr_t root, uint64_t iova,
+    vm_page_t *pages, u_int npages, int prot)
+{
+	volatile uint64_t *leaf;
+	uint64_t bits;
+	vm_size_t size;
+	bool mapped = false;
+	u_int i;
+	int error;
+
+	size = (vm_size_t)npages * AGX_UAT_PGSZ;
+	if ((iova & AGX_UAT_PGMSK) != 0 || npages == 0 ||
+	    prot < 0 || prot >= (int)nitems(agx_prot_bits))
+		return (EINVAL);
+	for (i = 0; i < npages; i++)
+		if ((VM_PAGE_TO_PHYS(pages[i]) & AGX_UAT_PGMSK) != 0)
+			return (EINVAL);
+	bits = agx_prot_bits[prot] | PTE_TYPE_LEAF_TABLE;
+	if (root != uat->upper_root && root != uat->secondary_root)
+		bits |= UAT_NON_GLOBAL;
+	for (i = 0; i < npages; i++) {
+		error = agx_walk(uat, root, iova + i * AGX_UAT_PGSZ, true, &leaf);
+		if (error != 0)
+			return (error);
+		if (*leaf != 0)
+			mapped = true;
+	}
+	if (mapped && (error = agx_uat_unmap(uat, root, iova, size)) != 0)
+		return (error);
+	for (i = 0; i < npages; i++) {
+		error = agx_walk(uat, root, iova + i * AGX_UAT_PGSZ, false, &leaf);
+		if (error != 0)
+			return (error);
+		*leaf = VM_PAGE_TO_PHYS(pages[i]) | bits;
 	}
 	agx_uat_tlbi_all();
 	return (0);
