@@ -262,6 +262,7 @@ struct agx_role {
 	void			*irq_tag;
 	u_long			irqs;
 	u_long			events;
+	u_long			reports[2];	/* trace, statistics records */
 };
 
 /* g17/qos.rs Accounting, for the one compute owner this driver has. */
@@ -829,6 +830,7 @@ agx_buf_map(void *arg, vm_paddr_t pa, size_t size, uint64_t *iova)
 }
 
 static void agx_drain_events(struct agx_role *r);
+static void agx_drain_reports(struct agx_role *r);
 
 static void
 agx_recv(void *arg, uint32_t ep, uint64_t msg)
@@ -840,6 +842,7 @@ agx_recv(void *arg, uint32_t ep, uint64_t msg)
 		r->init_ack = true;
 	} else if (ep == AGX_EP_FIRMWARE && msg == AGX_MSG_EVENTS) {
 		agx_drain_events(r);
+		agx_drain_reports(r);
 		return;
 	}
 	if (r->msgs++ < 16)
@@ -3680,6 +3683,58 @@ agx_recovery_task(void *arg, int pending)
 }
 
 /*
+ * channel.rs drain_report: each role's trace (512 slots) and statistics
+ * (256 slots) rings, state words at status A + 0x240 and + 0x280 like the
+ * event ring's. Nothing reads the records yet: they are discarded, as
+ * Aurora does when statistics are not wanted. Left full, the firmware
+ * kept notifying (GFX1 hundreds of times a second, nothing in its events).
+ */
+#define	AGX_STATUS_TRACE_STATE	0x240
+#define	AGX_STATUS_STATS_STATE	0x280
+#define	AGX_TRACE_SLOTS		512
+#define	AGX_STATS_SLOTS		256
+
+static void
+agx_drain_reports(struct agx_role *r)
+{
+	static const struct {
+		uint32_t state, slots;
+	} rings[2] = {
+		{ AGX_STATUS_TRACE_STATE, AGX_TRACE_SLOTS },
+		{ AGX_STATUS_STATS_STATE, AGX_STATS_SLOTS },
+	};
+	struct apple_agx_softc *sc = r->sc;
+	int idx = r == &sc->roles[0] ? 0 : 1;
+	volatile uint32_t *cons, *prod;
+	uint8_t *status;
+	uint32_t c, p;
+	u_int i;
+
+	if (sc->graph_va[0] == NULL)
+		return;
+	status = sc->graph_va[0] + agx_graph_status_a[idx];
+	for (i = 0; i < nitems(rings); i++) {
+		cons = (volatile uint32_t *)(status + rings[i].state);
+		prod = (volatile uint32_t *)(status + rings[i].state +
+		    AGX_RX_PRODUCER_OFFSET);
+		dsb(sy);
+		c = *cons;
+		p = *prod;
+		if (c >= rings[i].slots || p >= rings[i].slots) {
+			if (r->reports[i]++ == 0)
+				device_printf(sc->dev, "%s: bad %s cursors %u/%u\n",
+				    r->name, i == 0 ? "trace" : "statistics", c, p);
+			continue;
+		}
+		if (c == p)
+			continue;
+		r->reports[i] += (p - c + rings[i].slots) % rings[i].slots;
+		*cons = p;
+		dsb(sy);
+	}
+}
+
+/*
  * Drain firmware events. A stamp event carries a bit mask of ready QIDs.
  * g17/fw/channels.rs: 4 restart {generation u64, stamp}, 6 TVB grow,
  * 7 compute fault, 12 context killed, 13 free-list grow. Only stamps are
@@ -3978,6 +4033,12 @@ agx_sysctls(struct apple_agx_softc *sc)
 		    "gfx1_irqs", CTLFLAG_RD, &r->irqs, "Mailbox interrupts");
 		SYSCTL_ADD_ULONG(ctx, t, OID_AUTO, i == 0 ? "gfx_events" :
 		    "gfx1_events", CTLFLAG_RD, &r->events, "Firmware events");
+		SYSCTL_ADD_ULONG(ctx, t, OID_AUTO, i == 0 ? "gfx_trace" :
+		    "gfx1_trace", CTLFLAG_RD, &r->reports[0],
+		    "Trace records discarded");
+		SYSCTL_ADD_ULONG(ctx, t, OID_AUTO, i == 0 ? "gfx_statistics" :
+		    "gfx1_statistics", CTLFLAG_RD, &r->reports[1],
+		    "Statistics records discarded");
 		SYSCTL_ADD_UINT(ctx, t, OID_AUTO, i == 0 ? "gfx_msgs" :
 		    "gfx1_msgs", CTLFLAG_RD, &r->msgs, 0, "Endpoint messages");
 	}
