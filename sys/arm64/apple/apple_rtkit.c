@@ -109,6 +109,7 @@ struct apple_rtkit {
 	struct rtkit_buffer	crashlog, syslog, ioreport, oslog;
 	uint32_t		syslog_count, syslog_size;
 	uint32_t		syslog_last, syslog_repeats;
+	uint32_t		epmap[8];	/* endpoint map, 32 per word */
 };
 
 #define	ASC_RD4(r, o)		(*(volatile uint32_t *)((r)->asc + (o)))
@@ -144,6 +145,15 @@ void
 apple_rtkit_set_syslog(struct apple_rtkit *rtk, bool on)
 {
 	rtk->syslog_on = on;
+}
+
+/* Whether the IOP's endpoint map (from apple_rtkit_boot) names ep. */
+bool
+apple_rtkit_has_endpoint(struct apple_rtkit *rtk, uint32_t ep)
+{
+	if (ep >= 32 * nitems(rtk->epmap))
+		return (false);
+	return ((rtk->epmap[ep / 32] & (1u << (ep % 32))) != 0);
 }
 
 int
@@ -525,6 +535,7 @@ apple_rtkit_boot(struct apple_rtkit *rtk)
 			return (ENXIO);
 		}
 		base = (msg >> 32) & 0x7;
+		rtk->epmap[base] = msg & 0xffffffff;
 		if (base == 0)
 			eps = msg & 0xffffffff;	/* system endpoints */
 		error = apple_rtkit_send(rtk, EP_MGMT,

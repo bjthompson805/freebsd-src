@@ -51,5 +51,7 @@ int	apple_rtkit_send(struct apple_rtkit *rtk, uint32_t ep, uint64_t msg);
 int	apple_rtkit_start_ep(struct apple_rtkit *rtk, uint32_t ep);
 bool	apple_rtkit_crashed(struct apple_rtkit *rtk);
 void	apple_rtkit_set_syslog(struct apple_rtkit *rtk, bool on);
+/* After apple_rtkit_boot: whether the IOP's endpoint map names ep. */
+bool	apple_rtkit_has_endpoint(struct apple_rtkit *rtk, uint32_t ep);
 
 #endif /* _ARM64_APPLE_APPLE_RTKIT_H_ */

@@ -23,6 +23,7 @@
 #include <sys/kernel.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/queue.h>
 #include <sys/rman.h>
 #include <sys/sx.h>
 #include <sys/time.h>
@@ -433,6 +434,420 @@ apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid, uint64_t iova,
 	dsb(sy);
 	error = apple_dart_flush_sid(dev, dart, sid);
 	sx_xunlock(&apple_dart_lock);
+	return (error);
+}
+
+/*
+ * Streams whose tables firmware (iBoot, a coprocessor) set up and owns, as
+ * on a locked DART (aurora's locked-DART handling): apple_dart_fw_*() add
+ * host buffers to the live tables and never replace or rewrite any entry.
+ * A table of ours goes only into a vacant entry, at any level; a valid
+ * entry is followed, never changed. Pages of ours go only into leaf tables
+ * of ours, so IOVAs are allocated from the window "apple,dma-range" names a
+ * leaf's worth (DART_FW_CHUNK) at a time, from leaves that are vacant or
+ * already ours. Nothing is ever unmapped. The DART must be powered (for the
+ * AOP DART: the AOP is running).
+ *
+ * Our tables are uncached and the firmware's are mapped as device memory,
+ * so the DART sees each store once it completes. The tables of a stream are
+ * under fw->mtx, not apple_dart_lock: the AOP maps from its poll thread
+ * with a mutex of its own held, so nothing below attach may sleep.
+ */
+#define	DART_PTE_TO_PA(pte)	(((pte) & 0x3ffffffc00ul) << 4)
+#define	DART_FW_CHUNK		(DART_PAGE_SIZE * DART_PTES)	/* one leaf */
+#define	DART_FW_TABLES		32
+
+struct apple_dart_fw {
+	SLIST_ENTRY(apple_dart_fw) link;	/* under apple_dart_lock */
+	struct mtx	mtx;
+	device_t	dev;		/* the last attacher, for messages */
+	phandle_t	dart;
+	u_int		sid;
+	vm_offset_t	regs;
+	bus_size_t	regs_size;
+	vm_paddr_t	root_pa;
+	uint64_t	*root;
+	int		levels;		/* 3: IOVA[41:36], [35:25], [24:14] */
+	uint64_t	base, end;	/* apple,dma-range */
+	uint64_t	next;		/* allocation cursor */
+	int		ntables;
+	struct {
+		vm_paddr_t	pa;
+		uint64_t	*va;
+		bool		ours;
+	} tables[DART_FW_TABLES];
+};
+
+static SLIST_HEAD(, apple_dart_fw) apple_dart_fws =
+    SLIST_HEAD_INITIALIZER(apple_dart_fws);
+
+/* The table at pa, mapped; *oursp: whether it is one of ours. */
+static uint64_t *
+apple_dart_fw_table(struct apple_dart_fw *fw, vm_paddr_t pa, bool *oursp)
+{
+	int i;
+
+	for (i = 0; i < fw->ntables; i++)
+		if (fw->tables[i].pa == pa) {
+			if (oursp != NULL)
+				*oursp = fw->tables[i].ours;
+			return (fw->tables[i].va);
+		}
+	if (fw->ntables == DART_FW_TABLES)
+		return (NULL);
+	/* One of the firmware's: mapped as is, never cached by us. */
+	fw->tables[fw->ntables].pa = pa;
+	fw->tables[fw->ntables].va = pmap_mapdev(pa, DART_PAGE_SIZE);
+	fw->tables[fw->ntables].ours = false;
+	if (oursp != NULL)
+		*oursp = false;
+	return (fw->tables[fw->ntables++].va);
+}
+
+/*
+ * A table of ours: uncached, below 2^42. The zeroes kmem left in the
+ * cacheable direct map are written back and dropped first, so no dirty line
+ * can land on the table later.
+ */
+static uint64_t *
+apple_dart_fw_new_table(struct apple_dart_fw *fw, vm_paddr_t *pap)
+{
+	uint64_t *va;
+	vm_paddr_t pa;
+
+	if (fw->ntables == DART_FW_TABLES)
+		return (NULL);
+	va = kmem_alloc_contig(DART_PAGE_SIZE, M_NOWAIT | M_ZERO, 0,
+	    (1ul << DART_IOVA_BITS) - 1, DART_PAGE_SIZE, 0,
+	    VM_MEMATTR_UNCACHEABLE);
+	if (va == NULL)
+		return (NULL);
+	pa = pmap_kextract((vm_offset_t)va);
+	cpu_dcache_wbinv_range((void *)PHYS_TO_DMAP(pa), DART_PAGE_SIZE);
+	memset(va, 0, DART_PAGE_SIZE);
+	dsb(sy);
+	fw->tables[fw->ntables].pa = pa;
+	fw->tables[fw->ntables].va = va;
+	fw->tables[fw->ntables].ours = true;
+	fw->ntables++;
+	*pap = pa;
+	return (va);
+}
+
+static u_int
+apple_dart_fw_shift(struct apple_dart_fw *fw, int level)
+{
+
+	/* The leaf is always indexed by IOVA[24:14]. */
+	return (DART_PAGE_SHIFT + 11 * (fw->levels - 1 - level));
+}
+
+/*
+ * The leaf table for iova, or NULL. With create, vacant entries on the way
+ * get tables of ours; a valid entry is followed, never rewritten. *oursp:
+ * whether the leaf is one of ours.
+ */
+static uint64_t *
+apple_dart_fw_leaf(struct apple_dart_fw *fw, uint64_t iova, bool create,
+    bool *oursp)
+{
+	uint64_t *t, *next, e;
+	vm_paddr_t pa;
+	u_int idx;
+	int level;
+	bool ours;
+
+	ours = false;
+	t = fw->root;
+	for (level = 0; level < fw->levels - 1 && t != NULL; level++) {
+		idx = (iova >> apple_dart_fw_shift(fw, level)) & 0x7ff;
+		e = t[idx];
+		if ((e & DART_PTE_VALID) == 0) {
+			if (!create)
+				return (NULL);
+			next = apple_dart_fw_new_table(fw, &pa);
+			if (next == NULL)
+				return (NULL);
+			t[idx] = DART_PTE_PA(pa) | DART_PTE_VALID;
+			t = next;
+			ours = true;
+			continue;
+		}
+		t = apple_dart_fw_table(fw, DART_PTE_TO_PA(e), &ours);
+	}
+	if (oursp != NULL)
+		*oursp = ours;
+	return (t);
+}
+
+/* Whether pages of ours may go into the leaf covering iova: vacant or ours. */
+static bool
+apple_dart_fw_chunk_ok(struct apple_dart_fw *fw, uint64_t iova)
+{
+	uint64_t *t, e;
+	int level;
+	bool ours;
+
+	ours = false;
+	t = fw->root;
+	for (level = 0; level < fw->levels - 1; level++) {
+		e = t[(iova >> apple_dart_fw_shift(fw, level)) & 0x7ff];
+		if ((e & DART_PTE_VALID) == 0)
+			return (true);
+		t = apple_dart_fw_table(fw, DART_PTE_TO_PA(e), &ours);
+		if (t == NULL)
+			return (false);
+	}
+	return (ours);
+}
+
+/* Whether [iova, iova + size), inside one leaf, is all vacant and ours to use. */
+static bool
+apple_dart_fw_free(struct apple_dart_fw *fw, uint64_t iova, size_t size,
+    uint64_t *busyp)
+{
+	uint64_t *leaf, off;
+
+	if (!apple_dart_fw_chunk_ok(fw, iova)) {
+		*busyp = rounddown2(iova, DART_FW_CHUNK) + DART_FW_CHUNK - 1;
+		return (false);
+	}
+	leaf = apple_dart_fw_leaf(fw, iova, false, NULL);
+	for (off = 0; leaf != NULL && off < size; off += DART_PAGE_SIZE)
+		if (leaf[((iova + off) >> DART_PAGE_SHIFT) & 0x7ff] &
+		    DART_PTE_VALID) {
+			*busyp = iova + off;
+			return (false);
+		}
+	return (true);
+}
+
+/* Map [pa, pa + size) at iova, all checked free, and flush the stream. */
+static int
+apple_dart_fw_enter(struct apple_dart_fw *fw, uint64_t iova, vm_paddr_t pa,
+    size_t size)
+{
+	uint64_t *leaf, off;
+
+	for (off = 0; off < size; off += DART_PAGE_SIZE) {
+		leaf = apple_dart_fw_leaf(fw, iova + off, true, NULL);
+		if (leaf == NULL)
+			return (ENOMEM);
+		leaf[((iova + off) >> DART_PAGE_SHIFT) & 0x7ff] =
+		    DART_PTE_PA(pa + off) | DART_PTE_SP_END | DART_PTE_VALID;
+	}
+	return (apple_dart_tlb_flush(fw->dev, fw->regs, fw->sid));
+}
+
+int
+apple_dart_fw_attach(device_t dev, phandle_t node, int index,
+    struct apple_dart_fw **fwp)
+{
+	struct apple_dart_fw *fw;
+	pcell_t *cells, range[4];
+	phandle_t dart;
+	bus_addr_t pa;
+	bus_size_t size;
+	vm_offset_t regs;
+	vm_paddr_t root;
+	uint64_t base, end;
+	uint32_t tcr, ttbr;
+	u_int sid;
+	int error, i, levels, n;
+
+	n = OF_getencprop_alloc_multi(node, "iommus", sizeof(*cells),
+	    (void **)&cells);
+	if (index < 0 || n < 2 * index + 2) {
+		if (n > 0)
+			OF_prop_free(cells);
+		return (EINVAL);
+	}
+	dart = OF_node_from_xref(cells[2 * index]);
+	sid = cells[2 * index + 1];
+	OF_prop_free(cells);
+	if (OF_getencprop(node, "apple,dma-range", range, sizeof(range)) !=
+	    sizeof(range))
+		return (EINVAL);
+	base = roundup2((uint64_t)range[0] << 32 | range[1], DART_PAGE_SIZE);
+	end = rounddown2(((uint64_t)range[0] << 32 | range[1]) +
+	    ((uint64_t)range[2] << 32 | range[3]), DART_PAGE_SIZE);
+	if (end <= base || end > (1ul << DART_IOVA_BITS) ||
+	    sid >= DART_T8110_MAX_SID)
+		return (EINVAL);
+	if (!ofw_bus_node_is_compatible(dart, "apple,t8110-dart") ||
+	    ofw_reg_to_paddr(dart, 0, &pa, &size, NULL) != 0)
+		return (ENODEV);
+
+	sx_xlock(&apple_dart_lock);
+	SLIST_FOREACH(fw, &apple_dart_fws, link)
+		if (fw->dart == dart && fw->sid == sid)
+			break;
+	regs = fw != NULL ? fw->regs : (vm_offset_t)pmap_mapdev(pa, size);
+	tcr = DART_RD4(regs, DART_T8110_TCR(sid));
+	ttbr = DART_RD4(regs, DART_T8110_TTBR(sid));
+	device_printf(dev, "DART %#jx sid %u: TCR %#x TTBR %#x, window "
+	    "%#jx-%#jx\n", (uintmax_t)pa, sid, tcr, ttbr, (uintmax_t)base,
+	    (uintmax_t)end);
+	error = 0;
+	levels = (tcr & DART_T8110_TCR_FOUR_LEVEL) ? 3 : 2;
+	root = (vm_paddr_t)(ttbr >> 2) << DART_PAGE_SHIFT;
+	if ((tcr & DART_T8110_TCR_TRANSLATE) == 0 ||
+	    (ttbr & DART_T8110_TTBR_VALID) == 0) {
+		device_printf(dev, "DART sid %u has no live table\n", sid);
+		error = ENXIO;
+	} else if (end > (1ul << (DART_PAGE_SHIFT + 11 * levels))) {
+		device_printf(dev, "DART sid %u: window beyond its %d-level "
+		    "table\n", sid, levels);
+		error = ERANGE;
+	} else if (fw != NULL && (fw->base != base || fw->end != end)) {
+		device_printf(dev, "DART sid %u: in use with window "
+		    "%#jx-%#jx\n", sid, (uintmax_t)fw->base,
+		    (uintmax_t)fw->end);
+		error = EBUSY;
+	}
+	if (error != 0) {
+		if (fw == NULL)
+			pmap_unmapdev((void *)regs, size);
+		sx_xunlock(&apple_dart_lock);
+		return (error);
+	}
+
+	if (fw == NULL) {
+		fw = malloc(sizeof(*fw), M_APPLEDART, M_WAITOK | M_ZERO);
+		mtx_init(&fw->mtx, "apple_dart_fw", NULL, MTX_DEF);
+		fw->dart = dart;
+		fw->sid = sid;
+		fw->regs = regs;
+		fw->regs_size = size;
+		fw->base = base;
+		fw->end = end;
+		SLIST_INSERT_HEAD(&apple_dart_fws, fw, link);
+	}
+	mtx_lock(&fw->mtx);
+	fw->dev = dev;		/* an earlier attacher may be gone (kldunload) */
+	if (fw->root != NULL && (fw->root_pa != root || fw->levels != levels)) {
+		/* Firmware rebuilt its tables (a restart): ours went too. */
+		device_printf(dev, "DART sid %u: root moved %#jx -> %#jx\n",
+		    sid, (uintmax_t)fw->root_pa, (uintmax_t)root);
+		for (i = 0; i < fw->ntables; i++)
+			if (!fw->tables[i].ours)
+				pmap_unmapdev(fw->tables[i].va, DART_PAGE_SIZE);
+		/* Our old tables are leaked: the DART may have walked them. */
+		fw->ntables = 0;
+		fw->root = NULL;
+	}
+	if (fw->root == NULL) {
+		fw->root_pa = root;
+		fw->levels = levels;
+		fw->next = fw->base;
+		fw->root = apple_dart_fw_table(fw, root, NULL);
+	}
+	mtx_unlock(&fw->mtx);
+	sx_xunlock(&apple_dart_lock);
+	*fwp = fw;
+	return (0);
+}
+
+int
+apple_dart_fw_map(struct apple_dart_fw *fw, vm_paddr_t pa, size_t size,
+    uint64_t *iovap)
+{
+	uint64_t iova, busy;
+	int error;
+
+	size = roundup2(size, DART_PAGE_SIZE);
+	if ((pa & (DART_PAGE_SIZE - 1)) != 0 || size == 0 ||
+	    size > DART_FW_CHUNK)
+		return (EINVAL);
+	mtx_lock(&fw->mtx);
+	for (iova = fw->next; iova + size <= fw->end;) {
+		/* Within one leaf. */
+		if (rounddown2(iova, DART_FW_CHUNK) !=
+		    rounddown2(iova + size - 1, DART_FW_CHUNK))
+			iova = rounddown2(iova + size - 1, DART_FW_CHUNK);
+		else if (apple_dart_fw_free(fw, iova, size, &busy))
+			break;
+		else
+			iova = rounddown2(busy, DART_PAGE_SIZE) + DART_PAGE_SIZE;
+	}
+	if (iova + size > fw->end) {
+		device_printf(fw->dev, "DART sid %u: no vacant %#zx of IOVA "
+		    "in %#jx-%#jx\n", fw->sid, size, (uintmax_t)fw->base,
+		    (uintmax_t)fw->end);
+		mtx_unlock(&fw->mtx);
+		return (ENOSPC);
+	}
+	error = apple_dart_fw_enter(fw, iova, pa, size);
+	if (error != ENOMEM)
+		fw->next = iova + size;
+	mtx_unlock(&fw->mtx);
+	if (error == 0)
+		*iovap = iova;
+	return (error);
+}
+
+int
+apple_dart_fw_map_at(struct apple_dart_fw *fw, uint64_t iova, vm_paddr_t pa,
+    size_t size)
+{
+	uint64_t off, len, busy;
+	int error;
+
+	size = roundup2(size, DART_PAGE_SIZE);
+	if (((iova | pa) & (DART_PAGE_SIZE - 1)) != 0 || size == 0 ||
+	    iova < fw->base || iova + size > fw->end || iova + size < iova)
+		return (EINVAL);
+	mtx_lock(&fw->mtx);
+	error = 0;
+	for (off = 0; off < size; off += len) {
+		len = MIN(size - off, roundup2(iova + off + 1, DART_FW_CHUNK) -
+		    (iova + off));
+		if (!apple_dart_fw_free(fw, iova + off, len, &busy)) {
+			device_printf(fw->dev, "DART sid %u: IOVA %#jx is "
+			    "taken\n", fw->sid, (uintmax_t)busy);
+			error = EBUSY;
+			break;
+		}
+	}
+	if (error == 0)
+		error = apple_dart_fw_enter(fw, iova, pa, size);
+	mtx_unlock(&fw->mtx);
+	return (error);
+}
+
+int
+apple_dart_fw_lookup(struct apple_dart_fw *fw, uint64_t iova, size_t size,
+    vm_paddr_t *pap)
+{
+	uint64_t *leaf, pte, va, last;
+	vm_paddr_t pa, first;
+	int error;
+
+	if (iova + size < iova)
+		return (EINVAL);
+	first = 0;
+	error = 0;
+	last = size != 0 ? iova + size - 1 : iova;
+	mtx_lock(&fw->mtx);
+	for (va = rounddown2(iova, DART_PAGE_SIZE); va <= last;
+	    va += DART_PAGE_SIZE) {
+		leaf = apple_dart_fw_leaf(fw, va, false, NULL);
+		pte = leaf != NULL ? leaf[(va >> DART_PAGE_SHIFT) & 0x7ff] : 0;
+		if ((pte & DART_PTE_VALID) == 0) {
+			error = ENOENT;
+			break;
+		}
+		pa = DART_PTE_TO_PA(pte);
+		if (va == rounddown2(iova, DART_PAGE_SIZE))
+			first = pa;
+		else if (pa != first + (va - rounddown2(iova, DART_PAGE_SIZE))) {
+			error = EFAULT;
+			break;
+		}
+	}
+	mtx_unlock(&fw->mtx);
+	if (error == 0)
+		*pap = first | (iova & (DART_PAGE_SIZE - 1));
 	return (error);
 }
 

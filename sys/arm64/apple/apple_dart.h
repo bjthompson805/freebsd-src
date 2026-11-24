@@ -19,6 +19,37 @@ int	apple_dart_identity_stream(device_t dev, phandle_t dart, u_int sid);
 int	apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid,
 	    uint64_t iova, vm_paddr_t pa, size_t size);
 
+/*
+ * Streams whose page tables firmware set up and owns (locked DARTs, the
+ * AOP's): buffers go into vacant entries of the live tables, inside the
+ * device's "apple,dma-range" window. A valid entry is never rewritten and
+ * nothing is ever unmapped. No call after attach sleeps (callers may hold
+ * a mutex); the DART must be powered.
+ *
+ * apple_dart_fw_attach: the stream of node's "iommus" entry #index, with
+ *   node's window. Prints TCR/TTBR. ENXIO only when the stream has no live
+ *   table (translation off or TTBR invalid): only then may a caller give it
+ *   a table of its own (apple_dart_private_stream()). EINVAL: bad or
+ *   missing properties; ENODEV: not a T8110 DART; ERANGE: window beyond
+ *   the table; EBUSY: the stream is attached with another window.
+ *   Attaching the same stream again returns the same handle, never freed.
+ * apple_dart_fw_map: [pa, pa + size) at a fresh IOVA in the window, then
+ *   flushes the stream. size <= 32 MiB (one leaf table); pa 16K-aligned.
+ * apple_dart_fw_map_at: the same at a caller's IOVA (to give a buffer one
+ *   address on several streams); EBUSY if any page of it is taken.
+ * apple_dart_fw_lookup: where [iova, iova + size) is in memory, if mapped
+ *   contiguously (ENOENT, EFAULT otherwise), for firmware-placed buffers.
+ */
+struct apple_dart_fw;
+int	apple_dart_fw_attach(device_t dev, phandle_t node, int index,
+	    struct apple_dart_fw **fwp);
+int	apple_dart_fw_map(struct apple_dart_fw *fw, vm_paddr_t pa,
+	    size_t size, uint64_t *iova);
+int	apple_dart_fw_map_at(struct apple_dart_fw *fw, uint64_t iova,
+	    vm_paddr_t pa, size_t size);
+int	apple_dart_fw_lookup(struct apple_dart_fw *fw, uint64_t iova,
+	    size_t size, vm_paddr_t *pa);
+
 struct apple_dart_domain;
 int	apple_dart_domain_create(device_t dev, struct apple_dart_domain **result);
 void	apple_dart_domain_destroy(struct apple_dart_domain *domain);

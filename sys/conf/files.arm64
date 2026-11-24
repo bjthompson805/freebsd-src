@@ -563,6 +563,10 @@ arm64/apple/apple_agx_uat.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_agx_fw.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_agx_render.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_aic.c				optional soc_apple_t8103 fdt
+# AOP and its audio service: a kld for now (sys/modules/apple_aop); built in
+# as well, the module's drivers would clash with the kernel's.
+#arm64/apple/apple_aop.c			optional soc_apple_t8103 fdt
+#arm64/apple/apple_aop_audio.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_cpufreq.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_dart.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_ans.c				optional soc_apple_t8103 fdt nvme
