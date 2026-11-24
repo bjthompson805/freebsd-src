@@ -73,6 +73,7 @@
 #include <sys/queue.h>
 #include <sys/queue_mergesort.h>
 #include <sys/sched.h>
+#include <sys/smp.h>
 #include <sys/signalvar.h>
 #include <sys/sx.h>
 #include <sys/syscallsubr.h>
@@ -749,14 +750,18 @@ start_init(void *dummy)
 	 * other CPUs, after exec'ing pages the kernel prepared elsewhere.
 	 */
 	{
-		int cpu0 = 0;
+		int cpu0 = 0, cpu = -1;
 
+		/* kern.m5_init_cpu=N binds init to CPU N instead. */
 		TUNABLE_INT_FETCH("kern.m5_init_cpu0", &cpu0);
-		if (cpu0) {
+		TUNABLE_INT_FETCH("kern.m5_init_cpu", &cpu);
+		if (cpu0)
+			cpu = 0;
+		if (cpu >= 0 && cpu <= mp_maxid && !CPU_ABSENT(cpu)) {
 			thread_lock(td);
-			sched_bind(td, 0);
+			sched_bind(td, cpu);
 			thread_unlock(td);
-			printf("m5: init bound to CPU 0\n");
+			printf("m5: init bound to CPU %d\n", cpu);
 		}
 	}
 
