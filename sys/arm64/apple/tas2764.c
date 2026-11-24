@@ -456,6 +456,40 @@ tas2764_group_fail(struct tas2764_softc *sc, uint8_t cause)
 	    "is in hardware shutdown until the driver is reloaded\n", cause);
 }
 
+/*
+ * The group whose line is this node's shutdown-gpios, found from the DT
+ * cells: gpiobus lets only the first amp acquire the shared pin (EBUSY for
+ * the rest), so later amps join through this.
+ */
+static struct tas2764_group *
+tas2764_group_by_dt(phandle_t node)
+{
+	struct tas2764_group *g;
+	pcell_t cells[3];
+	device_t ctrl;
+
+	sx_assert(&tas2764_sx, SA_XLOCKED);
+	if (OF_getencprop(node, "shutdown-gpios", cells, sizeof(cells)) <
+	    (ssize_t)(2 * sizeof(pcell_t)) ||
+	    (ctrl = OF_device_from_xref(cells[0])) == NULL)
+		return (NULL);
+	LIST_FOREACH(g, &tas2764_groups, link)
+		if (g->pin->dev == ctrl && g->pin->pin == cells[1])
+			return (g);
+	return (NULL);
+}
+
+static void
+tas2764_group_add(struct tas2764_softc *sc, struct tas2764_group *g)
+{
+
+	sx_assert(&tas2764_sx, SA_XLOCKED);
+	g->users++;
+	LIST_INSERT_HEAD(&g->members, sc, glink);
+	sc->group = g;
+	sc->page = -1;
+}
+
 static int
 tas2764_group_join(struct tas2764_softc *sc, gpio_pin_t pin)
 {
@@ -1284,13 +1318,16 @@ tas2764_attach(device_t dev)
 	/* The line is the only way to reach the amp: no GPIO, no driver. */
 	error = gpio_pin_get_by_ofw_property(dev, node, "shutdown-gpios",
 	    &pin);
-	if (error != 0) {
+	sx_xlock(&tas2764_sx);
+	if (error == 0)
+		tas2764_group_join(sc, pin);
+	else if (error == EBUSY && (g = tas2764_group_by_dt(node)) != NULL)
+		tas2764_group_add(sc, g);	/* another amp holds the line */
+	else {
+		sx_xunlock(&tas2764_sx);
 		device_printf(dev, "no shutdown GPIO: %d\n", error);
 		return (ENXIO);
 	}
-
-	sx_xlock(&tas2764_sx);
-	tas2764_group_join(sc, pin);
 	g = sc->group;
 
 	/*

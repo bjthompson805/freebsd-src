@@ -1420,7 +1420,9 @@ mas_chan_setformat(kobj_t obj, void *data, uint32_t format)
 {
 	struct mas_chan *ch = data;
 
-	return (format == ch->fmt[0] ? 0 : EINVAL);
+	/* sound(4) may give the channel layout its own ext bits (6 -> 5.1). */
+	return (AFMT_ENCODING(format) == AFMT_ENCODING(ch->fmt[0]) &&
+	    AFMT_CHANNEL(format) == AFMT_CHANNEL(ch->fmt[0]) ? 0 : EINVAL);
 }
 
 static uint32_t
@@ -1839,21 +1841,22 @@ mas_pcm_attach(device_t dev)
 	sp = ch->sp;
 	ch->dev = dev;
 	pcm_init(dev, sc);
+	/*
+	 * The sense is bit-perfect (no feeders, no vchans), its one format.
+	 * Set before the channel exists: chn_init's first reset builds the
+	 * feeder chain, which the bit-perfect flag skips.
+	 */
+	if (ch->dir == PCMDIR_REC)
+		pcm_setflags(dev, (pcm_getflags(dev) | SD_F_BITPERFECT) &
+		    ~SD_F_RVCHANS);
 	pcm_addchan(dev, ch->dir, &mas_chan_class, ch);
 	if (pcm_register(dev, ch->dir == PCMDIR_PLAY ?
 	    "at macaudio (speakers)" : "at macaudio (speaker sense)") != 0) {
 		device_printf(dev, "pcm_register failed\n");
 		return (ENXIO);
 	}
-	if (ch->dir == PCMDIR_REC) {
-		/*
-		 * Twelve channels is more than sound(4)'s matrices: the sense
-		 * is bit-perfect (no feeders, no vchans), its one format.
-		 */
-		pcm_setflags(dev, (pcm_getflags(dev) | SD_F_BITPERFECT) &
-		    ~SD_F_RVCHANS);
+	if (ch->dir == PCMDIR_REC)
 		return (0);
-	}
 	mas_sysctls(sp);
 	sp->cdev = make_dev(&mas_owner_cdevsw, device_get_unit(dev),
 	    UID_ROOT, GID_WHEEL, 0600, "spkctl%d", device_get_unit(dev));
@@ -2085,7 +2088,13 @@ mas_chan_setup(struct ma_spk *sp, struct mas_chan *ch, int dir)
 			return (ENXIO);
 		}
 		ch->pcm_frame = ch->dma_frame;
-		ch->fmt[0] = SND_FORMAT(AFMT_S16_LE, ch->info.channels, 0);
+		/*
+		 * sound(4) takes at most 8 channels (feeder_matrix refuses 12
+		 * even bit-perfect), so the frame of 2 * namps S16 words goes out
+		 * as namps S32 "channels": the same bytes, which the daemon reads
+		 * back as S16 pairs (docs/speaker-interface.md).
+		 */
+		ch->fmt[0] = SND_FORMAT(AFMT_S32_LE, ch->info.channels / 2, 0);
 	}
 	ch->fmt[1] = 0;
 	ch->caps = (struct pcmchan_caps){ MAS_RATE, MAS_RATE, ch->fmt, 0 };
