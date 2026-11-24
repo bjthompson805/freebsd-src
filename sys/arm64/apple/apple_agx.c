@@ -176,10 +176,15 @@ SYSCTL_INT(_hw_apple_agx, OID_AUTO, stage, CTLFLAG_RDTUN, &agx_stage, 0,
 static int agx_effort = 0x10000;
 SYSCTL_INT(_hw_apple_agx, OID_AUTO, effort, CTLFLAG_RWTUN, &agx_effort, 0,
     "Effort published to the firmware at each kick (-1: none)");
-/* Experiment: a render for another context waits for the GPU to drain. */
+/*
+ * Renders of two contexts in flight on one pair restart the firmware, so a
+ * render for another context than the pair's last waits for the pair to
+ * drain. 0: only on a pair that several live roots share (more clients than
+ * AGX_RENDER_PAIRS); 1: on every pair.
+ */
 static int agx_ctx_drain = 0;
 SYSCTL_INT(_hw_apple_agx, OID_AUTO, ctx_drain, CTLFLAG_RWTUN, &agx_ctx_drain,
-    0, "Drain the render pair between renders of different contexts");
+    0, "Drain a render pair between contexts (0 shared pairs only, 1 always)");
 
 struct agx_fw_build {
 	const char	*name;
@@ -369,7 +374,20 @@ struct agx_render_slot {
 	void		*arg;
 };
 
+/*
+ * One render pair: a TA and a fragment queue. Each client root renders on
+ * pair (root index % AGX_RENDER_PAIRS), as Aurora gives each owner its own
+ * pair: renders of two VM contexts in flight on one pair restart the
+ * firmware. Pair k's firmware objects sit k * AGX_RENDER_PAIR_STRIDE above
+ * pair 0's (low ones k * AGX_RENDER_PAIR_LOW_STRIDE); its client-window
+ * objects keep pair 0's VAs, mapped into the roots that render on it.
+ */
 struct agx_render {
+	struct apple_agx_softc *sc;
+	u_int		index;
+	uint64_t	fw_off;		/* added to pair 0's firmware VAs */
+	uint64_t	low_off;	/* added to pair 0's low VAs */
+	const struct agx_render_pair_install *in;	/* QIDs, slots, records */
 	uint8_t		*mesh_storage;	/* the last task client's, for the probe */
 	u_int		mesh_chunks;	/* its register's chunk count */
 	u_int		task_context;	/* the last task render's context */
@@ -395,19 +413,12 @@ struct agx_render {
 	uint32_t	next_id;
 	uint32_t	items_end[2];	/* item-ring producers */
 	uint64_t	pb_token;	/* buffer.rs: a token names one PB binding */
-	uint64_t	stamp_events;	/* stamp events naming QID 0 or 1 */
+	uint64_t	stamp_events;	/* stamp events naming the pair's QIDs */
 	u_int		pb_context;
 	u_int		context;
 	uint8_t		generation;
 	struct task	reap_task;
 	struct callout	watchdog;
-	/* g17/recovery.rs State: the firmware restart handshake. */
-	struct task	recovery_task;
-	bool		recovering;	/* a restart is being serviced */
-	uint64_t	recovery_accepted;	/* next generation */
-	uint64_t	recovery_request;
-	int		recovery_blamed;	/* QID, or -1 */
-	u_int		recoveries;
 	struct agx_render_slot last_good;	/* the last render retired */
 };
 
@@ -433,7 +444,14 @@ struct apple_agx_softc {
 	uint8_t			*job_usc;
 	uint8_t			*job_out;
 	struct agx_client_root	client_roots[AGX_VM_SLOTS];
-	struct agx_render	render;
+	struct agx_render	renders[AGX_RENDER_PAIRS];
+	/* g17/recovery.rs State: the firmware restart handshake. */
+	struct task		recovery_task;
+	bool			recovering;	/* a restart is being serviced */
+	uint64_t		recovery_accepted;	/* next generation */
+	uint64_t		recovery_request;
+	int			recovery_blamed;	/* QID, or -1 */
+	u_int			recoveries;
 	struct agx_qos		qos;
 	uint8_t			*asc;
 	uint8_t			*sgx;
@@ -2152,23 +2170,28 @@ agx_stage5(struct apple_agx_softc *sc, phandle_t node,
 	return (cursors[0] == AGX_Q_INSTALL_END ? 0 : ETIMEDOUT);
 }
 
-/* Record a compact-window object of the render pair, aliased into the boot root. */
+/*
+ * Record a compact-window object of a render pair. Pair 0's are also aliased
+ * into the boot root; the other pairs' share those VAs and live only in the
+ * client roots that render on them.
+ */
 static int
-agx_render_alias(struct apple_agx_softc *sc, const char *name, uint8_t *kva,
+agx_render_alias(struct agx_render *r, const char *name, uint8_t *kva,
     vm_size_t size, uint64_t va, int prot)
 {
-	struct agx_render *r = &sc->render;
 
 	if (r->ncompact == nitems(r->compact))
 		return (ENOSPC);
 	r->compact[r->ncompact++] = (struct agx_render_object){ kva, size, va,
 	    prot };
-	return (agx_queue_alias(sc, name, kva, size, sc->uat.lower_root, va,
-	    prot));
+	if (r->index != 0)
+		return (0);
+	return (agx_queue_alias(r->sc, name, kva, size, r->sc->uat.lower_root,
+	    va, prot));
 }
 
 static int
-agx_render_compact(struct apple_agx_softc *sc, const char *name, uint8_t **kva,
+agx_render_compact(struct agx_render *r, const char *name, uint8_t **kva,
     vm_size_t size, uint64_t va)
 {
 
@@ -2176,15 +2199,41 @@ agx_render_compact(struct apple_agx_softc *sc, const char *name, uint8_t **kva,
 	    ~(vm_paddr_t)0, AGX_UAT_PGSZ, 0, VM_MEMATTR_WRITE_COMBINING);
 	if (*kva == NULL)
 		return (ENOMEM);
-	return (agx_render_alias(sc, name, *kva, size, va,
+	return (agx_render_alias(r, name, *kva, size, va,
 	    AGX_PROT_GPU_SHARED_RW));
+}
+
+static struct agx_render *agx_root_pair(struct apple_agx_softc *sc,
+    struct agx_client_root *root);
+
+/* Whether more than one live client root renders on pair r. */
+static bool
+agx_pair_shared(struct apple_agx_softc *sc, struct agx_render *r)
+{
+	u_int i, live = 0;
+
+	for (i = 0; i < AGX_VM_SLOTS; i++)
+		if (sc->client_roots[i].live &&
+		    agx_root_pair(sc, &sc->client_roots[i]) == r && ++live > 1)
+			return (true);
+	return (false);
+}
+
+/* The pair a client root renders on; pair 0 if its own did not install. */
+static struct agx_render *
+agx_root_pair(struct apple_agx_softc *sc, struct agx_client_root *root)
+{
+	struct agx_render *r;
+
+	r = &sc->renders[(root - sc->client_roots) % AGX_RENDER_PAIRS];
+	return (r->installed ? r : &sc->renders[0]);
 }
 
 /* Alias every compact render object into a client root, once per root. */
 static int
 agx_render_map_client(struct apple_agx_softc *sc, struct agx_client_root *root)
 {
-	struct agx_render *r = &sc->render;
+	struct agx_render *r = agx_root_pair(sc, root);
 	u_int i;
 	int error;
 
@@ -2212,8 +2261,10 @@ agx_render_map_client(struct apple_agx_softc *sc, struct agx_client_root *root)
 }
 
 static int
-agx_render_install_resources(struct apple_agx_softc *sc)
+agx_render_install_resources(struct agx_render *r)
 {
+	struct apple_agx_softc *sc = r->sc;
+	const struct agx_render_pair_install *in = r->in;
 	uint8_t *parameter, *pool, *control, *state, *metrics, *backing;
 	volatile uint32_t *pb;
 	volatile uint64_t *row;
@@ -2226,18 +2277,19 @@ agx_render_install_resources(struct apple_agx_softc *sc)
 		return (EINVAL);
 	if ((error = agx_queue_object(sc, "render parameter graph", &parameter,
 	    AGX_RENDER_PARAMETER_SIZE, sc->uat.upper_root,
-	    AGX_RENDER_PARAMETER_VA, AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
-	    (error = agx_render_alias(sc, "render parameter page list",
+	    AGX_RENDER_PARAMETER_VA + r->fw_off,
+	    AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
+	    (error = agx_render_alias(r, "render parameter page list",
 	    parameter + AGX_RENDER_PAGE_LIST_OFFSET, AGX_RENDER_PAGE_LIST_SIZE,
 	    AGX_RENDER_PAGE_LIST_VA, AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
 	    (error = agx_queue_object(sc, "render metrics", &metrics, 0x8000,
-	    sc->uat.upper_root, AGX_RENDER_METRICS_FW_VA,
+	    sc->uat.upper_root, AGX_RENDER_METRICS_FW_VA + r->fw_off,
 	    AGX_PROT_FW_SHARED_RW)) != 0 ||
-	    (error = agx_render_alias(sc, "render metrics", metrics, 0x8000,
+	    (error = agx_render_alias(r, "render metrics", metrics, 0x8000,
 	    AGX_RENDER_METRICS_VA, AGX_PROT_GPU_SHARED_RW)) != 0 ||
-	    (error = agx_render_compact(sc, "render scratch", &backing,
+	    (error = agx_render_compact(r, "render scratch", &backing,
 	    AGX_RENDER_SCRATCH_SIZE, AGX_RENDER_SCRATCH_VA)) != 0 ||
-	    (error = agx_render_compact(sc, "render discard", &backing, 0x8000,
+	    (error = agx_render_compact(r, "render discard", &backing, 0x8000,
 	    AGX_RENDER_DISCARD_VA)) != 0)
 		return (error);
 	/*
@@ -2245,7 +2297,7 @@ agx_render_install_resources(struct apple_agx_softc *sc)
 	 * two clients sharing one hung the tiler. Each client root gets its
 	 * own at the same VA.
 	 */
-	for (i = 0; i < AGX_VM_SLOTS; i++) {
+	for (i = 0; r->index == 0 && i < AGX_VM_SLOTS; i++) {
 		sc->client_roots[i].mesh_storage = (uint8_t *)kmem_alloc_contig(
 		    AGX_RENDER_MESH_STORAGE_SIZE, M_WAITOK | M_ZERO, 0,
 		    ~(vm_paddr_t)0, 0x10000, 0, VM_MEMATTR_WRITE_COMBINING);
@@ -2253,7 +2305,7 @@ agx_render_install_resources(struct apple_agx_softc *sc)
 			return (ENOMEM);
 	}
 	for (i = 0; i < AGX_RENDER_TVB_BLOCKS; i++) {
-		error = agx_render_compact(sc, "render TVB block", &backing,
+		error = agx_render_compact(r, "render TVB block", &backing,
 		    AGX_RENDER_TVB_BLOCK_SIZE,
 		    AGX_RENDER_TVB_VA + i * AGX_RENDER_TVB_STRIDE);
 		if (error != 0)
@@ -2261,83 +2313,94 @@ agx_render_install_resources(struct apple_agx_softc *sc)
 	}
 
 	if ((error = agx_queue_object(sc, "render free list", &pool,
-	    AGX_RENDER_POOL_SIZE, sc->uat.lower_root, AGX_RENDER_POOL_LOW_VA,
-	    AGX_PROT_GPU_SHARED_RW)) != 0 ||
+	    AGX_RENDER_POOL_SIZE, sc->uat.lower_root,
+	    AGX_RENDER_POOL_LOW_VA + r->low_off, AGX_PROT_GPU_SHARED_RW)) != 0 ||
 	    (error = agx_queue_object(sc, "render pool control", &control,
-	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_POOL_CONTROL_VA,
+	    AGX_UAT_PGSZ, sc->uat.upper_root,
+	    AGX_RENDER_POOL_CONTROL_VA + r->fw_off,
 	    AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
 	    (error = agx_queue_object(sc, "render pool state", &state,
-	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_POOL_STATE_VA,
+	    AGX_UAT_PGSZ, sc->uat.upper_root,
+	    AGX_RENDER_POOL_STATE_VA + r->fw_off,
 	    AGX_PROT_GPU_FW_SHARED_RW)) != 0)
 		return (error);
-	sc->render.parameter = parameter;
-	sc->render.pool_state = state;
-	agx_put_words(parameter, agx_render_parameter, nitems(agx_render_parameter));
-	agx_put_words(pool, agx_render_pool, nitems(agx_render_pool));
-	agx_put_words(control, agx_render_pool_control, nitems(agx_render_pool_control));
+	r->parameter = parameter;
+	r->pool_state = state;
+	agx_put_words(parameter, in->parameter, in->nparameter);
+	agx_put_words(pool, in->pool, in->npool);
+	agx_put_words(control, in->pool_control, in->npool_control);
 	dsb(sy);
 
-	pb = (volatile uint32_t *)sc->graph_va[table];
-	pb[0] = agx_render_pb_row[0] | (pb[0] & 6);
-	pb[1] = agx_render_pb_row[1] | (pb[1] & 0x0fc00000);
+	/* runtime/render.rs: a parameter buffer's row is its id * 16 bytes. */
+	pb = (volatile uint32_t *)(sc->graph_va[table] + in->pb_slot * 16);
+	pb[0] = in->pb_row[0] | (pb[0] & 6);
+	pb[1] = in->pb_row[1] | (pb[1] & 0x0fc00000);
 	pb[2] &= ~0x003fffffu;
 	pb[3] &= ~0x803fffffu;
-	row = (volatile uint64_t *)(sc->graph_va[pp] + AGX_RENDER_POOL_ROW);
+	row = (volatile uint64_t *)(sc->graph_va[pp] + in->pool_row);
 	for (i = 0; i < nitems(agx_render_pool_row); i++)
-		row[i] = agx_render_pool_row[i];
+		row[i] = in->pool_row_words[i];
 	dsb(sy);
 	return (0);
 }
 
-static int agx_render_objects(struct apple_agx_softc *sc);
+static int agx_render_objects(struct agx_render *r);
 
 /*
- * Register QIDs 0 (tiling) and 1 (fragment). This cold install publishes
- * only the configuration prefixes. No render kick or draw is submitted.
+ * Register pair k's QIDs (pair 0: 0 tiling, 1 fragment). This cold install
+ * publishes only the configuration prefixes. No render kick or draw is
+ * submitted.
  */
 static int
-agx_stage7(struct apple_agx_softc *sc)
+agx_render_install(struct apple_agx_softc *sc, u_int k)
 {
+	struct agx_render *r = &sc->renders[k];
+	const struct agx_render_pair_install *in = &agx_render_pair_installs[k];
 	uint8_t *graph, *config, *scheduler, *work, *kicks;
 	volatile uint32_t *ta, *fragment;
 	const u_int producer_offset = (AGX_Q_PRODUCER - AGX_Q_CURSORS) / 4;
 	int error, i;
 
+	r->sc = sc;
+	r->index = k;
+	r->fw_off = k * AGX_RENDER_PAIR_STRIDE;
+	r->low_off = k * AGX_RENDER_PAIR_LOW_STRIDE;
+	r->in = in;
 	if ((error = agx_queue_object(sc, "render graph", &graph,
-	    AGX_RENDER_GRAPH_SIZE, sc->uat.upper_root, AGX_RENDER_GRAPH_VA,
-	    AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
+	    AGX_RENDER_GRAPH_SIZE, sc->uat.upper_root,
+	    AGX_RENDER_GRAPH_VA + r->fw_off, AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
 	    (error = agx_queue_object(sc, "render configs", &config,
 	    2 * AGX_RENDER_CONFIG_STRIDE, sc->uat.upper_root,
-	    AGX_RENDER_CONFIG_VA, AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
+	    AGX_RENDER_CONFIG_VA + r->fw_off, AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
 	    (error = agx_queue_object(sc, "render scheduler", &scheduler,
-	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_SCHED_VA,
+	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_SCHED_VA + r->fw_off,
 	    AGX_PROT_FW_SHARED_RW)) != 0 ||
 	    (error = agx_queue_object(sc, "render work states", &work,
-	    AGX_Q_WORK_SIZE, sc->uat.upper_root, AGX_RENDER_WORK_VA,
+	    AGX_Q_WORK_SIZE, sc->uat.upper_root, AGX_RENDER_WORK_VA + r->fw_off,
 	    AGX_PROT_FW_SHARED_RW)) != 0 ||
 	    (error = agx_queue_object(sc, "render kick rings", &kicks,
-	    2 * AGX_Q_KICK_SIZE, sc->uat.lower_root, AGX_RENDER_KICK_LOW_VA,
-	    AGX_PROT_GPU_SHARED_RW)) != 0 ||
+	    2 * AGX_Q_KICK_SIZE, sc->uat.lower_root,
+	    AGX_RENDER_KICK_LOW_VA + r->low_off, AGX_PROT_GPU_SHARED_RW)) != 0 ||
 	    (error = agx_queue_alias(sc, "render kick rings", kicks,
-	    2 * AGX_Q_KICK_SIZE, sc->uat.upper_root, AGX_RENDER_KICK_HIGH_VA,
-	    AGX_PROT_FW_SHARED_RW)) != 0)
+	    2 * AGX_Q_KICK_SIZE, sc->uat.upper_root,
+	    AGX_RENDER_KICK_HIGH_VA + r->fw_off, AGX_PROT_FW_SHARED_RW)) != 0)
 		return (error);
 
-	error = agx_render_install_resources(sc);
+	error = agx_render_install_resources(r);
 	if (error != 0)
 		return (error);
 
-	sc->render.graph = graph;
-	sc->render.work = work;
-	sc->render.kicks = kicks;
-	sc->render.context = AGX_Q_CONTEXT;
-	sc->render.pb_context = AGX_Q_CONTEXT;	/* the cold install's token 0 */
+	r->graph = graph;
+	r->work = work;
+	r->kicks = kicks;
+	r->context = AGX_Q_CONTEXT;
+	r->pb_context = AGX_Q_CONTEXT;	/* the cold install's token 0 */
 	agx_put_words(scheduler, agx_q_sched, nitems(agx_q_sched));
-	agx_put_words(graph, agx_render_graph, nitems(agx_render_graph));
-	memcpy(work + AGX_RENDER_WORK_HEAD, agx_render_work_head,
+	agx_put_words(graph, in->graph, in->ngraph);
+	memcpy(work + AGX_RENDER_WORK_HEAD, in->work_head,
 	    sizeof(agx_render_work_head));
-	memcpy(config, agx_render_ta_config, sizeof(agx_render_ta_config));
-	memcpy(config + AGX_RENDER_CONFIG_STRIDE, agx_render_fragment_config,
+	memcpy(config, in->ta_config, sizeof(agx_render_ta_config));
+	memcpy(config + AGX_RENDER_CONFIG_STRIDE, in->fragment_config,
 	    sizeof(agx_render_fragment_config));
 	ta = (volatile uint32_t *)(graph + AGX_RENDER_TA_CURSORS);
 	fragment = (volatile uint32_t *)(graph + AGX_RENDER_FRAGMENT_CURSORS);
@@ -2347,8 +2410,7 @@ agx_stage7(struct apple_agx_softc *sc)
 	dsb(sy);
 
 	/* Both slots are on the shared compute ring. J813 rings pipe 0. */
-	error = agx_publish_work_slots(sc, agx_render_fragment_slot,
-	    agx_render_ta_slot);
+	error = agx_publish_work_slots(sc, in->fragment_slot, in->ta_slot);
 	if (error != 0)
 		return (error);
 	error = apple_rtkit_send(sc->roles[0].rtk, AGX_EP_DOORBELL,
@@ -2365,18 +2427,38 @@ agx_stage7(struct apple_agx_softc *sc)
 			break;
 		DELAY(1000);
 	}
-	device_printf(sc->dev, "render configuration: QID 0 %u/%u, "
-	    "QID 1 %u/%u after %d ms\n", ta[0], ta[producer_offset],
-	    fragment[0], fragment[producer_offset], i);
+	device_printf(sc->dev, "render pair %u configuration: QID %u %u/%u, "
+	    "QID %u %u/%u after %d ms\n", k, in->qids[0], ta[0],
+	    ta[producer_offset], in->qids[1], fragment[0],
+	    fragment[producer_offset], i);
 	if (ta[0] != 1 || fragment[0] != 1)
 		return (ETIMEDOUT);
-	sc->render.items_end[0] = sc->render.items_end[1] = 1;
-	if ((error = agx_render_objects(sc)) != 0)
+	r->items_end[0] = r->items_end[1] = 1;
+	if ((error = agx_render_objects(r)) != 0)
 		return (error);
-	sc->render.ts = 1;			/* KickTimestamp::FIRST */
-	sc->render.next_word = AGX_WORK_FIRST_WORD;
-	sc->render.next_id = 2;
-	sc->render.installed = true;
+	r->ts = 1;			/* KickTimestamp::FIRST */
+	r->next_word = AGX_WORK_FIRST_WORD;
+	r->next_id = 2;
+	r->installed = true;
+	return (0);
+}
+
+static void agx_recovery_task(void *arg, int pending);
+
+/* Every render pair; one that fails to install leaves the ones before it. */
+static int
+agx_stage7(struct apple_agx_softc *sc)
+{
+	u_int k;
+	int error;
+
+	TASK_INIT(&sc->recovery_task, 0, agx_recovery_task, sc);
+	for (k = 0; k < AGX_RENDER_PAIRS; k++)
+		if ((error = agx_render_install(sc, k)) != 0) {
+			device_printf(sc->dev, "render pair %u: install: %d\n",
+			    k, error);
+			return (k == 0 ? error : 0);
+		}
 	return (0);
 }
 
@@ -2411,46 +2493,46 @@ agx_stage7(struct apple_agx_softc *sc)
 
 static void agx_render_reap_task(void *arg, int pending);
 static void agx_render_watchdog(void *arg);
-static void agx_recovery_task(void *arg, int pending);
 
 static int
-agx_render_objects(struct apple_agx_softc *sc)
+agx_render_objects(struct agx_render *r)
 {
-	struct agx_render *r = &sc->render;
+	struct apple_agx_softc *sc = r->sc;
 	struct agx_render_slot *slot;
 	u_int i;
 	int error;
 
 	if ((error = agx_queue_object(sc, "render support", &r->support,
-	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_SUPPORT_VA,
+	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_SUPPORT_VA + r->fw_off,
 	    AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
 	    (error = agx_queue_object(sc, "render records", &r->records,
-	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_RECORDS_VA,
+	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_RENDER_RECORDS_VA + r->fw_off,
 	    AGX_PROT_FW_SHARED_RW)) != 0)
 		return (error);
 	for (i = 0; i < AGX_RENDER_SLOTS; i++) {
 		slot = &r->slots[i];
 		if ((error = agx_queue_object(sc, "render commands", &slot->desc,
 		    AGX_M5_RENDER_STORAGE_BYTES, sc->uat.upper_root,
-		    AGX_RENDER_DESC_VA + i * AGX_M5_RENDER_STORAGE_BYTES,
+		    AGX_RENDER_DESC_VA + r->fw_off +
+		    i * AGX_M5_RENDER_STORAGE_BYTES,
 		    AGX_PROT_GPU_FW_SHARED_RW)) != 0 ||
 		    (error = agx_queue_alias(sc, "render commands", slot->desc,
 		    AGX_M5_RENDER_STORAGE_BYTES, sc->uat.lower_root,
-		    AGX_RENDER_DESC_LOW_VA + i * AGX_M5_RENDER_STORAGE_BYTES,
+		    AGX_RENDER_DESC_LOW_VA + r->low_off +
+		    i * AGX_M5_RENDER_STORAGE_BYTES,
 		    AGX_PROT_GPU_SHARED_RW)) != 0 ||
-		    (error = agx_render_compact(sc, "render target", &slot->target,
+		    (error = agx_render_compact(r, "render target", &slot->target,
 		    AGX_RENDER_TARGET_SIZE,
 		    AGX_RENDER_TARGET_VA + i * AGX_RENDER_SLOT_STRIDE)) != 0 ||
-		    (error = agx_render_compact(sc, "render TPC", &slot->tpc,
+		    (error = agx_render_compact(r, "render TPC", &slot->tpc,
 		    AGX_RENDER_TPC_SIZE,
 		    AGX_RENDER_TPC_VA + i * AGX_RENDER_SLOT_STRIDE)) != 0 ||
-		    (error = agx_render_compact(sc, "render state", &slot->state,
+		    (error = agx_render_compact(r, "render state", &slot->state,
 		    AGX_RENDER_STATE_SIZE,
 		    AGX_RENDER_STATE_VA + i * AGX_RENDER_STATE_SIZE)) != 0)
 			return (error);
 	}
-	TASK_INIT(&r->reap_task, 0, agx_render_reap_task, sc);
-	TASK_INIT(&r->recovery_task, 0, agx_recovery_task, sc);
+	TASK_INIT(&r->reap_task, 0, agx_render_reap_task, r);
 	callout_init_mtx(&r->watchdog, &sc->mtx, 0);
 	return (0);
 }
@@ -2513,11 +2595,12 @@ agx_items_room(uint32_t producer, uint32_t consumer)
  * renders may still run: the tiling kick waits for the last fragment kick.
  */
 static int
-agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
+agx_render_kick(struct agx_render *r, u_int index, u_int context,
     uint8_t generation, const struct agx_render_pass *pass,
     const struct agx_stage_plan stages[2], uint8_t mesh_class)
 {
-	struct agx_render *r = &sc->render;
+	struct apple_agx_softc *sc = r->sc;
+	const struct agx_render_pair_install *in = r->in;
 	struct agx_render_slot *slot = &r->slots[index];
 	const struct agx_board *board = &agx_j813_board;
 	static const size_t cursors_off[2] = { AGX_RENDER_TA_CURSORS,
@@ -2525,9 +2608,17 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	static const size_t items_off[2] = { AGX_RENDER_TA_ITEMS,
 	    AGX_RENDER_FRAGMENT_ITEMS };
 	const u_int producer_offset = (AGX_Q_PRODUCER - AGX_Q_CURSORS) / 4;
-	const uint64_t desc_va = AGX_RENDER_DESC_VA +
+	/* The pair's firmware objects. */
+	const uint64_t graph_va = AGX_RENDER_GRAPH_VA + r->fw_off;
+	const uint64_t work_va = AGX_RENDER_WORK_VA + r->fw_off;
+	const uint64_t sched_va = AGX_RENDER_SCHED_VA + r->fw_off;
+	const uint64_t parameter_va = AGX_RENDER_PARAMETER_VA + r->fw_off;
+	const uint64_t pool_control_va = AGX_RENDER_POOL_CONTROL_VA + r->fw_off;
+	const uint64_t support_va = AGX_RENDER_SUPPORT_VA + r->fw_off;
+	const uint64_t records_va = AGX_RENDER_RECORDS_VA + r->fw_off;
+	const uint64_t desc_va = AGX_RENDER_DESC_VA + r->fw_off +
 	    index * AGX_M5_RENDER_STORAGE_BYTES;
-	const uint64_t desc_low = AGX_RENDER_DESC_LOW_VA +
+	const uint64_t desc_low = AGX_RENDER_DESC_LOW_VA + r->low_off +
 	    index * AGX_M5_RENDER_STORAGE_BYTES;
 	const uint64_t target_va = AGX_RENDER_TARGET_VA +
 	    index * AGX_RENDER_SLOT_STRIDE;
@@ -2585,16 +2676,17 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	    scene * AGX_RENDER_SCENE_SIZE + 0x48) = 0;
 	agx_put_unaligned64(r->parameter + AGX_RENDER_SCENE_TABLE +
 	    scene * AGX_RENDER_SCENE_SIZE + 0x4c, AGX_RENDER_PB_GENERATION);
-	*(volatile uint32_t *)(r->parameter + 0xc) = 0;	/* State::buffer_id */
+	/* State::buffer_id */
+	*(volatile uint32_t *)(r->parameter + 0xc) = in->pb_slot;
 
 	/* The work-state node, with both kicks submitted. */
 	do {
 		word = r->next_word++;
 	} while ((word & 63) == AGX_WORK_STATES);
-	node_va = AGX_RENDER_WORK_VA + (word & 63) * AGX_NODE_STRIDE;
+	node_va = work_va + (word & 63) * AGX_NODE_STRIDE;
 	counter_off = AGX_UAT_PGSZ + (word & 63) * 4;
 	memset(node, 0, sizeof(node));
-	va = AGX_RENDER_WORK_VA + counter_off;
+	va = work_va + counter_off;
 	memcpy(node, &va, 8);
 	memcpy(node + 8, &word, 4);
 	node[0x10] = 0x50;
@@ -2605,14 +2697,14 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	memset(&res, 0, sizeof(res));
 	res.context_id = context;
 	res.context_generation = generation;
-	res.pb_slot = 0;
-	res.free_list_slot = AGX_RENDER_FREE_LIST_SLOT;
-	res.free_list_control_va = AGX_RENDER_POOL_CONTROL_VA;
+	res.pb_slot = in->pb_slot;
+	res.free_list_slot = in->pool_slot;
+	res.free_list_control_va = pool_control_va;
 	res.kick_record_va = node_va;
-	res.pb_va = AGX_RENDER_PARAMETER_VA;
-	res.scene_va = AGX_RENDER_PARAMETER_VA + AGX_RENDER_SCENE_TABLE +
+	res.pb_va = parameter_va;
+	res.scene_va = parameter_va + AGX_RENDER_SCENE_TABLE +
 	    scene * AGX_RENDER_SCENE_SIZE;
-	res.scene_end_va = AGX_RENDER_PARAMETER_VA + AGX_RENDER_SCENE_TABLE +
+	res.scene_end_va = parameter_va + AGX_RENDER_SCENE_TABLE +
 	    AGX_RENDER_SCENES * AGX_RENDER_SCENE_SIZE;
 	res.pm_scratch = AGX_RENDER_SCRATCH_VA - AGX_COMPACT_BASE +
 	    (scene % AGX_RENDER_SCRATCH_SLOTS) * AGX_RENDER_SCRATCH_STRIDE;
@@ -2628,8 +2720,7 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	res.fragment_status_va = res.ta_status_va + 8;
 	res.aux_fb_va = state_va + AGX_RENDER_STATE_AUX;
 	/* The firmware writes the stage timestamps: a firmware address. */
-	res.timestamp_va = AGX_RENDER_SUPPORT_VA + AGX_RENDER_TIMESTAMPS +
-	    index * 0x20;
+	res.timestamp_va = support_va + AGX_RENDER_TIMESTAMPS + index * 0x20;
 	/* ids.rs render_pair: fragment, then tiling, after the graph's id. */
 	res.fragment_ids.predecessor = res.ta_ids.predecessor =
 	    AGX_RENDER_ID_PREDECESSOR;
@@ -2641,19 +2732,19 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	a.pass = pass;
 	a.resources = &res;
 	a.ordinal = ordinal;
-	a.ta = (struct agx_render_stage){ 0, desc_low, word,
-	    AGX_RENDER_SUPPORT_VA, AGX_RENDER_SUPPORT_VA + 8 };
-	a.fragment = (struct agx_render_stage){ 1, desc_low +
-	    AGX_M5_RENDER_FRAGMENT_OFFSET, word, AGX_RENDER_SUPPORT_VA + 0x10,
-	    AGX_RENDER_SUPPORT_VA + 0x18 };
+	a.ta = (struct agx_render_stage){ in->qids[0], desc_low, word, support_va,
+	    support_va + 8 };
+	a.fragment = (struct agx_render_stage){ in->qids[1], desc_low +
+	    AGX_M5_RENDER_FRAGMENT_OFFSET, word, support_va + 0x10,
+	    support_va + 0x18 };
 	a.has_stages = true;
 	memcpy(a.stages, stages, sizeof(a.stages));
 	a.mesh_class = mesh_class;
 	/* render.rs: only API task kicks get the TA mesh rendering buffer. */
 	if (mesh_class == 2)
 		res.mesh_storage = AGX_RENDER_MESH_STORAGE_VA |
-		    (uint64_t)r->mesh_chunks << 48;
-	a.usage[0] = AGX_RENDER_SUPPORT_VA + AGX_RENDER_USAGE + index * 0x80;
+		    (uint64_t)sc->renders[0].mesh_chunks << 48;
+	a.usage[0] = support_va + AGX_RENDER_USAGE + index * 0x80;
 	a.usage[1] = a.usage[0] + 0x40;
 	memset(slot->desc, 0, AGX_M5_RENDER_STORAGE_BYTES);
 	if ((error = agx_m5_render_encode(slot->desc, desc_low, &a, &enc)) != 0 ||
@@ -2679,30 +2770,32 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	}
 	for (s = 0; s < 2; s++) {
 		memset(&ca, 0, sizeof(ca));
-		ca.kick_ring_va = AGX_RENDER_KICK_LOW_VA + s * AGX_Q_KICK_SIZE;
-		ca.kick_ring_fw_va = AGX_RENDER_KICK_HIGH_VA + s * AGX_Q_KICK_SIZE;
-		ca.qid = s;
+		ca.kick_ring_va = AGX_RENDER_KICK_LOW_VA + r->low_off +
+		    s * AGX_Q_KICK_SIZE;
+		ca.kick_ring_fw_va = AGX_RENDER_KICK_HIGH_VA + r->fw_off +
+		    s * AGX_Q_KICK_SIZE;
+		ca.qid = in->qids[s];
 		ca.context_id = context;
-		ca.free_list_va = AGX_RENDER_POOL_CONTROL_VA;
+		ca.free_list_va = pool_control_va;
 		ca.free_list_generation = 1;
-		ca.free_list_slot = AGX_RENDER_FREE_LIST_SLOT;
-		ca.scheduler_va = AGX_RENDER_SCHED_VA;
+		ca.free_list_slot = in->pool_slot;
+		ca.scheduler_va = sched_va;
 		ca.priority = AGX_RENDER_PRIORITY;
 		ca.policy = AGX_Q_POLICY;
-		ca.qos_slot = 0;
+		ca.qos_slot = in->qos;
 		ca.qos_update = identity;
 		ca.owner_pid = 1;
 		ca.context_update = identity;
 		if ((error = agx_queue_config_render(config, &ca, s == 0,
-		    AGX_RENDER_PARAMETER_VA, r->pb_token, 0, 1)) != 0 ||
-		    (error = agx_kick_announce(announce, s, s == 0 ?
+		    parameter_va, r->pb_token, in->pb_slot, in->qids[1])) != 0 ||
+		    (error = agx_kick_announce(announce, in->qids[s], s == 0 ?
 		    AGX_DM_TILING : AGX_DM_FRAGMENT, ts,
 		    AGX_RENDER_PRIORITY)) != 0)
 			return (error);
-		values[0] = agx_queue_record(r->records, AGX_RENDER_RECORDS_VA,
+		values[0] = agx_queue_record(r->records, records_va,
 		    records + s * 0x100, 0x100, config, sizeof(config));
 		values[1] = desc_va + s * AGX_M5_RENDER_FRAGMENT_OFFSET;
-		values[2] = agx_queue_record(r->records, AGX_RENDER_RECORDS_VA,
+		values[2] = agx_queue_record(r->records, records_va,
 		    records + AGX_RENDER_ANNOUNCE + s * 0x80, 0x80, announce,
 		    sizeof(announce));
 		items = (volatile uint64_t *)(r->graph + items_off[s]);
@@ -2716,15 +2809,15 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	 * also waits for the last fragment kick (queue/render.rs
 	 * J813_LAST_FRAGMENT, class 2), then its parent (class 1).
 	 */
-	barriers[0] = agx_kick_dependency(1, ts - 1);
-	barriers[1] = agx_kick_dependency(0, ts);
+	barriers[0] = agx_kick_dependency(in->qids[1], ts - 1);
+	barriers[1] = agx_kick_dependency(in->qids[0], ts);
 	types[0][0] = ordinal != 0 ? 2 : 1;
 	types[0][1] = 1;
 	types[1][0] = 1;
 	types[1][1] = 3;
 	for (s = 1; s >= 0; s--) {
 		memset(&ka, 0, sizeof(ka));
-		ka.qid = s;
+		ka.qid = in->qids[s];
 		ka.timestamp = ts;
 		ka.parent = ts - 1;
 		ka.barriers = &barriers[s];
@@ -2733,8 +2826,8 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 			ka.barriers = NULL;
 		ka.dependency_types = types[s];
 		ka.descriptor_va = desc_va + s * AGX_M5_RENDER_FRAGMENT_OFFSET;
-		ka.queue_va = AGX_RENDER_GRAPH_VA + s * AGX_RENDER_QUEUE_STRIDE;
-		ka.qos_slot = 0;
+		ka.queue_va = graph_va + in->qids[s] * AGX_RENDER_QUEUE_STRIDE;
+		ka.qos_slot = in->qos;
 		ka.qos_class = s == 0 ? AGX_TA_QOS_CLASS : AGX_FRAGMENT_QOS_CLASS;
 		memcpy(ka.register_arrays, enc.rce[s], sizeof(ka.register_arrays));
 		ka.scs_enabled = enc.scratch[s];
@@ -2748,19 +2841,20 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 	if (ordinal == 0)
 		agx_uat_tlbi_all();
 
-	if ((error = agx_qos_publish(sc, 1, 0, AGX_DM_FRAGMENT,
-	    AGX_RENDER_SCHED_VA, AGX_Q_QOS_CLASS, AGX_Q_QOS_SHARE)) != 0 ||
-	    (error = agx_qos_publish(sc, 0, 0, AGX_DM_TILING,
-	    AGX_RENDER_SCHED_VA, AGX_Q_QOS_CLASS, AGX_Q_QOS_SHARE)) != 0)
+	if ((error = agx_qos_publish(sc, in->qids[1], in->qos, AGX_DM_FRAGMENT,
+	    sched_va, AGX_Q_QOS_CLASS, AGX_Q_QOS_SHARE)) != 0 ||
+	    (error = agx_qos_publish(sc, in->qids[0], in->qos, AGX_DM_TILING,
+	    sched_va, AGX_Q_QOS_CLASS, AGX_Q_QOS_SHARE)) != 0)
 		return (error);
 	for (s = 0; s < 2; s++)
 		r->items_end[s] = (base[s] + 3) % AGX_Q_ITEM_ENTRIES;
 	/* initdata.rs m5_work_pair: the shared ring's slots name compute. */
 	if ((error = agx_work_slot(slots[0], AGX_DM_COMPUTE,
-	    AGX_RENDER_GRAPH_VA + AGX_RENDER_QUEUE_STRIDE, 1, r->items_end[1],
-	    false)) != 0 ||
-	    (error = agx_work_slot(slots[1], AGX_DM_COMPUTE, AGX_RENDER_GRAPH_VA,
-	    0, r->items_end[0], false)) != 0)
+	    graph_va + in->qids[1] * AGX_RENDER_QUEUE_STRIDE, in->qids[1],
+	    r->items_end[1], false)) != 0 ||
+	    (error = agx_work_slot(slots[1], AGX_DM_COMPUTE,
+	    graph_va + in->qids[0] * AGX_RENDER_QUEUE_STRIDE, in->qids[0],
+	    r->items_end[0], false)) != 0)
 		return (error);
 	/* add_submitted_kicks(2), the free-list and manager submissions. */
 	*(volatile uint32_t *)(r->work + counter_off) = 2;
@@ -2787,12 +2881,11 @@ agx_render_kick(struct apple_agx_softc *sc, u_int index, u_int context,
 
 /* The slot's render retired: both stamps cover it and its node counts both kicks. */
 static bool
-agx_render_retired(struct apple_agx_softc *sc, struct agx_render_slot *slot)
+agx_render_retired(struct agx_render *r, struct agx_render_slot *slot)
 {
-	struct agx_render *r = &sc->render;
 	volatile uint32_t *stamps = (volatile uint32_t *)r->support;
 	volatile uint32_t *node = (volatile uint32_t *)(r->work +
-	    (slot->node_va - AGX_RENDER_WORK_VA));
+	    (slot->node_va - (AGX_RENDER_WORK_VA + r->fw_off)));
 
 	dsb(sy);
 	return (agx_stamp_covers(stamps[0], slot->stamp) &&
@@ -2812,9 +2905,9 @@ struct agx_render_done {
  * collected for the caller to run without the mutex.
  */
 static u_int
-agx_render_reap(struct apple_agx_softc *sc, struct agx_render_done *out)
+agx_render_reap(struct agx_render *r, struct agx_render_done *out)
 {
-	struct agx_render *r = &sc->render;
+	struct apple_agx_softc *sc = r->sc;
 	struct agx_render_slot *slot;
 	volatile uint32_t *stamps = (volatile uint32_t *)r->support;
 	u_int n = 0;
@@ -2827,16 +2920,16 @@ agx_render_reap(struct apple_agx_softc *sc, struct agx_render_done *out)
 		slot = &r->slots[r->oldest];
 		error = 0;
 		if (!r->failed && slot->error == 0 &&
-		    !agx_render_retired(sc, slot)) {
+		    !agx_render_retired(r, slot)) {
 			/* A restart being serviced holds every deadline. */
 			if (!apple_rtkit_crashed(sc->roles[0].rtk) &&
 			    !apple_rtkit_crashed(sc->roles[1].rtk) &&
-			    (r->recovering || sbinuptime() < slot->deadline))
+			    (sc->recovering || sbinuptime() < slot->deadline))
 				break;
-			device_printf(sc->dev, "render %u: not retired: stamps "
-			    "TA %#x 3D %#x (want %#x), %u in flight\n",
-			    slot->ordinal, stamps[0], stamps[4], slot->stamp,
-			    r->in_flight);
+			device_printf(sc->dev, "pair %u render %u: not retired: "
+			    "stamps TA %#x 3D %#x (want %#x), %u in flight\n",
+			    r->index, slot->ordinal, stamps[0], stamps[4],
+			    slot->stamp, r->in_flight);
 			r->failed = true;
 		}
 		if (r->failed)
@@ -2845,8 +2938,10 @@ agx_render_reap(struct apple_agx_softc *sc, struct agx_render_done *out)
 		else if (slot->error != 0)
 			error = slot->error;
 		else {
-			agx_qos_complete(sc, 1, 0, AGX_DM_FRAGMENT);
-			agx_qos_complete(sc, 0, 0, AGX_DM_TILING);
+			agx_qos_complete(sc, r->in->qids[1], r->in->qos,
+			    AGX_DM_FRAGMENT);
+			agx_qos_complete(sc, r->in->qids[0], r->in->qos,
+			    AGX_DM_TILING);
 			r->retired++;
 			r->last_good = *slot;
 		}
@@ -2860,7 +2955,7 @@ agx_render_reap(struct apple_agx_softc *sc, struct agx_render_done *out)
 		wakeup(&r->in_flight);
 	if (r->in_flight != 0)
 		callout_reset_sbt(&r->watchdog, 10 * SBT_1MS, 0,
-		    agx_render_watchdog, sc, 0);
+		    agx_render_watchdog, r, 0);
 	else
 		callout_stop(&r->watchdog);
 	return (n);
@@ -2879,13 +2974,13 @@ agx_render_complete(struct agx_render_done *done, u_int n)
 static void
 agx_render_reap_task(void *arg, int pending)
 {
-	struct apple_agx_softc *sc = arg;
+	struct agx_render *r = arg;
 	struct agx_render_done done[AGX_RENDER_SLOTS];
 	u_int n;
 
-	mtx_lock(&sc->mtx);
-	n = agx_render_reap(sc, done);
-	mtx_unlock(&sc->mtx);
+	mtx_lock(&r->sc->mtx);
+	n = agx_render_reap(r, done);
+	mtx_unlock(&r->sc->mtx);
 	agx_render_complete(done, n);
 }
 
@@ -2893,9 +2988,9 @@ agx_render_reap_task(void *arg, int pending)
 static void
 agx_render_watchdog(void *arg)
 {
-	struct apple_agx_softc *sc = arg;
+	struct agx_render *r = arg;
 
-	taskqueue_enqueue(taskqueue_thread, &sc->render.reap_task);
+	taskqueue_enqueue(taskqueue_thread, &r->reap_task);
 }
 
 /*
@@ -2910,7 +3005,7 @@ apple_agx_submit_render_async(device_t dev, u_int context,
     void (*done)(void *, int), void *arg)
 {
 	struct apple_agx_softc *sc = device_get_softc(dev);
-	struct agx_render *r = &sc->render;
+	struct agx_render *r;
 	struct agx_render_done finished[AGX_RENDER_SLOTS];
 	struct agx_client_root *root;
 	struct agx_render_pass p = *pass;
@@ -2938,8 +3033,14 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 	if (error != 0)
 		return (error);
 	mtx_lock(&sc->mtx);
+	root = agx_client_root(sc, context);
+	if (root == NULL || !root->live) {
+		mtx_unlock(&sc->mtx);
+		return (ENOENT);
+	}
+	r = agx_root_pair(sc, root);
 	while (r->installed && !r->failed && r->in_flight == AGX_RENDER_SLOTS) {
-		n = agx_render_reap(sc, finished);
+		n = agx_render_reap(r, finished);
 		if (n != 0)
 			break;
 		mtx_sleep(&r->in_flight, &sc->mtx, 0, "agxslot", hz / 100 + 1);
@@ -2948,17 +3049,18 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 	 * A task render for another context than the last one waits for the
 	 * GPU to drain: task tiling switching among three or more clients
 	 * hung the tiler with in-flight work behind it (J815, no reference).
+	 * Every render does on a shared pair (see agx_ctx_drain).
 	 */
 	while (((mesh_class == 2 && context != r->task_context) ||
-	    (agx_ctx_drain && context != r->context)) && r->installed &&
+	    (context != r->context && (agx_ctx_drain ||
+	    agx_pair_shared(sc, r)))) && r->installed &&
 	    !r->failed && r->in_flight != 0) {
-		n += agx_render_reap(sc, finished + n);
+		n += agx_render_reap(r, finished + n);
 		if (r->in_flight == 0)
 			break;
 		mtx_sleep(&r->in_flight, &sc->mtx, 0, "agxtask", hz / 100 + 1);
 	}
-	root = agx_client_root(sc, context);
-	if (!r->installed || r->failed || root == NULL || !root->live) {
+	if (!r->installed || r->failed || !root->live) {
 		error = !r->installed ? ENODEV : r->failed ? EIO : ENOENT;
 		goto out;
 	}
@@ -2966,10 +3068,10 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 		goto out;
 	index = (r->oldest + r->in_flight) % AGX_RENDER_SLOTS;
 	slot = &r->slots[index];
-	error = agx_render_kick(sc, index, context, root->generation, &p,
+	error = agx_render_kick(r, index, context, root->generation, &p,
 	    stages, mesh_class);
 	if (error == 0 && mesh_class == 2) {
-		r->mesh_storage = root->mesh_storage;
+		sc->renders[0].mesh_storage = root->mesh_storage;
 		r->task_context = context;
 	}
 	if (error == 0) {
@@ -2988,7 +3090,7 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 		if (++r->in_flight > r->peak_in_flight)
 			r->peak_in_flight = r->in_flight;
 		callout_reset_sbt(&r->watchdog, 10 * SBT_1MS, 0,
-		    agx_render_watchdog, sc, 0);
+		    agx_render_watchdog, r, 0);
 	} else if (error != EINVAL && error != E2BIG && error != EOPNOTSUPP &&
 	    r->ordinal != 0)
 		/* A partly published render may still run. */
@@ -3415,41 +3517,99 @@ agx_recovery_dump(struct apple_agx_softc *sc, const char *what,
  * writes 0. The render the firmware blames fails; the others stay in
  * flight and are retired from their own stamps as the firmware replays.
  */
+/* A pair's state at a restart, for the log. */
 static void
-agx_recovery_task(void *arg, int pending)
+agx_recovery_pair_log(struct agx_render *r)
 {
-	struct apple_agx_softc *sc = arg;
-	struct agx_render *r = &sc->render;
-	struct agx_render_done done[AGX_RENDER_SLOTS];
-	volatile uint32_t *info;
-	uint64_t gen;
-	uint32_t flags, host, guilty[4];
-	u_int i, j, listed = 0, n, nguilty = 0, nfailed = 0;
-	int blamed, error;
+	struct apple_agx_softc *sc = r->sc;
+	char name[16];
+	u_int i;
 
-	gen = r->recovery_request;
-	blamed = r->recovery_blamed;
-	host = *agx_recovery_word(sc, AGX_HOST_RECOVERY);
-	device_printf(sc->dev, "recovery gen %ju blamed %d: state %u host %u "
-	    "slot mask %#x, renders in flight %u\n", (uintmax_t)gen, blamed,
-	    *agx_recovery_word(sc, AGX_RECOVERY_STATE), host,
-	    *agx_recovery_word(sc, AGX_RECOVERY_SLOT_MASK), r->in_flight);
-	if (r->installed) {
-		agx_recovery_cursors(sc, "TA", (volatile uint32_t *)(r->graph +
-		    AGX_RENDER_TA_CURSORS), r->items_end[0]);
-		agx_recovery_cursors(sc, "3D", (volatile uint32_t *)(r->graph +
-		    AGX_RENDER_FRAGMENT_CURSORS), r->items_end[1]);
-	}
+	snprintf(name, sizeof(name), "pair %u TA", r->index);
+	agx_recovery_cursors(sc, name, (volatile uint32_t *)(r->graph +
+	    AGX_RENDER_TA_CURSORS), r->items_end[0]);
+	snprintf(name, sizeof(name), "pair %u 3D", r->index);
+	agx_recovery_cursors(sc, name, (volatile uint32_t *)(r->graph +
+	    AGX_RENDER_FRAGMENT_CURSORS), r->items_end[1]);
 	for (i = 0; i < r->in_flight; i++) {
 		struct agx_render_slot *s =
 		    &r->slots[(r->oldest + i) % AGX_RENDER_SLOTS];
 
-		device_printf(sc->dev, "recovery: in flight %u: render %u "
-		    "context %u %ux%u stamp %#x, %jd ms old\n", i, s->ordinal,
-		    s->context, s->width, s->height, s->stamp,
+		device_printf(sc->dev, "recovery: pair %u in flight %u: render "
+		    "%u context %u %ux%u stamp %#x, %jd ms old\n", r->index, i,
+		    s->ordinal, s->context, s->width, s->height, s->stamp,
 		    (intmax_t)((sbinuptime() - (s->deadline -
 		    AGX_RENDER_TIMEOUT)) / SBT_1MS));
 	}
+}
+
+/*
+ * After a restart: renders a guilty record names by stamp fail; without a
+ * match, the oldest render of the pair holding the blamed QID does. The
+ * rest replay. ECANCELED tells the caller the GPU recovered: only that
+ * render's client is lost. Returns the renders failed.
+ */
+static u_int
+agx_recovery_pair_settle(struct agx_render *r, const uint32_t *guilty,
+    const uint8_t *guilty_qid, u_int nguilty, int blamed, bool fallback)
+{
+	struct apple_agx_softc *sc = r->sc;
+	struct agx_render_slot *s;
+	u_int i, j, nfailed = 0;
+
+	for (i = 0; i < r->in_flight; i++) {
+		s = &r->slots[(r->oldest + i) % AGX_RENDER_SLOTS];
+		for (j = 0; j < nguilty; j++)
+			if (guilty[j] == s->stamp &&
+			    (guilty_qid[j] == r->in->qids[0] ||
+			    guilty_qid[j] == r->in->qids[1])) {
+				s->error = ECANCELED;
+				nfailed++;
+				device_printf(sc->dev, "recovery: failing pair %u "
+				    "render %u (context %u)\n", r->index,
+				    s->ordinal, s->context);
+				agx_recovery_dump(sc, "failed", s);
+				agx_recovery_dump(sc, "good", &r->last_good);
+				break;
+			}
+		s->deadline = sbinuptime() + AGX_RENDER_TIMEOUT;
+	}
+	if (fallback && nfailed == 0 && blamed >= 0 &&
+	    (blamed == r->in->qids[0] || blamed == r->in->qids[1]) &&
+	    r->in_flight != 0) {
+		s = &r->slots[r->oldest];
+		s->error = ECANCELED;
+		nfailed++;
+		device_printf(sc->dev, "recovery: no stamp matched; failing pair "
+		    "%u's oldest render %u (context %u)\n", r->index, s->ordinal,
+		    s->context);
+	}
+	return (nfailed);
+}
+
+static void
+agx_recovery_task(void *arg, int pending)
+{
+	struct apple_agx_softc *sc = arg;
+	struct agx_render *r;
+	struct agx_render_done done[AGX_RENDER_SLOTS];
+	volatile uint32_t *info;
+	uint64_t gen;
+	uint32_t flags, host, guilty[4];
+	uint8_t guilty_qid[4];
+	u_int i, k, listed = 0, n, nguilty = 0, nfailed = 0;
+	int blamed, error;
+
+	gen = sc->recovery_request;
+	blamed = sc->recovery_blamed;
+	host = *agx_recovery_word(sc, AGX_HOST_RECOVERY);
+	device_printf(sc->dev, "recovery gen %ju blamed %d: state %u host %u "
+	    "slot mask %#x\n", (uintmax_t)gen, blamed,
+	    *agx_recovery_word(sc, AGX_RECOVERY_STATE), host,
+	    *agx_recovery_word(sc, AGX_RECOVERY_SLOT_MASK));
+	for (k = 0; k < AGX_RENDER_PAIRS; k++)
+		if (sc->renders[k].installed)
+			agx_recovery_pair_log(&sc->renders[k]);
 	for (i = 0; i < nitems(sc->queues); i++)
 		if (sc->queues[i].graph != NULL && sc->queues[i].qid != 0)
 			agx_recovery_cursors(sc, "compute",
@@ -3469,8 +3629,10 @@ agx_recovery_task(void *arg, int pending)
 			flags = info[i * 2];
 			if ((flags & 1) == 0)
 				continue;
-			if ((flags & 2) != 0 && nguilty < nitems(guilty))
+			if ((flags & 2) != 0 && nguilty < nitems(guilty)) {
+				guilty_qid[nguilty] = (flags >> 4) & 0x7f;
 				guilty[nguilty++] = info[i * 2 + 1];
+			}
 			if (listed++ < 8)
 				device_printf(sc->dev, "recovery: record %u qid "
 				    "%u%s%s stamp %#x\n", i, (flags >> 4) & 0x7f,
@@ -3483,53 +3645,38 @@ agx_recovery_task(void *arg, int pending)
 		error = EIO;
 
 	mtx_lock(&sc->mtx);
-	r->recovering = false;
+	sc->recovering = false;
 	if (error != 0) {
 		device_printf(sc->dev, "recovery gen %ju failed: %d (state %u)\n",
 		    (uintmax_t)gen, error,
 		    *agx_recovery_word(sc, AGX_RECOVERY_STATE));
-		r->failed = true;
+		for (k = 0; k < AGX_RENDER_PAIRS; k++)
+			sc->renders[k].failed = true;
 	} else {
-		r->recovery_accepted = gen + 1;
-		r->recoveries++;
-		/*
-		 * Renders a guilty record names by stamp fail; without a match
-		 * the pair's oldest is the blamed one. The rest replay.
-		 * ECANCELED tells the caller the GPU recovered: only that
-		 * render's client is lost.
-		 */
-		for (i = 0; i < r->in_flight; i++) {
-			struct agx_render_slot *s =
-			    &r->slots[(r->oldest + i) % AGX_RENDER_SLOTS];
-
-			for (j = 0; j < nguilty; j++)
-				if (guilty[j] == s->stamp) {
-					s->error = ECANCELED;
-					nfailed++;
-					device_printf(sc->dev, "recovery: failing "
-					    "render %u (context %u)\n", s->ordinal,
-					    s->context);
-					agx_recovery_dump(sc, "failed", s);
-					agx_recovery_dump(sc, "good", &r->last_good);
-					break;
-				}
-			s->deadline = sbinuptime() + AGX_RENDER_TIMEOUT;
-		}
-		if (nfailed == 0 && (blamed == 0 || blamed == 1) &&
-		    r->in_flight != 0) {
-			r->slots[r->oldest].error = ECANCELED;
-			nfailed++;
-			device_printf(sc->dev, "recovery: no stamp matched; "
-			    "failing the oldest render %u (context %u)\n",
-			    r->slots[r->oldest].ordinal,
-			    r->slots[r->oldest].context);
-		}
+		sc->recovery_accepted = gen + 1;
+		sc->recoveries++;
+		/* Stamps are per pair: match them all before any fallback. */
+		for (k = 0; k < AGX_RENDER_PAIRS; k++)
+			if (sc->renders[k].installed)
+				nfailed += agx_recovery_pair_settle(&sc->renders[k],
+				    guilty, guilty_qid, nguilty, blamed, false);
+		for (k = 0; nfailed == 0 && k < AGX_RENDER_PAIRS; k++)
+			if (sc->renders[k].installed)
+				nfailed += agx_recovery_pair_settle(&sc->renders[k],
+				    NULL, NULL, 0, blamed, true);
 		device_printf(sc->dev, "recovery gen %ju done (%u records, %u "
 		    "renders failed)\n", (uintmax_t)gen, listed, nfailed);
 	}
-	n = agx_render_reap(sc, done);
 	mtx_unlock(&sc->mtx);
-	agx_render_complete(done, n);
+	for (k = 0; k < AGX_RENDER_PAIRS; k++) {
+		r = &sc->renders[k];
+		if (!r->installed)
+			continue;
+		mtx_lock(&sc->mtx);
+		n = agx_render_reap(r, done);
+		mtx_unlock(&sc->mtx);
+		agx_render_complete(done, n);
+	}
 }
 
 /*
@@ -3585,22 +3732,33 @@ agx_drain_events(struct agx_role *r)
 		 */
 		if (rec[0] == AGX_EVENT_RESTART) {
 			uint64_t gen = rec[1] | (uint64_t)rec[2] << 32;
-			struct agx_render *rr = &sc->render;
 
-			if (rr->installed && gen >= rr->recovery_accepted &&
-			    !rr->recovering) {
-				rr->recovering = true;
-				rr->recovery_request = gen;
-				rr->recovery_blamed = (int32_t)rec[3];
+			if (sc->renders[0].installed &&
+			    gen >= sc->recovery_accepted && !sc->recovering) {
+				sc->recovering = true;
+				sc->recovery_request = gen;
+				sc->recovery_blamed = (int32_t)rec[3];
 				taskqueue_enqueue(taskqueue_thread,
-				    &rr->recovery_task);
+				    &sc->recovery_task);
 			}
 		}
-		if (idx == 0 && rec[0] == AGX_EVENT_STAMP && (rec[1] & 3) != 0) {
-			sc->render.stamp_events++;
-			if (sc->render.in_flight != 0)
+		/* A stamp event's mask names ready QIDs; each pair has two. */
+		for (u_int k = 0; idx == 0 && rec[0] == AGX_EVENT_STAMP &&
+		    k < AGX_RENDER_PAIRS; k++) {
+			struct agx_render *rr = &sc->renders[k];
+			u_int q0, q1;
+
+			if (!rr->installed)
+				continue;
+			q0 = rr->in->qids[0];
+			q1 = rr->in->qids[1];
+			if ((rec[1 + q0 / 32] & (1u << (q0 % 32))) == 0 &&
+			    (rec[1 + q1 / 32] & (1u << (q1 % 32))) == 0)
+				continue;
+			rr->stamp_events++;
+			if (rr->in_flight != 0)
 				taskqueue_enqueue(taskqueue_thread,
-				    &sc->render.reap_task);
+				    &rr->reap_task);
 		}
 		if (idx == 0 && rec[0] == AGX_EVENT_STAMP) {
 			for (u_int i = 0; i < nitems(sc->queues); i++) {
@@ -3715,10 +3873,12 @@ agx_sysctl_mesh_probe(SYSCTL_HANDLER_ARGS)
 	error = sysctl_handle_int(oidp, &op, 0, req);
 	if (error != 0 || req->newptr == NULL)
 		return (error);
-	if (sc->render.mesh_storage == NULL)
+	/* The last task client's storage: submit records it in pair 0. */
+	if (sc->renders[0].mesh_storage == NULL)
 		return (ENXIO);
 	if (op == 1) {
-		memset(sc->render.mesh_storage, 0, AGX_RENDER_MESH_STORAGE_SIZE);
+		memset(sc->renders[0].mesh_storage, 0,
+		    AGX_RENDER_MESH_STORAGE_SIZE);
 		return (0);
 	}
 	if (op != 2)
@@ -3730,7 +3890,7 @@ agx_sysctl_mesh_probe(SYSCTL_HANDLER_ARGS)
 		    (((uint32_t)k << (23 - e)) & 0x7fffff);
 		first[k] = last[k] = count[k] = 0;
 	}
-	w = (const uint32_t *)sc->render.mesh_storage;
+	w = (const uint32_t *)sc->renders[0].mesh_storage;
 	n = AGX_RENDER_MESH_STORAGE_SIZE / 4;
 	for (i = 0; i < n; i++) {
 		if (w[i] == 0)
@@ -3781,20 +3941,36 @@ agx_sysctls(struct apple_agx_softc *sc)
 	SYSCTL_ADD_PROC(ctx, t, OID_AUTO, "mesh_probe",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
 	    agx_sysctl_mesh_probe, "I", "Task mesh storage probe (1 clear, 2 scan)");
-	sc->render.mesh_chunks = AGX_RENDER_MESH_STORAGE_CHUNKS;
+	/* Every pair's kicks read pair 0's. */
+	sc->renders[0].mesh_chunks = AGX_RENDER_MESH_STORAGE_CHUNKS;
 	SYSCTL_ADD_UINT(ctx, t, OID_AUTO, "mesh_chunks", CTLFLAG_RW,
-	    &sc->render.mesh_chunks, 0, "Task mesh storage register chunk count");
+	    &sc->renders[0].mesh_chunks, 0,
+	    "Task mesh storage register chunk count");
 	SYSCTL_ADD_PROC(ctx, t, OID_AUTO, "control",
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    agx_sysctl_control, "A", "Control ring consumer, unk_10, producer");
 	SYSCTL_ADD_UINT(ctx, t, OID_AUTO, "compute_peak_in_flight", CTLFLAG_RD,
 	    &sc->compute_peak_in_flight, 0, "Peak compute kicks awaiting retirement");
-	SYSCTL_ADD_UINT(ctx, t, OID_AUTO, "render_peak_in_flight", CTLFLAG_RD,
-	    &sc->render.peak_in_flight, 0, "Peak renders awaiting retirement");
-	SYSCTL_ADD_UINT(ctx, t, OID_AUTO, "renders", CTLFLAG_RD,
-	    &sc->render.ordinal, 0, "Renders published");
-	SYSCTL_ADD_UINT(ctx, t, OID_AUTO, "renders_retired", CTLFLAG_RD,
-	    &sc->render.retired, 0, "Renders retired");
+	SYSCTL_ADD_UINT(ctx, t, OID_AUTO, "recoveries", CTLFLAG_RD,
+	    &sc->recoveries, 0, "Firmware restarts serviced");
+	for (i = 0; i < AGX_RENDER_PAIRS; i++) {
+		struct agx_render *rp = &sc->renders[i];
+		struct sysctl_oid *node;
+		char name[8];
+
+		snprintf(name, sizeof(name), "pair%d", i);
+		node = SYSCTL_ADD_NODE(ctx, t, OID_AUTO, name,
+		    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "Render pair");
+		SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(node), OID_AUTO,
+		    "peak_in_flight", CTLFLAG_RD, &rp->peak_in_flight, 0,
+		    "Peak renders awaiting retirement");
+		SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(node), OID_AUTO, "renders",
+		    CTLFLAG_RD, &rp->ordinal, 0, "Renders published");
+		SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(node), OID_AUTO, "retired",
+		    CTLFLAG_RD, &rp->retired, 0, "Renders retired");
+		SYSCTL_ADD_BOOL(ctx, SYSCTL_CHILDREN(node), OID_AUTO, "installed",
+		    CTLFLAG_RD, &rp->installed, 0, "Pair installed");
+	}
 	for (i = 0; i < 2; i++) {
 		struct agx_role *r = &sc->roles[i];
 
