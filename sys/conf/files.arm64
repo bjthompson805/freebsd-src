@@ -563,6 +563,7 @@ arm64/apple/apple_agx_uat.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_agx_fw.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_agx_render.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_aic.c				optional soc_apple_t8103 fdt
+arm64/apple/apple_cpufreq.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_dart.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_ans.c				optional soc_apple_t8103 fdt nvme
 arm64/apple/apple_mtp.c				optional soc_apple_t8103 fdt hidbus
