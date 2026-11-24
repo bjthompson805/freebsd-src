@@ -88,6 +88,7 @@ static const char *modes[] = {
 
 #define ACPIAC		"hw.acpi.acline"
 #define PMUAC		"dev.pmu.0.acline"
+#define SMCAC		"dev.apple_smc.0.acline"
 #define APMDEV		"/dev/apm"
 #define DEVDPIPE	"/var/run/devd.pipe"
 #define DEVCTL_MAXBUF	1024
@@ -153,6 +154,7 @@ typedef enum {
 } acline_mode_t;
 static acline_mode_t acline_mode;
 static acline_mode_t acline_mode_user = ac_none;
+static bool	acline_poll_only;	/* source has no ACPI AC events */
 #ifdef USE_APM
 static int	apm_fd = -1;
 #endif
@@ -428,6 +430,14 @@ acline_init(void)
 		if (vflag)
 			warnx("using sysctl for AC line status");
 #endif
+#ifdef __aarch64__
+	} else if ((skip_source_check || acline_mode_user == ac_sysctl) &&
+		   sysctlnametomib(SMCAC, acline_mib, &acline_mib_len) == 0) {
+		acline_mode = ac_sysctl;
+		acline_poll_only = true;
+		if (vflag)
+			warnx("using the Apple SMC for AC line status");
+#endif
 #ifdef USE_APM
 	} else if ((skip_source_check || acline_mode_user == ac_apm) &&
 		   (apm_fd = open(APMDEV, O_RDONLY)) >= 0) {
@@ -528,7 +538,12 @@ acline_read(int rfds)
 		}
 	}
 #endif
-	/* try to (re)connect to devd */
+	/*
+	 * try to (re)connect to devd; not for a source without ACPI AC
+	 * events (the Apple SMC), which has to be polled
+	 */
+	if (acline_poll_only)
+		return;
 #ifdef USE_APM
 	if ((acline_mode == ac_sysctl &&
 	    (acline_mode_user == ac_none ||

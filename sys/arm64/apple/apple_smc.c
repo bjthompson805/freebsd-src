@@ -134,20 +134,29 @@ apple_smc_start(struct apple_smc_softc *sc)
 int
 apple_smc_write_u32(uint32_t key, uint32_t value)
 {
+
+	return (apple_smc_write(key, &value, sizeof(value)));
+}
+
+int
+apple_smc_write(uint32_t key, const void *buf, size_t size)
+{
 	struct apple_smc_softc *sc = apple_smc_sc;
 	int error = 0;
 
 	if (sc == NULL)
 		return (ENXIO);
+	if (size == 0 || size > 255)
+		return (EINVAL);
 	sx_xlock(&sc->lock);
 	if (sc->shmem == NULL)
 		error = apple_smc_start(sc);
 	if (error == 0) {
-		memcpy(sc->shmem, &value, sizeof(value));
+		memcpy(sc->shmem, buf, size);
 		sc->wait_id = sc->msgid++ & 0xf;
 		sc->pending = true;
 		error = apple_rtkit_send(sc->rtk, SMC_ENDPOINT, SMC_WRITE_KEY |
-		    SMC_MSG_ID(sc->wait_id) | (uint64_t)sizeof(value) << 16 |
+		    SMC_MSG_ID(sc->wait_id) | (uint64_t)size << 16 |
 		    (uint64_t)key << 32);
 	}
 	if (error == 0)
@@ -159,6 +168,60 @@ apple_smc_write_u32(uint32_t key, uint32_t value)
 	}
 	sx_xunlock(&sc->lock);
 	return (error);
+}
+
+/*
+ * Reads up to size bytes of key into buf; returns the key's size in *lenp.
+ * Up to 4 bytes come back in the reply itself, more through the shared
+ * buffer (as aurora's macsmc does).
+ */
+int
+apple_smc_read(uint32_t key, void *buf, size_t size, size_t *lenp)
+{
+	struct apple_smc_softc *sc = apple_smc_sc;
+	uint32_t data;
+	size_t len;
+	int error = 0;
+
+	if (sc == NULL)
+		return (ENXIO);
+	if (size == 0 || size > 255)
+		return (EINVAL);
+	sx_xlock(&sc->lock);
+	if (sc->shmem == NULL)
+		error = apple_smc_start(sc);
+	if (error == 0) {
+		sc->wait_id = sc->msgid++ & 0xf;
+		sc->pending = true;
+		error = apple_rtkit_send(sc->rtk, SMC_ENDPOINT, SMC_READ_KEY |
+		    SMC_MSG_ID(sc->wait_id) | (uint64_t)size << 16 |
+		    (uint64_t)key << 32);
+	}
+	if (error == 0)
+		error = apple_smc_wait(sc, &sc->pending, NULL);
+	if (error == 0 && SMC_RESULT(sc->reply) != 0)
+		error = EIO;	/* typically: no such key */
+	if (error == 0) {
+		len = (sc->reply >> 16) & 0xff;
+		if (len > size)
+			error = EIO;
+		else if (size <= 4) {
+			data = sc->reply >> 32;
+			memcpy(buf, &data, len);
+		} else
+			memcpy(buf, sc->shmem, len);
+		if (error == 0 && lenp != NULL)
+			*lenp = len;
+	}
+	sx_xunlock(&sc->lock);
+	return (error);
+}
+
+static void
+apple_smc_battery_hook(void *arg)
+{
+
+	apple_smc_battery_attach(arg);
 }
 
 static int
@@ -185,6 +248,8 @@ apple_smc_attach(device_t dev)
 	for (child = OF_child(node); child > 0; child = OF_peer(child))
 		simplebus_add_device(dev, child, 0, NULL, -1, NULL);
 	bus_attach_children(dev);
+	/* The battery sysctls start the SMC session: not this early. */
+	config_intrhook_oneshot(apple_smc_battery_hook, dev);
 	return (0);
 }
 
