@@ -5,18 +5,19 @@
  * glue between the AOP audio service (apple_aop_audio), the base-ns ADMAC
  * (apple_admac) and the CS42L84 headphone codec (cs42l84). Follows the
  * "Headphone Jack" link of aurora's sound/soc/apple/macaudio.c and the
- * front-end of t8152_aop_audio.rs: 48 kHz stereo, 24-bit samples in 32-bit
- * words (ALSA S24_LE), DSP_A with an inverted bit clock, 64 bit clocks per
- * frame, the codec the clock consumer.
+ * front-end of t8152_aop_audio.rs: 48 kHz, 24-bit samples in 32-bit words
+ * (ALSA S24_LE), DSP_A with an inverted bit clock, 64 bit clocks per frame,
+ * the codec the clock consumer. Playback is "cout" (stereo), capture "cin"
+ * (the headset microphone, mono).
  *
  * Stage 1: the jack only. The speakers stay off (their amplifiers' shutdown
  * line is never raised here) until speaker protection exists.
  *
  * sound(4) calls trigger and the mixer with locks held, but the firmware and
  * the codec sleep, so power changes and volume run on a taskqueue. The DMA
- * buffer is the device's own: each period the PCM buffer's S32 samples are
- * converted into it (shifted down to 24 bits), a period ahead of the
- * hardware, so the PCM pointer runs two periods ahead of what is heard.
+ * buffers are the device's own; each period is converted between them and
+ * the PCM buffers (S32 <-> 24 bits in 32), playback a period ahead of the
+ * hardware, capture as each period completes.
  */
 
 #include <sys/param.h>
@@ -44,9 +45,7 @@
 #include <arm64/apple/cs42l84.h>
 
 #define	MA_RATE		48000
-#define	MA_CHANNELS	2
 #define	MA_WORD		4
-#define	MA_FRAME	(MA_CHANNELS * MA_WORD)
 #define	MA_BCLK_RATIO	64			/* macaudio primary front-end */
 #define	MA_SLOT_WIDTH	32
 #define	MA_BUFSZ	(64 * 1024)
@@ -57,6 +56,12 @@ struct ma_softc;
 
 struct ma_chan {
 	struct ma_softc		*sc;
+	int			dir;		/* PCMDIR_PLAY or PCMDIR_REC */
+	const char		*stream;	/* "cout" or "cin" */
+	int			codec_dir;	/* CS42L84_DIR_* */
+	u_int			channels;
+	uint32_t		fmt[2];
+	struct pcmchan_caps	caps;
 	struct pcm_channel	*pcm;
 	struct snd_dbuf		*buf;
 	struct apple_admac_chan	*dma;
@@ -64,8 +69,12 @@ struct ma_chan {
 	bus_addr_t		dmaiova;
 	uint32_t		blksz;
 	uint32_t		nblk;
+	/* Taskqueue only: */
+	struct apple_aop_audio_stream *aop;
+	bool			powered;	/* stream pwrd, codec on, DMA on */
 	/* Under sc->mtx: */
-	bool			running;	/* PCM data flows into dmabuf */
+	bool			want;
+	bool			running;	/* data flows to or from the PCM */
 	uint32_t		done;		/* periods the DMA finished */
 };
 
@@ -76,14 +85,13 @@ struct ma_softc {
 	struct intr_config_hook	hook;
 	device_t		aop_audio;
 	device_t		codec;
-	struct apple_aop_audio_stream *cout;
-	bool			powered;	/* cout pwrd, codec on, DMA running */
-	bool			want_play;
+	bool			codec_fmt;	/* format and clock set */
 	u_int			vol_l, vol_r;
 	struct taskqueue	*tq;
 	struct task		power_task;
 	struct task		vol_task;
 	struct ma_chan		play;
+	struct ma_chan		rec;
 };
 
 static struct ofw_compat_data compat_data[] = {
@@ -91,24 +99,17 @@ static struct ofw_compat_data compat_data[] = {
 	{ NULL,			0 }
 };
 
-static uint32_t ma_fmt[] = {
-	SND_FORMAT(AFMT_S32_LE, MA_CHANNELS, 0),
-	0
-};
-static struct pcmchan_caps ma_caps = { MA_RATE, MA_RATE, ma_fmt, 0 };
-
 /* ---- data path ---- */
 
-/* Converts period blk of the PCM buffer into the device buffer. */
+/* Playback: PCM period blk (S32) into the device buffer, or silence. */
 static void
-ma_copy_period(struct ma_chan *ch, uint32_t blk)
+ma_play_period(struct ma_chan *ch, uint32_t blk)
 {
 	const int32_t *src;
 	uint32_t *dst;
 	u_int i, n;
 
-	src = (const int32_t *)(ch->buf->buf +
-	    blk * ch->blksz);
+	src = (const int32_t *)(ch->buf->buf + blk * ch->blksz);
 	dst = (uint32_t *)((uint8_t *)ch->dmabuf + blk * ch->blksz);
 	n = ch->blksz / MA_WORD;
 	if (!ch->running) {
@@ -117,6 +118,21 @@ ma_copy_period(struct ma_chan *ch, uint32_t blk)
 	}
 	for (i = 0; i < n; i++)
 		dst[i] = (uint32_t)(src[i] >> 8);
+}
+
+/* Capture: device period blk (24 bits in 32) into the PCM buffer as S32. */
+static void
+ma_rec_period(struct ma_chan *ch, uint32_t blk)
+{
+	const uint32_t *src;
+	int32_t *dst;
+	u_int i, n;
+
+	src = (const uint32_t *)((uint8_t *)ch->dmabuf + blk * ch->blksz);
+	dst = (int32_t *)(ch->buf->buf + blk * ch->blksz);
+	n = ch->blksz / MA_WORD;
+	for (i = 0; i < n; i++)
+		dst[i] = (int32_t)(src[i] << 8);
 }
 
 /* ADMAC period callback (its interrupt thread; may not sleep). */
@@ -128,9 +144,16 @@ ma_period(void *arg)
 	bool running;
 
 	mtx_lock(&sc->mtx);
-	ch->done++;
-	/* The hardware plays period done; fill the one after it. */
-	ma_copy_period(ch, (ch->done + 1) % ch->nblk);
+	if (ch->dir == PCMDIR_PLAY) {
+		/* The hardware plays period done + 1; fill the one after. */
+		ch->done++;
+		ma_play_period(ch, (ch->done + 1) % ch->nblk);
+	} else {
+		/* Period done is complete. */
+		if (ch->running)
+			ma_rec_period(ch, ch->done % ch->nblk);
+		ch->done++;
+	}
 	running = ch->running;
 	mtx_unlock(&sc->mtx);
 	if (running)
@@ -140,85 +163,108 @@ ma_period(void *arg)
 /* ---- power (taskqueue) ---- */
 
 static int
-ma_power_up(struct ma_softc *sc)
+ma_codec_setup(struct ma_softc *sc)
 {
-	struct ma_chan *ch = &sc->play;
+	int error;
+
+	if (sc->codec_fmt)
+		return (0);
+	if ((error = cs42l84_set_fmt(sc->codec, CS42L84_FMT_DSP_A)) != 0 ||
+	    (error = cs42l84_set_sysclk(sc->codec,
+	    MA_RATE * MA_BCLK_RATIO)) != 0)
+		return (error);
+	sc->codec_fmt = true;
+	return (0);
+}
+
+static int
+ma_power_up(struct ma_softc *sc, struct ma_chan *ch)
+{
 	uint32_t i;
 	int error;
 
-	if ((error = apple_aop_audio_stream_open(sc->aop_audio, "cout",
-	    &sc->cout)) != 0) {
-		device_printf(sc->dev, "cout open: %d\n", error);
+	if ((error = apple_aop_audio_stream_open(sc->aop_audio, ch->stream,
+	    &ch->aop)) != 0) {
+		device_printf(sc->dev, "%s open: %d\n", ch->stream, error);
 		return (error);
 	}
-	if ((error = apple_admac_config(ch->dma, MA_WORD, MA_CHANNELS)) != 0 ||
-	    (error = cs42l84_set_fmt(sc->codec, CS42L84_FMT_DSP_A)) != 0 ||
-	    (error = cs42l84_set_sysclk(sc->codec,
-	    MA_RATE * MA_BCLK_RATIO)) != 0 ||
-	    (error = cs42l84_hw_params(sc->codec, CS42L84_DIR_PLAYBACK, MA_RATE,
-	    24, MA_SLOT_WIDTH)) != 0) {
-		device_printf(sc->dev, "stream setup: %d\n", error);
+	if ((error = apple_admac_config(ch->dma, MA_WORD, ch->channels)) != 0 ||
+	    (error = ma_codec_setup(sc)) != 0 ||
+	    (error = cs42l84_hw_params(sc->codec, ch->codec_dir, MA_RATE, 24,
+	    MA_SLOT_WIDTH)) != 0) {
+		device_printf(sc->dev, "%s setup: %d\n", ch->stream, error);
 		goto close;
 	}
-	/* Prefill: two periods of PCM data, the rest silence. */
 	mtx_lock(&sc->mtx);
 	ch->done = 0;
 	memset(ch->dmabuf, 0, ch->blksz * ch->nblk);
-	for (i = 0; i < 2; i++)
-		ma_copy_period(ch, i);
+	/* Playback prefill: two periods of PCM data, the rest silence. */
+	if (ch->dir == PCMDIR_PLAY)
+		for (i = 0; i < 2; i++)
+			ma_play_period(ch, i);
 	mtx_unlock(&sc->mtx);
 	/* The firmware starts the serializer and its clocks, then the codec. */
-	if ((error = apple_aop_audio_stream_power(sc->cout, true)) != 0) {
-		device_printf(sc->dev, "cout pwrd: %d\n", error);
+	if ((error = apple_aop_audio_stream_power(ch->aop, true)) != 0) {
+		device_printf(sc->dev, "%s pwrd: %d\n", ch->stream, error);
 		goto close;
 	}
 	if ((error = apple_admac_start_cyclic(ch->dma, ch->dmaiova,
 	    ch->blksz * ch->nblk, ch->blksz, ma_period, ch)) != 0) {
-		device_printf(sc->dev, "DMA start: %d\n", error);
+		device_printf(sc->dev, "%s DMA start: %d\n", ch->stream, error);
 		goto unpower;
 	}
-	if ((error = cs42l84_set_power(sc->codec, CS42L84_DIR_PLAYBACK,
-	    true)) != 0) {
-		device_printf(sc->dev, "codec power: %d\n", error);
+	if ((error = cs42l84_set_power(sc->codec, ch->codec_dir, true)) != 0) {
+		device_printf(sc->dev, "%s codec power: %d\n", ch->stream,
+		    error);
 		apple_admac_stop(ch->dma);
 		goto unpower;
 	}
-	sc->powered = true;
+	ch->powered = true;
 	return (0);
 unpower:
-	apple_aop_audio_stream_power(sc->cout, false);
+	apple_aop_audio_stream_power(ch->aop, false);
 close:
-	apple_aop_audio_stream_close(sc->cout);
-	sc->cout = NULL;
+	apple_aop_audio_stream_close(ch->aop);
+	ch->aop = NULL;
 	return (error);
 }
 
 static void
-ma_power_down(struct ma_softc *sc)
+ma_power_down(struct ma_softc *sc, struct ma_chan *ch)
 {
 
 	/* Codec first (muted), then the data, then the clocks. */
-	cs42l84_set_power(sc->codec, CS42L84_DIR_PLAYBACK, false);
-	apple_admac_stop(sc->play.dma);
-	apple_aop_audio_stream_power(sc->cout, false);
-	apple_aop_audio_stream_close(sc->cout);
-	sc->cout = NULL;
-	sc->powered = false;
+	cs42l84_set_power(sc->codec, ch->codec_dir, false);
+	apple_admac_stop(ch->dma);
+	apple_aop_audio_stream_power(ch->aop, false);
+	apple_aop_audio_stream_close(ch->aop);
+	ch->aop = NULL;
+	ch->powered = false;
+}
+
+static void
+ma_power_chan(struct ma_softc *sc, struct ma_chan *ch)
+{
+	bool want;
+
+	if (ch->dma == NULL)
+		return;
+	mtx_lock(&sc->mtx);
+	want = ch->want;
+	mtx_unlock(&sc->mtx);
+	if (want && !ch->powered)
+		ma_power_up(sc, ch);
+	else if (!want && ch->powered)
+		ma_power_down(sc, ch);
 }
 
 static void
 ma_power_task(void *arg, int pending)
 {
 	struct ma_softc *sc = arg;
-	bool want;
 
-	mtx_lock(&sc->mtx);
-	want = sc->want_play;
-	mtx_unlock(&sc->mtx);
-	if (want && !sc->powered)
-		ma_power_up(sc);
-	else if (!want && sc->powered)
-		ma_power_down(sc);
+	ma_power_chan(sc, &sc->play);
+	ma_power_chan(sc, &sc->rec);
 }
 
 static void
@@ -241,17 +287,14 @@ ma_chan_init(kobj_t obj, void *devinfo, struct snd_dbuf *b,
     struct pcm_channel *c, int dir)
 {
 	struct ma_softc *sc = devinfo;
-	struct ma_chan *ch = &sc->play;
+	struct ma_chan *ch = dir == PCMDIR_PLAY ? &sc->play : &sc->rec;
 	void *buf;
 
-	if (dir != PCMDIR_PLAY)
-		return (NULL);
 	buf = malloc(MA_BUFSZ, M_DEVBUF, M_WAITOK | M_ZERO);
 	if (sndbuf_setup(b, buf, MA_BUFSZ) != 0) {
 		free(buf, M_DEVBUF);
 		return (NULL);
 	}
-	ch->sc = sc;
 	ch->pcm = c;
 	ch->buf = b;
 	ch->blksz = MA_BUFSZ / 8;
@@ -271,8 +314,9 @@ ma_chan_free(kobj_t obj, void *data)
 static int
 ma_chan_setformat(kobj_t obj, void *data, uint32_t format)
 {
+	struct ma_chan *ch = data;
 
-	return (format == ma_fmt[0] ? 0 : EINVAL);
+	return (format == ch->fmt[0] ? 0 : EINVAL);
 }
 
 static uint32_t
@@ -287,12 +331,11 @@ ma_chan_setblocksize(kobj_t obj, void *data, uint32_t blksz)
 {
 	struct ma_chan *ch = data;
 
-	/* Whole frames, a power of two dividing the buffer, three or more. */
-	blksz = MAX(rounddown_pow_of_two(blksz), MA_BLK_MIN);
-	blksz = MIN(blksz, MA_BUFSZ / MA_NBLK_MIN);
-	blksz = rounddown_pow_of_two(blksz);
-	if (ch->sc->powered)
+	if (ch->powered)
 		return (ch->blksz);	/* fixed while the DMA runs */
+	/* A power of two dividing the buffer, three periods or more. */
+	blksz = MAX(rounddown_pow_of_two(blksz), MA_BLK_MIN);
+	blksz = rounddown_pow_of_two(MIN(blksz, MA_BUFSZ / MA_NBLK_MIN));
 	ch->blksz = blksz;
 	ch->nblk = MA_BUFSZ / blksz;
 	sndbuf_resize(ch->buf, ch->nblk, ch->blksz);
@@ -311,13 +354,13 @@ ma_chan_trigger(kobj_t obj, void *data, int go)
 	switch (go) {
 	case PCMTRIG_START:
 		ch->running = true;
-		sc->want_play = true;
+		ch->want = true;
 		break;
 	case PCMTRIG_STOP:
 	case PCMTRIG_ABORT:
-		/* Silence from the next period on; the task powers down. */
+		/* No more data from the next period on; the task powers down. */
 		ch->running = false;
-		sc->want_play = false;
+		ch->want = false;
 		break;
 	}
 	mtx_unlock(&sc->mtx);
@@ -332,8 +375,12 @@ ma_chan_getptr(kobj_t obj, void *data)
 	uint32_t ptr;
 
 	mtx_lock(&ch->sc->mtx);
-	/* Converted up to the end of period done + 1. */
-	ptr = ((ch->done + 2) % ch->nblk) * ch->blksz;
+	if (ch->dir == PCMDIR_PLAY)
+		/* Converted up to the end of period done + 1. */
+		ptr = ((ch->done + 2) % ch->nblk) * ch->blksz;
+	else
+		/* Captured up to the end of period done - 1. */
+		ptr = (ch->done % ch->nblk) * ch->blksz;
 	mtx_unlock(&ch->sc->mtx);
 	return (ptr);
 }
@@ -341,8 +388,9 @@ ma_chan_getptr(kobj_t obj, void *data)
 static struct pcmchan_caps *
 ma_chan_getcaps(kobj_t obj, void *data)
 {
+	struct ma_chan *ch = data;
 
-	return (&ma_caps);
+	return (&ch->caps);
 }
 
 static kobj_method_t ma_chan_methods[] = {
@@ -446,38 +494,64 @@ ma_find_jack(struct ma_softc *sc)
 	return (0);
 }
 
-static void
-ma_init(void *arg)
+/* A direction's DMA channel and buffer; false if it has none. */
+static bool
+ma_chan_setup(struct ma_softc *sc, struct ma_chan *ch, int dir)
 {
-	struct ma_softc *sc = arg;
-	struct ma_chan *ch = &sc->play;
 	phandle_t xref;
 	uint32_t cell;
 	void *kva;
 	int error;
 
+	ch->sc = sc;
+	ch->dir = dir;
+	ch->stream = dir == PCMDIR_PLAY ? "cout" : "cin";
+	ch->codec_dir = dir == PCMDIR_PLAY ? CS42L84_DIR_PLAYBACK :
+	    CS42L84_DIR_CAPTURE;
+	ch->channels = dir == PCMDIR_PLAY ? 2 : 1;
+	ch->fmt[0] = SND_FORMAT(AFMT_S32_LE, ch->channels, 0);
+	ch->fmt[1] = 0;
+	ch->caps = (struct pcmchan_caps){ MA_RATE, MA_RATE, ch->fmt, 0 };
+	if ((error = apple_aop_audio_dma(sc->aop_audio, ch->stream, &xref,
+	    &cell)) != 0 ||
+	    (error = apple_admac_get_channel(xref, cell, &ch->dma)) != 0) {
+		device_printf(sc->dev, "%s DMA channel: %d\n", ch->stream,
+		    error);
+		return (false);
+	}
+	if ((error = apple_admac_alloc_buffer(ch->dma, MA_BUFSZ, &kva,
+	    &ch->dmaiova)) != 0) {
+		device_printf(sc->dev, "%s DMA buffer: %d\n", ch->stream,
+		    error);
+		apple_admac_release(ch->dma);
+		ch->dma = NULL;
+		return (false);
+	}
+	ch->dmabuf = kva;
+	return (true);
+}
+
+static void
+ma_init(void *arg)
+{
+	struct ma_softc *sc = arg;
+	bool play, rec;
+
 	if (sc->hook.ich_func != NULL)
 		config_intrhook_disestablish(&sc->hook);
 	if (ma_find_jack(sc) != 0)
 		return;
-	if ((error = apple_aop_audio_dma(sc->aop_audio, "cout", &xref,
-	    &cell)) != 0 ||
-	    (error = apple_admac_get_channel(xref, cell, &ch->dma)) != 0) {
-		device_printf(sc->dev, "cout DMA channel: %d\n", error);
+	play = ma_chan_setup(sc, &sc->play, PCMDIR_PLAY);
+	rec = ma_chan_setup(sc, &sc->rec, PCMDIR_REC);
+	if (!play && !rec)
 		return;
-	}
-	if ((error = apple_admac_alloc_buffer(ch->dma, MA_BUFSZ, &kva,
-	    &ch->dmaiova)) != 0) {
-		device_printf(sc->dev, "DMA buffer: %d\n", error);
-		apple_admac_release(ch->dma);
-		ch->dma = NULL;
-		return;
-	}
-	ch->dmabuf = kva;
 	cs42l84_get_volume(sc->codec, &sc->vol_l, &sc->vol_r);
 
 	pcm_init(sc->dev, sc);
-	pcm_addchan(sc->dev, PCMDIR_PLAY, &ma_chan_class, sc);
+	if (play)
+		pcm_addchan(sc->dev, PCMDIR_PLAY, &ma_chan_class, sc);
+	if (rec)
+		pcm_addchan(sc->dev, PCMDIR_REC, &ma_chan_class, sc);
 	if (pcm_register(sc->dev, "at macaudio (headphone jack)") != 0) {
 		device_printf(sc->dev, "pcm_register failed\n");
 		return;
@@ -523,19 +597,22 @@ static int
 ma_detach(device_t dev)
 {
 	struct ma_softc *sc = device_get_softc(dev);
-	int error;
+	struct ma_chan *chans[] = { &sc->play, &sc->rec };
+	int error, i;
 
 	if ((error = pcm_unregister(dev)) != 0)
 		return (error);
 	mtx_lock(&sc->mtx);
-	sc->want_play = false;
+	sc->play.want = sc->rec.want = false;
 	mtx_unlock(&sc->mtx);
 	taskqueue_enqueue(sc->tq, &sc->power_task);
 	taskqueue_drain_all(sc->tq);
 	taskqueue_free(sc->tq);
-	if (sc->play.dma != NULL) {
-		apple_admac_free_buffer(sc->play.dma, sc->play.dmabuf);
-		apple_admac_release(sc->play.dma);
+	for (i = 0; i < nitems(chans); i++) {
+		if (chans[i]->dma == NULL)
+			continue;
+		apple_admac_free_buffer(chans[i]->dma, chans[i]->dmabuf);
+		apple_admac_release(chans[i]->dma);
 	}
 	mtx_destroy(&sc->mtx);
 	return (0);
