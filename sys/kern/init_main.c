@@ -764,6 +764,16 @@ start_init(void *dummy)
 			printf("m5: init bound to CPU %d\n", cpu);
 		}
 	}
+	{
+		/* kern.m5_init_delay=N: wait N s before mounting root/exec. */
+		int delay_s = 0;
+
+		TUNABLE_INT_FETCH("kern.m5_init_delay", &delay_s);
+		if (delay_s > 0) {
+			printf("m5: init waiting %d s\n", delay_s);
+			pause("m5idly", delay_s * hz);
+		}
+	}
 
 	vfs_mountroot();
 
