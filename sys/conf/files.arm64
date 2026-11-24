@@ -573,6 +573,7 @@ arm64/apple/apple_pmu_rtc.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_smc.c				optional soc_apple_t8103 fdt
 arm64/apple/apple_smc_battery.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_smc_reboot.c			optional soc_apple_t8103 fdt
+arm64/apple/apple_smc_temp.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_pmgr.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_pinctrl.c			optional soc_apple_t8103 fdt
 arm64/apple/apple_wdog.c			optional soc_apple_t8103 fdt

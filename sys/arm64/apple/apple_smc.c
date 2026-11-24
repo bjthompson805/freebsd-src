@@ -222,6 +222,7 @@ apple_smc_battery_hook(void *arg)
 {
 
 	apple_smc_battery_attach(arg);
+	apple_smc_temp_attach(arg);
 }
 
 static int
