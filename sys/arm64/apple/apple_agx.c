@@ -166,6 +166,10 @@ static SYSCTL_NODE(_hw, OID_AUTO, apple_agx, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
 static int agx_stage = 1;
 SYSCTL_INT(_hw_apple_agx, OID_AUTO, stage, CTLFLAG_RDTUN, &agx_stage, 0,
     "Bring-up stage to run at attach");
+/* Experiment: a render for another context waits for the GPU to drain. */
+static int agx_ctx_drain = 0;
+SYSCTL_INT(_hw_apple_agx, OID_AUTO, ctx_drain, CTLFLAG_RWTUN, &agx_ctx_drain,
+    0, "Drain the render pair between renders of different contexts");
 
 struct agx_fw_build {
 	const char	*name;
@@ -342,8 +346,15 @@ struct agx_render_slot {
 	bool		used;
 	uint32_t	ordinal;
 	uint32_t	stamp;		/* both stages' completion stamp */
+	u_int		context;
+	uint32_t	width, height;
+	/* Diagnostics: what the render was built from. */
+	struct agx_render_pass pass;
+	struct agx_render_program programs[4];
+	u_int		nprograms;
 	uint64_t	node_va;	/* the work-state node */
 	sbintime_t	deadline;
+	int		error;		/* failed by a firmware recovery */
 	void		(*done)(void *, int);
 	void		*arg;
 };
@@ -380,6 +391,14 @@ struct agx_render {
 	uint8_t		generation;
 	struct task	reap_task;
 	struct callout	watchdog;
+	/* g17/recovery.rs State: the firmware restart handshake. */
+	struct task	recovery_task;
+	bool		recovering;	/* a restart is being serviced */
+	uint64_t	recovery_accepted;	/* next generation */
+	uint64_t	recovery_request;
+	int		recovery_blamed;	/* QID, or -1 */
+	u_int		recoveries;
+	struct agx_render_slot last_good;	/* the last render retired */
 };
 
 struct apple_agx_softc;
@@ -2364,6 +2383,7 @@ agx_stage7(struct apple_agx_softc *sc)
 
 static void agx_render_reap_task(void *arg, int pending);
 static void agx_render_watchdog(void *arg);
+static void agx_recovery_task(void *arg, int pending);
 
 static int
 agx_render_objects(struct apple_agx_softc *sc)
@@ -2402,6 +2422,7 @@ agx_render_objects(struct apple_agx_softc *sc)
 			return (error);
 	}
 	TASK_INIT(&r->reap_task, 0, agx_render_reap_task, sc);
+	TASK_INIT(&r->recovery_task, 0, agx_recovery_task, sc);
 	callout_init_mtx(&r->watchdog, &sc->mtx, 0);
 	return (0);
 }
@@ -2776,10 +2797,12 @@ agx_render_reap(struct apple_agx_softc *sc, struct agx_render_done *out)
 	while (r->in_flight != 0) {
 		slot = &r->slots[r->oldest];
 		error = 0;
-		if (!r->failed && !agx_render_retired(sc, slot)) {
+		if (!r->failed && slot->error == 0 &&
+		    !agx_render_retired(sc, slot)) {
+			/* A restart being serviced holds every deadline. */
 			if (!apple_rtkit_crashed(sc->roles[0].rtk) &&
 			    !apple_rtkit_crashed(sc->roles[1].rtk) &&
-			    sbinuptime() < slot->deadline)
+			    (r->recovering || sbinuptime() < slot->deadline))
 				break;
 			device_printf(sc->dev, "render %u: not retired: stamps "
 			    "TA %#x 3D %#x (want %#x), %u in flight\n",
@@ -2790,10 +2813,13 @@ agx_render_reap(struct apple_agx_softc *sc, struct agx_render_done *out)
 		if (r->failed)
 			error = apple_rtkit_crashed(sc->roles[0].rtk) ? EIO :
 			    ETIMEDOUT;
+		else if (slot->error != 0)
+			error = slot->error;
 		else {
 			agx_qos_complete(sc, 1, 0, AGX_DM_FRAGMENT);
 			agx_qos_complete(sc, 0, 0, AGX_DM_TILING);
 			r->retired++;
+			r->last_good = *slot;
 		}
 		out[n++] = (struct agx_render_done){ slot->done, slot->arg,
 		    error };
@@ -2894,7 +2920,8 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 	 * GPU to drain: task tiling switching among three or more clients
 	 * hung the tiler with in-flight work behind it (J815, no reference).
 	 */
-	while (mesh_class == 2 && context != r->task_context && r->installed &&
+	while (((mesh_class == 2 && context != r->task_context) ||
+	    (agx_ctx_drain && context != r->context)) && r->installed &&
 	    !r->failed && r->in_flight != 0) {
 		n += agx_render_reap(sc, finished + n);
 		if (r->in_flight == 0)
@@ -2921,6 +2948,14 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 		slot->done = done;
 		slot->arg = arg;
 		slot->deadline = sbinuptime() + AGX_RENDER_TIMEOUT;
+		slot->error = 0;
+		slot->context = context;
+		slot->width = pass->width;
+		slot->height = pass->height;
+		slot->pass = p;
+		slot->nprograms = nprograms;
+		memcpy(slot->programs, programs, MIN(nprograms,
+		    nitems(slot->programs)) * sizeof(*programs));
 		if (++r->in_flight > r->peak_in_flight)
 			r->peak_in_flight = r->in_flight;
 		callout_reset_sbt(&r->watchdog, 10 * SBT_1MS, 0,
@@ -3199,6 +3234,276 @@ agx_report_mmu_fault(struct apple_agx_softc *sc)
 }
 
 /*
+ * recovery.rs service on the M5 firmware: the handshake words of the
+ * primary status B (fw/m5/initdata.rs M5_RECOVERY_*). Status B sits at
+ * 0x340 of the private cluster: its fwctl pointers (status B + 0x4ac0)
+ * are the graph words at 0x4e00.
+ */
+#define	AGX_STATUS_B		0x340
+#define	AGX_RECOVERY_INFO	(AGX_STATUS_B + 0x4298)
+#define	AGX_RECOVERY_SLOT_MASK	(AGX_STATUS_B + 0x4ab8)
+#define	AGX_RECOVERY_STATE	(AGX_STATUS_B + 0x4ae0)
+#define	AGX_HOST_RECOVERY	(AGX_STATUS_B + 0x4af0)
+#define	AGX_RECOVERY_RECORDS	256
+#define	AGX_RECOVERY_POLLS	10000	/* 1 ms ticks per phase */
+
+static volatile uint32_t *
+agx_recovery_word(struct apple_agx_softc *sc, size_t off)
+{
+
+	dsb(sy);
+	return ((volatile uint32_t *)(sc->graph_va[0] + off));
+}
+
+/* Firmware sends no notification for states 1 and 3; poll for them. */
+static int
+agx_recovery_wait(struct apple_agx_softc *sc, uint32_t want)
+{
+	uint32_t state;
+	int i;
+
+	for (i = 0; i < AGX_RECOVERY_POLLS; i++) {
+		if (apple_rtkit_crashed(sc->roles[0].rtk) ||
+		    apple_rtkit_crashed(sc->roles[1].rtk))
+			return (EIO);
+		state = *agx_recovery_word(sc, AGX_RECOVERY_STATE);
+		if (state == want)
+			return (0);
+		if (want == 1 && state != 0)
+			return (EIO);
+		pause_sbt("agxrcv", SBT_1MS, 0, 0);
+	}
+	return (ETIMEDOUT);
+}
+
+/* Aligned 32-bit store between full barriers, checking the old value. */
+static int
+agx_recovery_transition(struct apple_agx_softc *sc, uint32_t expected,
+    uint32_t next)
+{
+	volatile uint32_t *state = agx_recovery_word(sc, AGX_RECOVERY_STATE);
+
+	if (*state != expected)
+		return (EBUSY);
+	dsb(sy);
+	*state = next;
+	dsb(sy);
+	return (0);
+}
+
+/* A queue's pointer block: done, firmware cursor, the words at 0x40/0x50. */
+static void
+agx_recovery_cursors(struct apple_agx_softc *sc, const char *name,
+    volatile uint32_t *p, uint32_t host)
+{
+
+	device_printf(sc->dev, "recovery: %s done %#x +30 %#x +40 %#x "
+	    "+50 %#x entries %#x, host producer %#x\n", name, p[0],
+	    p[0x30 / 4], p[0x40 / 4], p[0x50 / 4], p[0x60 / 4], host);
+}
+
+/*
+ * The firmware's own log (the FW_LOG buffers): print its text runs, which
+ * may say why it restarted. The format is unknown; runs of at least 12
+ * printable bytes are shown, at most 40 per buffer, last ones first.
+ */
+static void
+agx_recovery_fw_log(struct apple_agx_softc *sc)
+{
+	static const char *names[2] = { "fw_log0", "fw_log1" };
+	char line[120];
+	const uint8_t *b;
+	size_t size, i, start, len;
+	u_int shown, k;
+	int o;
+
+	for (k = 0; k < 2; k++) {
+		if ((o = agx_graph_find(names[k])) < 0)
+			continue;
+		b = sc->graph_va[o];
+		size = agx_graph_objects[o].size;
+		dsb(sy);
+		shown = 0;
+		for (i = size; i > 0 && shown < 40; ) {
+			while (i > 0 && (b[i - 1] < 0x20 || b[i - 1] > 0x7e))
+				i--;
+			start = i;
+			while (start > 0 && b[start - 1] >= 0x20 &&
+			    b[start - 1] <= 0x7e)
+				start--;
+			len = i - start;
+			if (len >= 12) {
+				len = MIN(len, sizeof(line) - 1);
+				memcpy(line, b + start, len);
+				line[len] = '\0';
+				device_printf(sc->dev, "%s @%#zx: %s\n", names[k],
+				    start, line);
+				shown++;
+			}
+			i = start;
+		}
+	}
+}
+
+/* What a render was built from, to compare a failed one with a good one. */
+static void
+agx_recovery_dump(struct apple_agx_softc *sc, const char *what,
+    const struct agx_render_slot *s)
+{
+	const struct agx_render_pass *p = &s->pass;
+	const uint32_t *w = (const uint32_t *)p;
+	u_int i;
+
+	device_printf(sc->dev, "%s render %u context %u: %ux%u layers %u "
+	    "utile %ux%u samples %u empty %d msaa %#jx ppp %#jx zls %#jx "
+	    "samplers %u barriers %d writes %d bg %#x eot %#x, %u programs\n",
+	    what, s->ordinal, s->context, p->width, p->height, p->layers,
+	    p->utile_width, p->utile_height, 1u << p->samples_log2,
+	    p->process_empty_tiles, (uintmax_t)p->msaa_control,
+	    (uintmax_t)p->ppp_control, (uintmax_t)p->zls_control,
+	    p->sampler_count, p->fragment_barriers, p->shader_writes_memory,
+	    p->bg_offset, p->eot_offset, s->nprograms);
+	for (i = 0; i < MIN(s->nprograms, nitems(s->programs)); i++) {
+		const struct agx_render_program *g = &s->programs[i];
+
+		device_printf(sc->dev, "%s  program %u: stage %u primary %u "
+		    "secondary %u linked %u min %u aux %u tg %u ib %u ms %u "
+		    "threads %u%s\n", what, i, g->stage, g->primary_bytes,
+		    g->secondary_bytes, g->linked_bytes,
+		    g->minimum_primary_bytes, g->auxiliary_count,
+		    g->threadgroup_bytes, g->imageblock_bytes,
+		    g->multisample_bytes, g->threads, g->task ? " task" : "");
+	}
+	for (i = 0; i + 8 <= sizeof(*p) / 4; i += 8)
+		device_printf(sc->dev, "%s  +%03x: %08x %08x %08x %08x %08x "
+		    "%08x %08x %08x\n", what, i * 4, w[i], w[i + 1], w[i + 2],
+		    w[i + 3], w[i + 4], w[i + 5], w[i + 6], w[i + 7]);
+}
+
+/*
+ * Services one restart. The firmware halts and waits in state 1; the host
+ * acknowledges with 2, the firmware drains to 3 and resumes once the host
+ * writes 0. The render the firmware blames fails; the others stay in
+ * flight and are retired from their own stamps as the firmware replays.
+ */
+static void
+agx_recovery_task(void *arg, int pending)
+{
+	struct apple_agx_softc *sc = arg;
+	struct agx_render *r = &sc->render;
+	struct agx_render_done done[AGX_RENDER_SLOTS];
+	volatile uint32_t *info;
+	uint64_t gen;
+	uint32_t flags, host, guilty[4];
+	u_int i, j, listed = 0, n, nguilty = 0, nfailed = 0;
+	int blamed, error;
+
+	gen = r->recovery_request;
+	blamed = r->recovery_blamed;
+	host = *agx_recovery_word(sc, AGX_HOST_RECOVERY);
+	device_printf(sc->dev, "recovery gen %ju blamed %d: state %u host %u "
+	    "slot mask %#x, renders in flight %u\n", (uintmax_t)gen, blamed,
+	    *agx_recovery_word(sc, AGX_RECOVERY_STATE), host,
+	    *agx_recovery_word(sc, AGX_RECOVERY_SLOT_MASK), r->in_flight);
+	if (r->installed) {
+		agx_recovery_cursors(sc, "TA", (volatile uint32_t *)(r->graph +
+		    AGX_RENDER_TA_CURSORS), r->items_end[0]);
+		agx_recovery_cursors(sc, "3D", (volatile uint32_t *)(r->graph +
+		    AGX_RENDER_FRAGMENT_CURSORS), r->items_end[1]);
+	}
+	for (i = 0; i < r->in_flight; i++) {
+		struct agx_render_slot *s =
+		    &r->slots[(r->oldest + i) % AGX_RENDER_SLOTS];
+
+		device_printf(sc->dev, "recovery: in flight %u: render %u "
+		    "context %u %ux%u stamp %#x, %jd ms old\n", i, s->ordinal,
+		    s->context, s->width, s->height, s->stamp,
+		    (intmax_t)((sbinuptime() - (s->deadline -
+		    AGX_RENDER_TIMEOUT)) / SBT_1MS));
+	}
+	for (i = 0; i < nitems(sc->queues); i++)
+		if (sc->queues[i].graph != NULL && sc->queues[i].qid != 0)
+			agx_recovery_cursors(sc, "compute",
+			    (volatile uint32_t *)(sc->queues[i].graph +
+			    AGX_Q_CURSORS), sc->queues[i].items_end);
+
+	agx_recovery_fw_log(sc);
+	error = host != 0 ? EIO : agx_recovery_wait(sc, 1);
+	if (error == 0)
+		error = agx_recovery_transition(sc, 1, 2);
+	if (error == 0)
+		error = agx_recovery_wait(sc, 3);
+	if (error == 0) {
+		/* The M5 table need not be packed: walk all of it. */
+		info = agx_recovery_word(sc, AGX_RECOVERY_INFO);
+		for (i = 0; i < AGX_RECOVERY_RECORDS; i++) {
+			flags = info[i * 2];
+			if ((flags & 1) == 0)
+				continue;
+			if ((flags & 2) != 0 && nguilty < nitems(guilty))
+				guilty[nguilty++] = info[i * 2 + 1];
+			if (listed++ < 8)
+				device_printf(sc->dev, "recovery: record %u qid "
+				    "%u%s%s stamp %#x\n", i, (flags >> 4) & 0x7f,
+				    flags & 2 ? " guilty" : "",
+				    flags & 4 ? " cancelled" : "", info[i * 2 + 1]);
+		}
+		error = agx_recovery_transition(sc, 3, 0);
+	}
+	if (error == 0 && *agx_recovery_word(sc, AGX_RECOVERY_STATE) != 0)
+		error = EIO;
+
+	mtx_lock(&sc->mtx);
+	r->recovering = false;
+	if (error != 0) {
+		device_printf(sc->dev, "recovery gen %ju failed: %d (state %u)\n",
+		    (uintmax_t)gen, error,
+		    *agx_recovery_word(sc, AGX_RECOVERY_STATE));
+		r->failed = true;
+	} else {
+		r->recovery_accepted = gen + 1;
+		r->recoveries++;
+		/*
+		 * Renders a guilty record names by stamp fail; without a match
+		 * the pair's oldest is the blamed one. The rest replay.
+		 * ECANCELED tells the caller the GPU recovered: only that
+		 * render's client is lost.
+		 */
+		for (i = 0; i < r->in_flight; i++) {
+			struct agx_render_slot *s =
+			    &r->slots[(r->oldest + i) % AGX_RENDER_SLOTS];
+
+			for (j = 0; j < nguilty; j++)
+				if (guilty[j] == s->stamp) {
+					s->error = ECANCELED;
+					nfailed++;
+					device_printf(sc->dev, "recovery: failing "
+					    "render %u (context %u)\n", s->ordinal,
+					    s->context);
+					agx_recovery_dump(sc, "failed", s);
+					agx_recovery_dump(sc, "good", &r->last_good);
+					break;
+				}
+			s->deadline = sbinuptime() + AGX_RENDER_TIMEOUT;
+		}
+		if (nfailed == 0 && (blamed == 0 || blamed == 1) &&
+		    r->in_flight != 0) {
+			r->slots[r->oldest].error = ECANCELED;
+			nfailed++;
+			device_printf(sc->dev, "recovery: no stamp matched; "
+			    "failing the oldest render %u (context %u)\n",
+			    r->slots[r->oldest].ordinal,
+			    r->slots[r->oldest].context);
+		}
+		device_printf(sc->dev, "recovery gen %ju done (%u records, %u "
+		    "renders failed)\n", (uintmax_t)gen, listed, nfailed);
+	}
+	n = agx_render_reap(sc, done);
+	mtx_unlock(&sc->mtx);
+	agx_render_complete(done, n);
+}
+
+/*
  * Drain firmware events. A stamp event carries a bit mask of ready QIDs.
  * g17/fw/channels.rs: 4 restart {generation u64, stamp}, 6 TVB grow,
  * 7 compute fault, 12 context killed, 13 free-list grow. Only stamps are
@@ -3243,6 +3548,24 @@ agx_drain_events(struct agx_role *r)
 			    rec[2], rec[3], rec[4], rec[5], rec[6], rec[7], rec[8]);
 			if (rec[0] == AGX_EVENT_RESTART)
 				agx_report_mmu_fault(sc);
+		}
+		/*
+		 * recovery.rs State::request: restart {generation u64, stamp
+		 * i32}; the stamp is the blamed QID, or -1. An older generation
+		 * is a duplicate.
+		 */
+		if (rec[0] == AGX_EVENT_RESTART) {
+			uint64_t gen = rec[1] | (uint64_t)rec[2] << 32;
+			struct agx_render *rr = &sc->render;
+
+			if (rr->installed && gen >= rr->recovery_accepted &&
+			    !rr->recovering) {
+				rr->recovering = true;
+				rr->recovery_request = gen;
+				rr->recovery_blamed = (int32_t)rec[3];
+				taskqueue_enqueue(taskqueue_thread,
+				    &rr->recovery_task);
+			}
 		}
 		if (idx == 0 && rec[0] == AGX_EVENT_STAMP && (rec[1] & 3) != 0) {
 			sc->render.stamp_events++;
