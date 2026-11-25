@@ -154,6 +154,8 @@ struct mtp_iface {
 	int			mt_touch_fingers; /* most fingers seen */
 	int			mt_touch_moved;	/* total movement, touch units */
 	bool			mt_touch_clicked;
+	int			mt_touch_frames; /* tap_debug: frames and */
+	uint8_t			mt_touch_states; /* record state bytes ORed */
 	bool			mt_tap_release;	/* right-button release due */
 };
 
@@ -369,6 +371,9 @@ SYSCTL_NODE(_hw, OID_AUTO, apple_mtp, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
 SYSCTL_INT(_hw_apple_mtp, OID_AUTO, natural_scroll, CTLFLAG_RWTUN,
     &mtp_natural_scroll, 0,
     "Two-finger scrolling moves the content with the fingers (macOS style)");
+static int mtp_tap_debug;
+SYSCTL_INT(_hw_apple_mtp, OID_AUTO, tap_debug, CTLFLAG_RWTUN,
+    &mtp_tap_debug, 0, "Log each touch's tap decision");
 
 static uint32_t
 mtp_checksum(const uint8_t *p, size_t len)
@@ -573,9 +578,14 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 		ifc->mt_touch_ticks = ticks;
 		ifc->mt_touch_moved = 0;
 		ifc->mt_touch_clicked = false;
+		ifc->mt_touch_frames = 0;
+		ifc->mt_touch_states = 0;
 	}
 	ifc->mt_touch_moved += abs(dx) + abs(dy);
 	ifc->mt_touch_clicked |= pressed;
+	ifc->mt_touch_frames++;
+	for (int i = 0; i < count; i++)
+		ifc->mt_touch_states |= p[MT_HDR_LEN + i * MT_REC_LEN + 1];
 	if (count > 0) {
 		ifc->mt_touch_fingers = MAX(ifc->mt_touch_fingers, count);
 		tap = 0;
@@ -584,6 +594,13 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 		    ifc->mt_touch_moved < MT_TAP_MOVE &&
 		    ticks - ifc->mt_touch_ticks < MT_TAP_MS * hz / 1000 ?
 		    ifc->mt_touch_fingers : 0;
+		if (mtp_tap_debug && ifc->mt_touch_fingers > 0)
+			printf("apple_mtp: touch fingers %d moved %d ms %d "
+			    "clicked %d frames %d states %#x -> tap %d\n",
+			    ifc->mt_touch_fingers, ifc->mt_touch_moved,
+			    (ticks - ifc->mt_touch_ticks) * 1000 / hz,
+			    ifc->mt_touch_clicked, ifc->mt_touch_frames,
+			    ifc->mt_touch_states, tap);
 		ifc->mt_touch_fingers = 0;
 	}
 
