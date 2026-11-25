@@ -329,6 +329,13 @@ static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
 #define	MT_HDR_BUTTONS		23
 #define	MT_REC_LEN		30
 #define	MT_REC_ID		0	/* low byte: contact id */
+#define	MT_REC_STATE		1	/* high byte: contact state */
+/*
+ * Records stay in the frame after their finger lifts, in state 7 and then
+ * 0, and the firmware never sends an empty frame; a contact is on the pad
+ * in states 3 (new) to 5 (lifting), as in aurora's hid-magicmouse.
+ */
+#define	MT_STATE_TOUCHING(s)	((s) >= 3 && (s) <= 5)
 #define	MT_REC_X		4	/* signed 16-bit, ~0.01 mm */
 #define	MT_REC_Y		6	/* signed 16-bit, up is positive */
 #define	MT_MOUSE_REPORT_ID	2
@@ -511,27 +518,34 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
     const uint8_t *p, size_t len)
 {
 	const uint8_t *rec;
-	int count, ids[2], px[2], py[2], n, x, y, dx, dy, ddx, ddy;
+	int nrec, count, ids[2], px[2], py[2], n, x, y, dx, dy, ddx, ddy;
 	uint8_t *r;
 	int g, tap;			/* tap: fingers in it, or 0 */
 	bool pressed;
 
 	if (len < MT_HDR_LEN || p[0] != MT_REPORT_ID)
 		return;
-	count = p[MT_HDR_COUNT];
-	if (MT_HDR_LEN + (size_t)count * MT_REC_LEN > len)
+	nrec = p[MT_HDR_COUNT];
+	if (MT_HDR_LEN + (size_t)nrec * MT_REC_LEN > len)
 		return;
 
-	n = MIN(count, 2);
+	/* Follow the first two contacts on the pad; count all of them. */
+	count = n = 0;
 	ids[0] = ids[1] = -1;
 	x = y = 0;
-	for (int i = 0; i < n; i++) {
+	for (int i = 0; i < nrec; i++) {
 		rec = p + MT_HDR_LEN + i * MT_REC_LEN;
-		ids[i] = rec[MT_REC_ID];
-		px[i] = (int16_t)le16dec(rec + MT_REC_X);
-		py[i] = (int16_t)le16dec(rec + MT_REC_Y);
-		x += px[i];
-		y += py[i];
+		if (!MT_STATE_TOUCHING(rec[MT_REC_STATE]))
+			continue;
+		count++;
+		if (n == 2)
+			continue;
+		ids[n] = rec[MT_REC_ID];
+		px[n] = (int16_t)le16dec(rec + MT_REC_X);
+		py[n] = (int16_t)le16dec(rec + MT_REC_Y);
+		x += px[n];
+		y += py[n];
+		n++;
 	}
 	if (n > 0) {
 		x /= n;
