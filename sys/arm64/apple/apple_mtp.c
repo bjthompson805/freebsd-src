@@ -334,16 +334,18 @@ static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
 #define	MT_MOUSE_REPORT_ID	2
 #define	MT_POINTER_UNITS	8	/* touch units per pointer count */
 #define	MT_SCROLL_UNITS		60	/* touch units per wheel step */
-#define	MT_TAP_MS		250	/* longest two-finger tap */
+#define	MT_TAP_MS		250	/* longest tap */
 #define	MT_TAP_MOVE		150	/* most movement in a tap (~1.5 mm) */
+#define	MT_HOLD_MS		120	/* pointer motion held back as a tap */
 /*
- * Pointer gain, in 1/MT_GAIN_FULL: slow, fine movement gets a quarter of
- * the full gain, rising linearly to full at MT_GAIN_SPEED touch units per
- * frame (frames come at ~120 Hz, so ~50 mm/s).
+ * Pointer gain, in 1/MT_GAIN_FULL: slow, fine movement gets 5/8 of the
+ * full gain, rising linearly to full at MT_GAIN_SPEED touch units per
+ * frame (frames come at ~120 Hz, so ~35 mm/s). libinput slows slow
+ * motion further on its own.
  */
 #define	MT_GAIN_FULL		16
-#define	MT_GAIN_MIN		4
-#define	MT_GAIN_SPEED		40
+#define	MT_GAIN_MIN		10
+#define	MT_GAIN_SPEED		30
 
 /* Report 2: 3 buttons, X, Y, wheel, AC pan (horizontal wheel). */
 static const uint8_t mtp_mouse_rdesc[] = {
@@ -603,7 +605,7 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 		/* While this could still be a tap, hold the motion back. */
 		if (ifc->mt_touch_fingers == 1 && !ifc->mt_touch_clicked &&
 		    ifc->mt_touch_moved < MT_TAP_MOVE &&
-		    ticks - ifc->mt_touch_ticks < MT_TAP_MS * hz / 1000)
+		    ticks - ifc->mt_touch_ticks < MT_HOLD_MS * hz / 1000)
 			return;
 		r[2] = (int8_t)mtp_mt_steps(&ifc->mt_rx,
 		    MT_POINTER_UNITS * MT_GAIN_FULL);
