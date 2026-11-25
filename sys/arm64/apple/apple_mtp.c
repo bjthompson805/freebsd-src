@@ -147,8 +147,10 @@ struct mtp_iface {
 	int			mt_ids[2];
 	int			mt_x, mt_y;	/* finger, or two-finger centre */
 	int			mt_px[2], mt_py[2]; /* each followed contact */
+	int			mt_pp;		/* first contact's pressure */
 	int			mt_rx, mt_ry;	/* sub-step remainders */
 	uint8_t			mt_button;	/* latched at press: 1 or 2 */
+	int			mt_press_moved;	/* movement since the press */
 	/* the current touch, from first contact until all fingers lift */
 	int			mt_touch_ticks;	/* when it started */
 	int			mt_touch_fingers; /* most fingers seen */
@@ -338,6 +340,13 @@ static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
 #define	MT_STATE_TOUCHING(s)	((s) >= 3 && (s) <= 5)
 #define	MT_REC_X		4	/* signed 16-bit, ~0.01 mm */
 #define	MT_REC_Y		6	/* signed 16-bit, up is positive */
+#define	MT_REC_PRESSURE		26	/* 16-bit, ~40 resting, ~300 clicked */
+/*
+ * A press or release rolls the fingertip 0.5-1 mm while its pressure
+ * ramps (DTrace on a J815, ~4-30 per frame); a moving finger's pressure
+ * barely changes. Motion in frames where it changes this much is dropped.
+ */
+#define	MT_PRESS_DP		4
 #define	MT_MOUSE_REPORT_ID	2
 #define	MT_POINTER_UNITS	8	/* touch units per pointer count */
 #define	MT_SCROLL_UNITS		60	/* touch units per wheel step */
@@ -520,7 +529,7 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 	const uint8_t *rec;
 	int nrec, count, ids[2], px[2], py[2], n, x, y, dx, dy, ddx, ddy;
 	uint8_t *r;
-	int g, tap;			/* tap: fingers in it, or 0 */
+	int g, pp, tap;			/* tap: fingers in it, or 0 */
 	bool pressed;
 
 	if (len < MT_HDR_LEN || p[0] != MT_REPORT_ID)
@@ -530,7 +539,7 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 		return;
 
 	/* Follow the first two contacts on the pad; count all of them. */
-	count = n = 0;
+	count = n = pp = 0;
 	ids[0] = ids[1] = -1;
 	x = y = 0;
 	for (int i = 0; i < nrec; i++) {
@@ -543,6 +552,8 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 		ids[n] = rec[MT_REC_ID];
 		px[n] = (int16_t)le16dec(rec + MT_REC_X);
 		py[n] = (int16_t)le16dec(rec + MT_REC_Y);
+		if (n == 0)
+			pp = le16dec(rec + MT_REC_PRESSURE);
 		x += px[n];
 		y += py[n];
 		n++;
@@ -565,8 +576,12 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 				ddy = cy;
 			}
 		}
+		/* A finger pressing or releasing rolls; that isn't motion. */
+		if (n == 1 && abs(pp - ifc->mt_pp) >= MT_PRESS_DP)
+			dx = dy = 0;
 	} else
 		ifc->mt_rx = ifc->mt_ry = 0;
+	ifc->mt_pp = pp;
 	ifc->mt_ids[0] = ids[0];
 	ifc->mt_ids[1] = ids[1];
 	ifc->mt_x = x;
@@ -579,8 +594,10 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 	pressed = (p[MT_HDR_BUTTONS] & 1) != 0;
 	if (!pressed)
 		ifc->mt_button = 0;
-	else if (ifc->mt_button == 0)
+	else if (ifc->mt_button == 0) {
 		ifc->mt_button = count >= 2 ? 2 : 1;
+		ifc->mt_press_moved = 0;
+	}
 
 	/* Two-finger tap: short, still, no click, two fingers at most. */
 	if (count > 0 && ifc->mt_touch_fingers == 0) {
@@ -612,7 +629,11 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 		r[1] = tap == 2 ? 0x2 : 0x1;
 		ifc->mt_tap_release = true;
 	}
-	if (n == 1) {
+	if (n == 1 && ifc->mt_button != 0 &&
+	    ifc->mt_press_moved < MT_TAP_MOVE) {
+		/* Clicked: still until the finger means to drag. */
+		ifc->mt_press_moved += abs(dx) + abs(dy);
+	} else if (n == 1) {
 		g = mtp_mt_gain(dx, dy);
 		ifc->mt_rx += dx * g;
 		ifc->mt_ry -= dy * g;		/* screen y grows downward */
