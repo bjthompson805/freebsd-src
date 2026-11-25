@@ -344,7 +344,9 @@ static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
 /*
  * A press or release rolls the fingertip 0.5-1 mm while its pressure
  * ramps (DTrace on a J815, ~4-30 per frame); a moving finger's pressure
- * barely changes. Motion in frames where it changes this much is dropped.
+ * barely changes. With the button up, motion in frames where it changes
+ * this much is dropped. With it down, the press slop keeps a click still
+ * instead: a fast drag changes pressure in nearly every frame.
  */
 #define	MT_PRESS_DP		4
 #define	MT_MOUSE_REPORT_ID	2
@@ -562,6 +564,7 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 		x /= n;
 		y /= n;
 	}
+	pressed = (p[MT_HDR_BUTTONS] & 1) != 0;
 	dx = dy = ddx = ddy = 0;
 	if (n > 0 && ids[0] == ifc->mt_ids[0] && ids[1] == ifc->mt_ids[1]) {
 		dx = x - ifc->mt_x;
@@ -577,7 +580,7 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 			}
 		}
 		/* A finger pressing or releasing rolls; that isn't motion. */
-		if (n == 1 && abs(pp - ifc->mt_pp) >= MT_PRESS_DP)
+		if (n == 1 && !pressed && abs(pp - ifc->mt_pp) >= MT_PRESS_DP)
 			dx = dy = 0;
 	} else
 		ifc->mt_rx = ifc->mt_ry = 0;
@@ -591,7 +594,6 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 		ifc->mt_py[i] = py[i];
 	}
 
-	pressed = (p[MT_HDR_BUTTONS] & 1) != 0;
 	if (!pressed)
 		ifc->mt_button = 0;
 	else if (ifc->mt_button == 0) {
