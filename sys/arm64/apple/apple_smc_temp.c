@@ -31,6 +31,8 @@ static const char *const gpu_keys[] = {
 struct smc_zone {
 	uint32_t	keys[nitems(cpu_keys)];
 	int		nkeys;
+	sbintime_t	when;		/* of the cached reading, 0: none */
+	int		dk;
 };
 
 static struct smc_zone cpu_zone, gpu_zone;
@@ -91,13 +93,23 @@ smc_zone_read(struct smc_zone *zone, int *dk)
 	return (0);
 }
 
+/* Readings are reused for a second: each costs a key read per sensor. */
 static int
 smc_zone_sysctl(SYSCTL_HANDLER_ARGS)
 {
+	struct smc_zone *zone = arg1;
+	sbintime_t now;
 	int error, val;
 
-	if ((error = smc_zone_read(arg1, &val)) != 0)
-		return (error);
+	now = sbinuptime();
+	if (zone->when != 0 && now - zone->when < SBT_1S)
+		val = zone->dk;
+	else {
+		if ((error = smc_zone_read(zone, &val)) != 0)
+			return (error);
+		zone->dk = val;
+		zone->when = now;
+	}
 	return (sysctl_handle_int(oidp, &val, 0, req));
 }
 

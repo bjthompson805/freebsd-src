@@ -9,9 +9,11 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/callout.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/module.h>
+#include <sys/proc.h>
 #include <sys/sx.h>
 
 #include <vm/vm.h>
@@ -76,19 +78,33 @@ static const struct apple_rtkit_ops apple_smc_rtkit_ops = {
 	.recv = apple_smc_recv,
 };
 
+/*
+ * Polls for the reply for up to a second of real time. Callers that may sleep
+ * sleep between polls, so a slow SMC does not keep a core spinning (and the
+ * sx lock's waiters spinning behind it).
+ */
 static int
 apple_smc_wait(struct apple_smc_softc *sc, bool *done_when_false, uint64_t *pa)
 {
-	int i;
+	sbintime_t end;
+	bool sleep;
 
-	for (i = 0; i < 1000000; i++) {
+	sleep = !cold && !SCHEDULER_STOPPED() && THREAD_CAN_SLEEP();
+	end = sbinuptime() + SBT_1S;
+	for (;;) {
 		apple_rtkit_poll(sc->rtk);
 		if (apple_rtkit_crashed(sc->rtk))
 			return (EIO);
 		if (done_when_false != NULL ? !*done_when_false : *pa != 0)
 			return (0);
-		DELAY(1);
+		if (sbinuptime() >= end)
+			break;
+		if (sleep)
+			pause_sbt("smcwt", SBT_1US * 20, SBT_1US * 20, C_PREL(1));
+		else
+			DELAY(1);
 	}
+	device_printf(sc->dev, "no reply within 1 s\n");
 	return (ETIMEDOUT);
 }
 
