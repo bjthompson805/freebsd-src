@@ -89,14 +89,60 @@ isp_gpio_wait(struct apple_isp *isp, u32 reg, u32 expected)
 	    ISP_FIRMWARE_TIMEOUT_US, NULL));
 }
 
-/* The CPU, FE, ... domains (1 on): ISP_SYS (0) stays on, see attach. */
+/*
+ * hw.apple_isp.sys_cycle: power ISP_SYS (the whole block, its DARTs too) off
+ * and on before a start, as Linux's runtime PM does ("Needs to be power
+ * cycled for IOMMU to behave correctly"); the DART stream registers are put
+ * back afterwards.
+ */
+static int apple_isp_sys_cycle;
+TUNABLE_INT("hw.apple_isp.sys_cycle", &apple_isp_sys_cycle);
+
+#define	ISP_DART_ENABLE_STREAMS	0xc00
+#define	ISP_DART_TCR(sid)	(0x1000 + 4 * (sid))
+#define	ISP_DART_TTBR(sid)	(0x1400 + 4 * (sid))
+#define	ISP_DART_NSTREAMS	16
+#define	IDART(isp, i, r)	\
+	(*(volatile u32 *)((char *)(isp)->dart_regs[i] + (r)))
+
 static int
-apple_isp_power_up_domains(struct apple_isp *isp)
+apple_isp_cycle_sys(struct apple_isp *isp)
+{
+	u32 tcr[ISP_NUM_DARTS][ISP_DART_NSTREAMS];
+	u32 ttbr[ISP_NUM_DARTS][ISP_DART_NSTREAMS], en[ISP_NUM_DARTS];
+	int err, i, s;
+
+	for (i = 0; i < ISP_NUM_DARTS; i++) {
+		en[i] = IDART(isp, i, ISP_DART_ENABLE_STREAMS);
+		for (s = 0; s < ISP_DART_NSTREAMS; s++) {
+			tcr[i][s] = IDART(isp, i, ISP_DART_TCR(s));
+			ttbr[i][s] = IDART(isp, i, ISP_DART_TTBR(s));
+		}
+	}
+	err = apple_pmgr_set_domain(isp->dev, 0, false);
+	if (err == 0)
+		err = apple_pmgr_set_domain(isp->dev, 0, true);
+	if (err != 0)
+		return (-err);
+	for (i = 0; i < ISP_NUM_DARTS; i++) {
+		device_printf(isp->dev, "DART %d after the cycle: TCR0 %#x "
+		    "TTBR0 %#x\n", i, IDART(isp, i, ISP_DART_TCR(0)),
+		    IDART(isp, i, ISP_DART_TTBR(0)));
+		for (s = 0; s < ISP_DART_NSTREAMS; s++) {
+			IDART(isp, i, ISP_DART_TCR(s)) = 0;
+			IDART(isp, i, ISP_DART_TTBR(s)) = ttbr[i][s];
+			IDART(isp, i, ISP_DART_TCR(s)) = tcr[i][s];
+		}
+		IDART(isp, i, ISP_DART_ENABLE_STREAMS) = en[i];
+	}
+	/* The heap, segments and windows are in our tables: nothing to flush. */
+	return (0);
+}
+
+static int
+apple_isp_domains_on(struct apple_isp *isp)
 {
 	int i, ret;
-
-	if (isp->pds_active)
-		return (0);
 
 	for (i = 1; i < isp->pd_count; i++) {
 		ret = apple_pmgr_set_domain(isp->dev, i, true);
@@ -107,6 +153,54 @@ apple_isp_power_up_domains(struct apple_isp *isp)
 				apple_pmgr_set_domain(isp->dev, i, false);
 			return (-ret);
 		}
+	}
+	return (0);
+}
+
+static void
+apple_isp_domains_off(struct apple_isp *isp)
+{
+	for (int i = isp->pd_count - 1; i >= 1; i--)
+		if (apple_pmgr_set_domain(isp->dev, i, false) != 0)
+			dev_err(isp->dev,
+			    "Failed to power down power domain %d\n", i);
+}
+
+/* The CPU, FE, ... domains (1 on): ISP_SYS (0) stays on, see attach. */
+static int
+apple_isp_power_up_domains(struct apple_isp *isp)
+{
+	int ret;
+
+	if (isp->pds_active)
+		return (0);
+
+	ret = apple_isp_domains_on(isp);
+	if (ret)
+		return (ret);
+	if (!isp->fw.started) {
+		/* iBoot's reset vector, before any power cycle can lose it */
+		if (!isp->fw.entry)
+			isp->fw.entry = bus_read_8(isp->coproc,
+			    ISP_COPROC_RVBAR) & ~1ULL;
+		device_printf(isp->dev, "before the start: control %#x status "
+		    "%#x RVBAR %#jx\n",
+		    isp_coproc_read32(isp, isp->hw->coproc_control),
+		    isp_coproc_read32(isp, isp->hw->coproc_status),
+		    (uintmax_t)bus_read_8(isp->coproc, ISP_COPROC_RVBAR));
+	}
+	if (apple_isp_sys_cycle) {
+		apple_isp_domains_off(isp);
+		ret = apple_isp_cycle_sys(isp);
+		if (ret == 0)
+			ret = apple_isp_domains_on(isp);
+		if (ret)
+			return (ret);
+		device_printf(isp->dev, "after the ISP_SYS cycle: control %#x "
+		    "status %#x RVBAR %#jx\n",
+		    isp_coproc_read32(isp, isp->hw->coproc_control),
+		    isp_coproc_read32(isp, isp->hw->coproc_status),
+		    (uintmax_t)bus_read_8(isp->coproc, ISP_COPROC_RVBAR));
 	}
 	isp->pds_active = true;
 	return (0);
@@ -288,11 +382,12 @@ isp_coproc_entry(struct apple_isp *isp)
 	struct isp_firmware *fw = &isp->fw;
 	u64 rvbar = bus_read_8(isp->coproc, ISP_COPROC_RVBAR);
 
+	/* fw->entry: noted at the first power-up (apple_isp_power_up_domains()) */
 	if (!fw->started) {
-		fw->entry = rvbar & ~1ULL;
-		device_printf(isp->dev, "firmware reset vector %#jx\n",
-		    (uintmax_t)rvbar);
-		return (0);
+		device_printf(isp->dev, "firmware reset vector %#jx (entry "
+		    "%#jx)\n", (uintmax_t)rvbar, (uintmax_t)fw->entry);
+		if (!fw->entry)
+			fw->entry = rvbar & ~1ULL;
 	}
 
 	if (!fw->entry || rvbar == (fw->entry | 1))
