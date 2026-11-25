@@ -370,6 +370,58 @@ apple_isp_program_dapf(struct apple_isp *isp)
  * The firmware heap, from /reserved-memory/isp-heap (m1n1): its physical
  * memory and, in iommu-addresses, where the firmware sees it.
  */
+/*
+ * T8142: the firmware's text and data end at 0x16ec000 (J813 and J815 ADTs,
+ * macOS 26 and 27); the heap runs from there to the next 2 MiB boundary.
+ */
+#define	ISP_T8142_SEG_END	0x16ec000
+#define	ISP_T8142_HEAP_TOP	0x1800000
+
+/*
+ * Without an isp-heap from m1n1 (a stub older than its ISP17a support,
+ * which reserves the firmware segments but carves no heap and disables the
+ * ISP): find the end of the firmware from the asc-firmware regions m1n1
+ * reserved for this device, and allocate the heap above it ourselves.
+ */
+static int
+apple_isp_alloc_heap(struct apple_isp *isp)
+{
+	device_t dev = isp->dev;
+	phandle_t resv, child;
+	pcell_t self, ia[5];
+	u64 end = 0;
+	void *va;
+
+	self = OF_xref_from_node(ofw_bus_get_node(dev));
+	resv = OF_finddevice("/reserved-memory");
+	for (child = resv > 0 ? OF_child(resv) : 0; child != 0;
+	    child = OF_peer(child)) {
+		if (OF_getencprop(child, "iommu-addresses", ia, sizeof(ia)) !=
+		    sizeof(ia) || ia[0] != self)
+			continue;
+		end = MAX(end, ((((u64)ia[1] << 32 | ia[2]) +
+		    ((u64)ia[3] << 32 | ia[4])) & isp->fw_iova_mask));
+	}
+	end = roundup2(end, ISP_PAGE_SIZE);
+	if (end != ISP_T8142_SEG_END) {
+		dev_err(dev, "firmware segments end at 0x%jx, not 0x%x\n",
+		    (uintmax_t)end, ISP_T8142_SEG_END);
+		return (-ENODEV);
+	}
+	isp->fw.heap_base = end;
+	isp->fw.heap_top = ISP_T8142_HEAP_TOP;
+	va = kmem_alloc_contig(isp->fw.heap_top - isp->fw.heap_base,
+	    M_WAITOK | M_ZERO, 0, (1ul << 42) - 1, ISP_PAGE_SIZE, 0,
+	    VM_MEMATTR_WRITE_COMBINING);
+	if (va == NULL)
+		return (-ENOMEM);
+	isp->fw.heap_pa = pmap_kextract((vm_offset_t)va);
+	device_printf(dev, "firmware heap 0x%jx-0x%jx allocated at %#jx\n",
+	    (uintmax_t)isp->fw.heap_base, (uintmax_t)isp->fw.heap_top,
+	    (uintmax_t)isp->fw.heap_pa);
+	return (0);
+}
+
 static int
 apple_isp_init_heap(struct apple_isp *isp)
 {
@@ -377,19 +429,14 @@ apple_isp_init_heap(struct apple_isp *isp)
 	phandle_t node = ofw_bus_get_node(dev), mem;
 	pcell_t xref, ia[5], reg[4];
 
-	if (OF_getencprop(node, "memory-region", &xref, sizeof(xref)) <= 0) {
-		dev_err(dev, "no memory-region (m1n1 didn't set up the "
-		    "ISP)\n");
-		return (-ENODEV);
-	}
+	if (OF_getencprop(node, "memory-region", &xref, sizeof(xref)) <= 0)
+		return (apple_isp_alloc_heap(isp));
 	mem = OF_node_from_xref(xref);
 	/* iommu-addresses = <&isp hi lo hi lo>; reg = <hi lo hi lo> */
 	if (OF_getencprop(mem, "iommu-addresses", ia, sizeof(ia)) !=
 	    sizeof(ia) ||
-	    OF_getencprop(mem, "reg", reg, sizeof(reg)) != sizeof(reg)) {
-		dev_err(dev, "isp-heap has no iommu-addresses or reg\n");
-		return (-ENODEV);
-	}
+	    OF_getencprop(mem, "reg", reg, sizeof(reg)) != sizeof(reg))
+		return (apple_isp_alloc_heap(isp));
 	isp->fw.heap_base = ((u64)ia[1] << 32 | ia[2]) & isp->fw_iova_mask;
 	isp->fw.heap_top = isp->fw.heap_base + ((u64)ia[3] << 32 | ia[4]);
 	isp->fw.heap_pa = (u64)reg[0] << 32 | reg[1];
@@ -546,8 +593,10 @@ apple_isp_intr(void *arg)
 static int
 apple_isp_probe(device_t dev)
 {
-	if (!ofw_bus_status_okay(dev))
-		return (ENXIO);
+	/*
+	 * Not ofw_bus_status_okay(): an m1n1 without ISP17a support disables
+	 * the node only for want of a heap, which attach allocates instead.
+	 */
 	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
 		return (ENXIO);
 	device_set_desc(dev, "Apple ISP (" APPLE_ISP_CARD_NAME ")");
