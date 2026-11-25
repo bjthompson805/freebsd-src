@@ -3,7 +3,7 @@
  *
  * Apple fPWM (apple,s5l-fpwm), a one-channel PWM clocked from the 24 MHz
  * reference. Follows Linux's pwm-apple.c: the period is split into ON and OFF
- * cycle counts, and CONTROL's UPDATE/TRIGGER bits latch them. On the M5
+ * cycle counts, and CONTROL's UPDATE bit latches them. On the M5
  * laptops it drives the keyboard backlight (ADT /arm-io/fpwm0/kbd-backlight).
  */
 
@@ -72,8 +72,8 @@ apple_fpwm_apply(struct apple_fpwm_softc *sc)
 		on = total;
 	WR4(sc, REG_ON_CYCLES, on);
 	WR4(sc, REG_OFF_CYCLES, total - on);
-	WR4(sc, REG_CONTROL, CONTROL_ENABLE | CONTROL_MODE | CONTROL_UPDATE |
-	    CONTROL_TRIGGER | CONTROL_OUTPUT_ENABLE);
+	WR4(sc, REG_CONTROL, CONTROL_ENABLE | CONTROL_OUTPUT_ENABLE |
+	    CONTROL_UPDATE);
 }
 
 static int

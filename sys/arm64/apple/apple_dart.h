@@ -47,6 +47,8 @@ int	apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid,
 struct apple_dart_fw;
 int	apple_dart_fw_attach(device_t dev, phandle_t node, int index,
 	    struct apple_dart_fw **fwp);
+int	apple_dart_fw_attach_own(device_t dev, phandle_t node, int index,
+	    struct apple_dart_fw **fwp);
 int	apple_dart_fw_map(struct apple_dart_fw *fw, vm_paddr_t pa,
 	    size_t size, uint64_t *iova);
 int	apple_dart_fw_map_at(struct apple_dart_fw *fw, uint64_t iova,

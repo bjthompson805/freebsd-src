@@ -410,6 +410,14 @@ apple_isp_alloc_heap(struct apple_isp *isp)
 	}
 	isp->fw.heap_base = end;
 	isp->fw.heap_top = ISP_T8142_HEAP_TOP;
+	/* A heap an earlier attach allocated stays mapped (see detach). */
+	if (apple_dart_fw_lookup(isp->darts[0], isp->fw.heap_base,
+	    isp->fw.heap_top - isp->fw.heap_base, &isp->fw.heap_pa) == 0) {
+		device_printf(dev, "firmware heap 0x%jx-0x%jx kept at %#jx\n",
+		    (uintmax_t)isp->fw.heap_base, (uintmax_t)isp->fw.heap_top,
+		    (uintmax_t)isp->fw.heap_pa);
+		return (0);
+	}
 	va = kmem_alloc_contig(isp->fw.heap_top - isp->fw.heap_base,
 	    M_WAITOK | M_ZERO, 0, (1ul << 42) - 1, ISP_PAGE_SIZE, 0,
 	    VM_MEMATTR_WRITE_COMBINING);
@@ -484,6 +492,142 @@ apple_isp_map_fw_mmio(struct apple_isp *isp)
 	return (0);
 }
 
+/*
+ * The firmware's text and data, the asc-firmware regions m1n1 reserved for
+ * this device: map them at their IOVAs where the DART lacks them (a table of
+ * our own, apple_dart_fw_attach_own()), as Linux's DART driver maps a
+ * device's reserved regions.
+ */
+static int
+apple_isp_map_fw_segments(struct apple_isp *isp)
+{
+	phandle_t resv, child;
+	pcell_t self, ia[5], reg[4];
+	vm_paddr_t pa, got;
+	u64 iova, size;
+	int err;
+
+	self = OF_xref_from_node(ofw_bus_get_node(isp->dev));
+	resv = OF_finddevice("/reserved-memory");
+	for (child = resv > 0 ? OF_child(resv) : 0; child != 0;
+	    child = OF_peer(child)) {
+		if (OF_getencprop(child, "iommu-addresses", ia, sizeof(ia)) !=
+		    sizeof(ia) || ia[0] != self ||
+		    !ofw_bus_node_is_compatible(child, "apple,asc-mem") ||
+		    OF_getencprop(child, "reg", reg, sizeof(reg)) != sizeof(reg))
+			continue;
+		iova = ((u64)ia[1] << 32 | ia[2]) & isp->fw_iova_mask;
+		size = (u64)ia[3] << 32 | ia[4];
+		pa = (u64)reg[0] << 32 | reg[1];
+		if (apple_dart_fw_lookup(isp->darts[0], iova, size, &got) == 0) {
+			if (got != pa) {
+				dev_err(isp->dev, "firmware 0x%jx is mapped to "
+				    "%#jx, not %#jx\n", (uintmax_t)iova,
+				    (uintmax_t)got, (uintmax_t)pa);
+				return (-EEXIST);
+			}
+			continue;
+		}
+		err = isp_dart_map(isp, iova, pa, size);
+		if (err)
+			return (err);
+		device_printf(isp->dev, "firmware 0x%jx-0x%jx mapped from "
+		    "%#jx\n", (uintmax_t)iova, (uintmax_t)(iova + size),
+		    (uintmax_t)pa);
+	}
+	return (0);
+}
+
+#define	ISP_DART_ERROR		0x100
+#define	ISP_DART_ERROR_ADDR_LO	0x170
+#define	ISP_DART_ERROR_ADDR_HI	0x174
+#define	ISP_DART_ERROR_STREAMS	0x1c0
+#define	ISP_DART_ENABLE_STREAMS	0xc00
+#define	ISP_DART_TCR(sid)	(0x1000 + 4 * (sid))
+#define	ISP_DART_TCR_REMAP_ENABLE BIT(7)
+#define	ISP_DART_TCR_REMAP_SHIFT 8
+#define	DART_RD4(isp, i, r)	\
+	(*(volatile u32 *)((char *)(isp)->dart_regs[i] + (r)))
+#define	DART_WR4(isp, i, r, v)	\
+	(*(volatile u32 *)((char *)(isp)->dart_regs[i] + (r)) = (v))
+
+/*
+ * Map the DARTs' registers, and fold the streams apple,remap-streams names
+ * onto their targets (the ISP firmware uses several; aurora's DART driver
+ * writes these remaps, which a bare DART from the boot loader lacks).
+ */
+static int
+apple_isp_init_darts(struct apple_isp *isp)
+{
+	pcell_t *iommus, *remap;
+	phandle_t dart;
+	bus_addr_t pa;
+	int i, n;
+
+	n = OF_getencprop_alloc_multi(ofw_bus_get_node(isp->dev), "iommus",
+	    sizeof(*iommus), (void **)&iommus);
+	if (n < 2 * ISP_NUM_DARTS) {
+		OF_prop_free(iommus);
+		return (-EINVAL);
+	}
+	for (i = 0; i < ISP_NUM_DARTS; i++) {
+		dart = OF_node_from_xref(iommus[2 * i]);
+		if (ofw_reg_to_paddr(dart, 0, &pa, &isp->dart_regs_size[i],
+		    NULL) != 0) {
+			OF_prop_free(iommus);
+			return (-ENXIO);
+		}
+		isp->dart_regs[i] = pmap_mapdev(pa, isp->dart_regs_size[i]);
+
+		n = OF_getencprop_alloc_multi(dart, "apple,remap-streams",
+		    sizeof(*remap), (void **)&remap);
+		for (int j = 0; j + 1 < n; j += 2) {
+			u32 src = remap[j], dst = remap[j + 1];
+
+			if (src >= 256 || dst > 0xf)
+				continue;
+			DART_WR4(isp, i, ISP_DART_TCR(src),
+			    ISP_DART_TCR_REMAP_ENABLE |
+			    dst << ISP_DART_TCR_REMAP_SHIFT);
+			DART_WR4(isp, i, ISP_DART_ENABLE_STREAMS + 4 * (src / 32),
+			    DART_RD4(isp, i, ISP_DART_ENABLE_STREAMS +
+			    4 * (src / 32)) | BIT(src % 32));
+			dev_dbg(isp->dev, "DART %d: stream %u -> %u, TCR %#x\n",
+			    i, src, dst, DART_RD4(isp, i, ISP_DART_TCR(src)));
+		}
+		if (n > 0)
+			device_printf(isp->dev, "DART %d: %d stream remaps\n",
+			    i, n / 2);
+		OF_prop_free(remap);
+	}
+	OF_prop_free(iommus);
+	return (0);
+}
+
+/* Report (and with clear, acknowledge) the DARTs' latched faults. */
+void
+apple_isp_dart_report(struct apple_isp *isp, bool clear)
+{
+	u32 err;
+
+	for (int i = 0; i < ISP_NUM_DARTS; i++) {
+		if (isp->dart_regs[i] == NULL)
+			continue;
+		err = DART_RD4(isp, i, ISP_DART_ERROR);
+		if (err & BIT(31))
+			device_printf(isp->dev, "DART %d fault: error %#x "
+			    "(stream %u) at 0x%x%08x, streams %#x\n", i, err,
+			    (err >> 20) & 0xff,
+			    DART_RD4(isp, i, ISP_DART_ERROR_ADDR_HI),
+			    DART_RD4(isp, i, ISP_DART_ERROR_ADDR_LO),
+			    DART_RD4(isp, i, ISP_DART_ERROR_STREAMS));
+		else if (!clear)
+			device_printf(isp->dev, "DART %d: no fault\n", i);
+		if (clear && (err & BIT(31)))
+			DART_WR4(isp, i, ISP_DART_ERROR, err);
+	}
+}
+
 static int
 apple_isp_init_iommu(struct apple_isp *isp)
 {
@@ -493,13 +637,20 @@ apple_isp_init_iommu(struct apple_isp *isp)
 
 	isp->fw_iova_mask = isp->hw->fw_iova_mask ?: U64_MAX;
 	for (i = 0; i < ISP_NUM_DARTS; i++) {
-		err = apple_dart_fw_attach(dev, ofw_bus_get_node(dev), i,
+		err = apple_dart_fw_attach_own(dev, ofw_bus_get_node(dev), i,
 		    &isp->darts[i]);
 		if (err != 0) {
 			dev_err(dev, "DART %d: %d\n", i, err);
 			return (-err);
 		}
 	}
+	err = apple_isp_init_darts(isp);
+	if (err)
+		return (err);
+
+	err = apple_isp_map_fw_segments(isp);
+	if (err)
+		return (err);
 
 	err = apple_isp_init_heap(isp);
 	if (err)
@@ -753,6 +904,9 @@ apple_isp_detach(device_t dev)
 		    rman_get_rid(isp->irq_res), isp->irq_res);
 	if (isp->dapf != NULL)
 		pmap_unmapdev(isp->dapf, isp->dapf_size);
+	for (int i = 0; i < ISP_NUM_DARTS; i++)
+		if (isp->dart_regs[i] != NULL)
+			pmap_unmapdev(isp->dart_regs[i], isp->dart_regs_size[i]);
 	if (isp->wdt != NULL)
 		bus_release_resource(dev, SYS_RES_MEMORY,
 		    rman_get_rid(isp->wdt), isp->wdt);

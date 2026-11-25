@@ -313,6 +313,9 @@ struct apple_isp {
 	unsigned int num_dapf;
 
 	struct apple_dart_fw *darts[ISP_NUM_DARTS];
+	/* their registers, for the stream remaps and fault reports */
+	void *dart_regs[ISP_NUM_DARTS];
+	bus_size_t dart_regs_size[ISP_NUM_DARTS];
 	vmem_t *iovas;
 	u64 iova_size;
 	u64 fw_iova_mask;
@@ -485,6 +488,7 @@ void *apple_isp_translate(struct apple_isp *isp, struct isp_surf *surf,
 	apple_isp_translate((isp), (isp)->ipc_surf, (iova), (size))
 void isp_wake(struct apple_isp *isp);
 int apple_isp_program_dapf(struct apple_isp *isp);
+void apple_isp_dart_report(struct apple_isp *isp, bool clear);
 
 /* apple_isp_fw.c */
 int apple_isp_alloc_firmware_surface(struct apple_isp *isp);

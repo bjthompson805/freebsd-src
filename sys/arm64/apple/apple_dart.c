@@ -754,6 +754,59 @@ apple_dart_fw_attach(device_t dev, phandle_t node, int index,
 	return (0);
 }
 
+/*
+ * apple_dart_fw_attach(), and where the stream has no live table, first give
+ * it an empty one of ours (uncached, as apple_dart_fw_new_table()'s), so the
+ * fw interface manages it the same way. For a coprocessor whose boot loader
+ * left its DART bare (the M5 ISP under an m1n1 without ISP17a support).
+ */
+int
+apple_dart_fw_attach_own(device_t dev, phandle_t node, int index,
+    struct apple_dart_fw **fwp)
+{
+	pcell_t *cells;
+	phandle_t dart;
+	uint64_t *root;
+	vm_paddr_t pa;
+	u_int sid;
+	int error, n;
+
+	error = apple_dart_fw_attach(dev, node, index, fwp);
+	if (error != ENXIO)
+		return (error);
+
+	n = OF_getencprop_alloc_multi(node, "iommus", sizeof(*cells),
+	    (void **)&cells);
+	if (n < 2 * index + 2) {
+		OF_prop_free(cells);
+		return (EINVAL);
+	}
+	dart = OF_node_from_xref(cells[2 * index]);
+	sid = cells[2 * index + 1];
+	OF_prop_free(cells);
+
+	root = kmem_alloc_contig(DART_PAGE_SIZE, M_WAITOK | M_ZERO, 0,
+	    (1ul << DART_IOVA_BITS) - 1, DART_PAGE_SIZE, 0,
+	    VM_MEMATTR_UNCACHEABLE);
+	if (root == NULL)
+		return (ENOMEM);
+	pa = pmap_kextract((vm_offset_t)root);
+	cpu_dcache_wbinv_range((void *)PHYS_TO_DMAP(pa), DART_PAGE_SIZE);
+	memset(root, 0, DART_PAGE_SIZE);
+	dsb(sy);
+	sx_xlock(&apple_dart_lock);
+	error = apple_dart_setup_table(dev, dart, sid, root);
+	sx_xunlock(&apple_dart_lock);
+	if (error != 0) {
+		kmem_free(root, DART_PAGE_SIZE);
+		return (error);
+	}
+	device_printf(dev, "DART sid %u: own table at %#jx\n", sid,
+	    (uintmax_t)pa);
+	/* The root is leaked on purpose: the DART walks it from now on. */
+	return (apple_dart_fw_attach(dev, node, index, fwp));
+}
+
 int
 apple_dart_fw_map(struct apple_dart_fw *fw, vm_paddr_t pa, size_t size,
     uint64_t *iovap)

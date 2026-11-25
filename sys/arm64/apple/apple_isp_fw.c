@@ -377,6 +377,7 @@ isp_firmware_boot_stage1(struct apple_isp *isp)
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
 
+	apple_isp_dart_report(isp, true);
 	isp_coproc_write32(isp, isp->hw->coproc_control, 0x0);
 	isp_coproc_write32(isp, isp->hw->coproc_control, 0x10);
 	isp->fw.started = true;
@@ -386,6 +387,10 @@ isp_firmware_boot_stage1(struct apple_isp *isp)
 		isp_err(isp,
 		    "never received first magic number from firmware (0x%x)\n",
 		    isp_gpio_read32(isp, ISP_GPIO_7));
+		apple_isp_dart_report(isp, false);
+		device_printf(isp->dev, "coproc control %#x status %#x\n",
+		    isp_coproc_read32(isp, isp->hw->coproc_control),
+		    isp_coproc_read32(isp, isp->hw->coproc_status));
 		err = -ENODEV;
 		goto shutdown;
 	}
