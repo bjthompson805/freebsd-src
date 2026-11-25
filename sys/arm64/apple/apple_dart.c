@@ -247,7 +247,15 @@ apple_dart_lookup(uint64_t iova, size_t size, vm_paddr_t *pap)
 }
 
 static int
-apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1);
+apple_dart_setup_table_tcr(device_t dev, phandle_t dart, u_int sid,
+    uint64_t *l1, uint32_t tcrval);
+
+static int
+apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1)
+{
+	return (apple_dart_setup_table_tcr(dev, dart, sid, l1,
+	    DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL));
+}
 
 static int
 apple_dart_setup_one(device_t dev, phandle_t dart, u_int sid)
@@ -255,8 +263,10 @@ apple_dart_setup_one(device_t dev, phandle_t dart, u_int sid)
 	return (apple_dart_setup_table(dev, dart, sid, apple_dart_l1));
 }
 
+/* tcrval: TRANSLATE, with FOUR_LEVEL for a 3-level (42-bit) table */
 static int
-apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1)
+apple_dart_setup_table_tcr(device_t dev, phandle_t dart, u_int sid,
+    uint64_t *l1, uint32_t tcrval)
 {
 	bus_addr_t pa;
 	bus_size_t size;
@@ -291,8 +301,7 @@ apple_dart_setup_table(device_t dev, phandle_t dart, u_int sid, uint64_t *l1)
 	error = apple_dart_tlb_flush(dev, va, sid);
 	if (error != 0)
 		goto out;
-	DART_WR4(va, DART_T8110_TCR(sid),
-	    DART_T8110_TCR_TRANSLATE | DART_T8110_TCR_FOUR_LEVEL);
+	DART_WR4(va, DART_T8110_TCR(sid), tcrval);
 	streams = DART_T8110_ENABLE_STREAMS + 4 * (sid / 32);
 	DART_WR4(va, streams, DART_RD4(va, streams) | (1u << (sid % 32)));
 
@@ -759,9 +768,11 @@ apple_dart_fw_attach(device_t dev, phandle_t node, int index,
  * it an empty one of ours (uncached, as apple_dart_fw_new_table()'s), so the
  * fw interface manages it the same way. For a coprocessor whose boot loader
  * left its DART bare (the M5 ISP under an m1n1 without ISP17a support).
+ * levels: 2 (IOVA[35:25], [24:14]; TCR TRANSLATE only, as macOS runs the
+ * M5 ISP DARTs) or 3 (42 bits, FOUR_LEVEL).
  */
 int
-apple_dart_fw_attach_own(device_t dev, phandle_t node, int index,
+apple_dart_fw_attach_own(device_t dev, phandle_t node, int index, int levels,
     struct apple_dart_fw **fwp)
 {
 	pcell_t *cells;
@@ -795,7 +806,9 @@ apple_dart_fw_attach_own(device_t dev, phandle_t node, int index,
 	memset(root, 0, DART_PAGE_SIZE);
 	dsb(sy);
 	sx_xlock(&apple_dart_lock);
-	error = apple_dart_setup_table(dev, dart, sid, root);
+	error = apple_dart_setup_table_tcr(dev, dart, sid, root,
+	    DART_T8110_TCR_TRANSLATE |
+	    (levels == 3 ? DART_T8110_TCR_FOUR_LEVEL : 0));
 	sx_xunlock(&apple_dart_lock);
 	if (error != 0) {
 		kmem_free(root, DART_PAGE_SIZE);

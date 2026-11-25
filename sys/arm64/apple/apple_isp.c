@@ -554,6 +554,61 @@ apple_isp_map_fw_segments(struct apple_isp *isp)
 	(*(volatile u32 *)((char *)(isp)->dart_regs[i] + (r)) = (v))
 
 /*
+ * The rest of the DART setup macOS 27.2 does on T8142 (HV trace,
+ * logs/isp-macos-trace-keep.txt): the J815 ADT's dart-tunables-instance-N
+ * (mask, value), streams 0, 4, 5, 8 and 9 enabled (4/5 and 8/9 are the ADT's
+ * exclave-sid pairs), and the protection words of dart-isp reg[6] and [7].
+ */
+static const struct {
+	u32 off, mask, val;
+} isp_dart_tunables[ISP_NUM_DARTS][6] = {
+	{ { 0x20c, 0x80000121, 0x80000121 }, { 0x220, 0xf0f, 0xf0f },
+	  { 0x224, 0xffff, 0x909 }, { 0x300, 0x1f31, 0x1 },
+	  { 0x308, 0x3ffffffc, 0x10000000 }, { 0x310, 0x3ffffffc, 0x3ffffffc } },
+	{ { 0x20c, 0x80000121, 0x80000121 }, { 0x220, 0xf0f0f, 0xf0f0f },
+	  { 0x224, 0xffffff, 0x90909 }, { 0x300, 0x1f31, 0x1 },
+	  { 0x308, 0x3ffffffc, 0x10000000 }, { 0x310, 0x3ffffffc, 0x3ffffffc } },
+	{ { 0x20c, 0x80000021, 0x80000021 }, { 0x220, 0xf0f0f, 0xf0f0f },
+	  { 0x224, 0xffffff, 0x90909 }, { 0x300, 0x1f31, 0x1 },
+	  { 0x308, 0x3ffffffc, 0x10000000 }, { 0x310, 0x3ffffffc, 0x3ffffffc } },
+};
+#define	ISP_T8142_DART_PS6	0x380714000ul	/* dart-isp reg[6] */
+#define	ISP_T8142_DART_PS7	0x388298000ul	/* dart-isp reg[7] */
+
+static void
+isp_or32(vm_paddr_t pa, u32 set)
+{
+	volatile u32 *w = pmap_mapdev(pa, sizeof(u32));
+
+	*w |= set;
+	pmap_unmapdev(__DEVOLATILE(void *, w), sizeof(u32));
+}
+
+static void
+apple_isp_dart_macos_init(struct apple_isp *isp)
+{
+	for (int i = 0; i < ISP_NUM_DARTS; i++) {
+		for (int j = 0; j < 6; j++) {
+			u32 off = isp_dart_tunables[i][j].off;
+
+			DART_WR4(isp, i, off, (DART_RD4(isp, i, off) &
+			    ~isp_dart_tunables[i][j].mask) |
+			    isp_dart_tunables[i][j].val);
+		}
+		DART_WR4(isp, i, ISP_DART_ERROR_MASK_V2, 0);
+		DART_WR4(isp, i, ISP_DART_ENABLE_STREAMS, 0x331);
+		device_printf(isp->dev, "DART %d: macOS init, 0x20c %#x, TCR0 "
+		    "%#x, streams %#x\n", i, DART_RD4(isp, i, 0x20c),
+		    DART_RD4(isp, i, ISP_DART_TCR(0)),
+		    DART_RD4(isp, i, ISP_DART_ENABLE_STREAMS));
+	}
+	isp_or32(ISP_T8142_DART_PS6 + 0x3fec, 0x420);
+	isp_or32(ISP_T8142_DART_PS6 + 0x3fe8, 0x400);
+	isp_or32(ISP_T8142_DART_PS7 + 0x3ff8, BIT(29));
+	isp_or32(ISP_T8142_DART_PS7 + 0x3fec, 0x4);
+}
+
+/*
  * Map the DARTs' registers, and fold the streams apple,remap-streams names
  * onto their targets (the ISP firmware uses several; aurora's DART driver
  * writes these remaps, which a bare DART from the boot loader lacks).
@@ -603,6 +658,7 @@ apple_isp_init_darts(struct apple_isp *isp)
 		OF_prop_free(remap);
 	}
 	OF_prop_free(iommus);
+	apple_isp_dart_macos_init(isp);
 	return (0);
 }
 
@@ -649,7 +705,7 @@ apple_isp_init_iommu(struct apple_isp *isp)
 
 	isp->fw_iova_mask = isp->hw->fw_iova_mask ?: U64_MAX;
 	for (i = 0; i < ISP_NUM_DARTS; i++) {
-		err = apple_dart_fw_attach_own(dev, ofw_bus_get_node(dev), i,
+		err = apple_dart_fw_attach_own(dev, ofw_bus_get_node(dev), i, 2,
 		    &isp->darts[i]);
 		if (err != 0) {
 			dev_err(dev, "DART %d: %d\n", i, err);
