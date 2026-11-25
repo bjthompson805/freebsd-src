@@ -214,6 +214,39 @@ apple_isp_cycle_sys(struct apple_isp *isp)
 	return (0);
 }
 
+/*
+ * Linux's PMGR driver leaves AUTO_ENABLE (bit 28) set in every power state it
+ * turns on, and the ISP firmware only starts with it (HV trace of the Linux
+ * reference boot, logs/isp-linux-trace-keep.txt: ISP_SYS 0x100020ff, ISP_CPU
+ * 0x100000ff, CORE0 0x1f0000ff, ..., ISPSENS 0x140000ff). apple_pmgr clears
+ * it, so set it here on every ISP domain (T8142 addresses, as the DT's).
+ */
+#define	ISP_PMGR_AUTO_ENABLE	BIT(28)
+
+static void
+apple_isp_auto_enable(struct apple_isp *isp)
+{
+	static const vm_paddr_t ps[] = {
+		0x3807002f8,	/* ISP_SYS */
+		0x380704000,	/* ISP_CPU */
+		0x380704008,	/* ISP_CPU_CORE0 */
+		0x380704018,	/* ISP_FE */
+		0x380704020,	/* ISP_DPRX */
+		0x380704030,	/* ISP_STS0 */
+		0x380704048,	/* ISP_BE */
+		0x380704050,	/* ISP_CLR */
+	};
+	volatile u32 *w;
+
+	for (unsigned int i = 0; i < nitems(ps); i++) {
+		w = pmap_mapdev(ps[i], sizeof(u32));
+		/* Write back the same state (minus the W1C flags) with the bit */
+		*w = (*w & ~0x300u) | ISP_PMGR_AUTO_ENABLE;
+		dev_dbg(isp->dev, "PS %#jx: %#x\n", (uintmax_t)ps[i], *w);
+		pmap_unmapdev(__DEVOLATILE(void *, w), sizeof(u32));
+	}
+}
+
 static int
 apple_isp_domains_on(struct apple_isp *isp)
 {
@@ -229,6 +262,7 @@ apple_isp_domains_on(struct apple_isp *isp)
 			return (-ret);
 		}
 	}
+	apple_isp_auto_enable(isp);
 	return (0);
 }
 
@@ -640,7 +674,8 @@ isp_firmware_boot_stage1(struct apple_isp *isp)
 	if (err)
 		goto shutdown;
 
-	err = isp_reset_coproc_t8142(isp);
+	/* As Linux, which starts it (logs/isp-linux-trace-keep.txt) */
+	err = isp_reset_coproc_t8140(isp);
 	if (err < 0)
 		goto shutdown;
 
@@ -650,17 +685,6 @@ isp_firmware_boot_stage1(struct apple_isp *isp)
 
 	if (!isp->fw.started)
 		apple_isp_t8142_dump(isp);
-
-	/*
-	 * macOS 27.2 (HV trace, logs/isp-macos-trace-keep.txt), before the
-	 * GPIOs. It is past the "coproc" window the DT maps: map it alone.
-	 */
-	{
-		volatile u32 *w = pmap_mapdev(rman_get_start(isp->coproc) +
-		    ISP_COPROC_T8142_28A4080, sizeof(u32));
-		*w = 0x1;
-		pmap_unmapdev(__DEVOLATILE(void *, w), sizeof(u32));
-	}
 
 	isp_gpio_write32(isp, ISP_GPIO_0, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_1, 0x0);
