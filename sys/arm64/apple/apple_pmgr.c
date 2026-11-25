@@ -115,3 +115,55 @@ apple_pmgr_power_on_node(device_t dev, phandle_t node)
 
 	return (apple_pmgr_enable_domains(dev, node, 0));
 }
+
+/*
+ * Switch one power domain, the power-domains entry #index of dev's node, on
+ * or off, without its parents (which must already be on). For drivers that
+ * cycle a coprocessor's domains themselves (apple_isp).
+ */
+int
+apple_pmgr_set_domain(device_t dev, int index, bool on)
+{
+	bus_addr_t pa;
+	bus_size_t size;
+	pcell_t *cells, reg;
+	phandle_t ps;
+	vm_offset_t va;
+	uint32_t old, val, want;
+	int error, i, n;
+
+	n = OF_getencprop_alloc_multi(ofw_bus_get_node(dev), "power-domains",
+	    sizeof(*cells), (void **)&cells);
+	if (n <= index) {
+		OF_prop_free(cells);
+		return (ENOENT);
+	}
+	ps = OF_node_from_xref(cells[index]);
+	OF_prop_free(cells);
+	if (!ofw_bus_node_is_compatible(ps, "apple,t8103-pmgr-pwrstate") ||
+	    OF_getencprop(ps, "reg", &reg, sizeof(reg)) <= 0 ||
+	    ofw_reg_to_paddr(OF_parent(ps), 0, &pa, &size, NULL) != 0)
+		return (ENXIO);
+	pa += reg;
+
+	want = on ? PMGR_PS_ACTIVE : 0;
+	error = 0;
+	va = (vm_offset_t)pmap_mapdev(pa, sizeof(uint32_t));
+	old = *(volatile uint32_t *)va;
+	val = old & ~(PMGR_FLAGS | PMGR_RESET | PMGR_PS_TARGET |
+	    PMGR_AUTO_ENABLE | PMGR_PS_RESET | PMGR_BUSY | PMGR_DEV_DISABLE);
+	*(volatile uint32_t *)va = val | want;
+	for (i = 0; i < 100000; i++) {
+		val = *(volatile uint32_t *)va;
+		if (PMGR_PS_ACTUAL(val) == want)
+			break;
+		DELAY(1);
+	}
+	if (bootverbose || PMGR_PS_ACTUAL(val) != want)
+		device_printf(dev, "power domain %#lx %s: %#x -> %#x\n", pa,
+		    on ? "on" : "off", old, val);
+	if (PMGR_PS_ACTUAL(val) != want)
+		error = ETIMEDOUT;
+	pmap_unmapdev((void *)va, sizeof(uint32_t));
+	return (error);
+}

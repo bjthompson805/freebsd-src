@@ -601,14 +601,17 @@ apple_dart_fw_chunk_ok(struct apple_dart_fw *fw, uint64_t iova)
 	return (ours);
 }
 
-/* Whether [iova, iova + size), inside one leaf, is all vacant and ours to use. */
+/*
+ * Whether [iova, iova + size), inside one leaf, is all vacant and ours to use;
+ * with vacant, also in a leaf of the firmware's.
+ */
 static bool
 apple_dart_fw_free(struct apple_dart_fw *fw, uint64_t iova, size_t size,
-    uint64_t *busyp)
+    uint64_t *busyp, bool vacant)
 {
 	uint64_t *leaf, off;
 
-	if (!apple_dart_fw_chunk_ok(fw, iova)) {
+	if (!vacant && !apple_dart_fw_chunk_ok(fw, iova)) {
 		*busyp = rounddown2(iova, DART_FW_CHUNK) + DART_FW_CHUNK - 1;
 		return (false);
 	}
@@ -665,7 +668,10 @@ apple_dart_fw_attach(device_t dev, phandle_t node, int index,
 	dart = OF_node_from_xref(cells[2 * index]);
 	sid = cells[2 * index + 1];
 	OF_prop_free(cells);
+	/* The client's window, or else the whole DART's (the ISP's). */
 	if (OF_getencprop(node, "apple,dma-range", range, sizeof(range)) !=
+	    sizeof(range) &&
+	    OF_getencprop(dart, "apple,dma-range", range, sizeof(range)) !=
 	    sizeof(range))
 		return (EINVAL);
 	base = roundup2((uint64_t)range[0] << 32 | range[1], DART_PAGE_SIZE);
@@ -765,7 +771,7 @@ apple_dart_fw_map(struct apple_dart_fw *fw, vm_paddr_t pa, size_t size,
 		if (rounddown2(iova, DART_FW_CHUNK) !=
 		    rounddown2(iova + size - 1, DART_FW_CHUNK))
 			iova = rounddown2(iova + size - 1, DART_FW_CHUNK);
-		else if (apple_dart_fw_free(fw, iova, size, &busy))
+		else if (apple_dart_fw_free(fw, iova, size, &busy, false))
 			break;
 		else
 			iova = rounddown2(busy, DART_PAGE_SIZE) + DART_PAGE_SIZE;
@@ -786,9 +792,9 @@ apple_dart_fw_map(struct apple_dart_fw *fw, vm_paddr_t pa, size_t size,
 	return (error);
 }
 
-int
-apple_dart_fw_map_at(struct apple_dart_fw *fw, uint64_t iova, vm_paddr_t pa,
-    size_t size)
+static int
+apple_dart_fw_map_at_flags(struct apple_dart_fw *fw, uint64_t iova,
+    vm_paddr_t pa, size_t size, bool vacant)
 {
 	uint64_t off, len, busy;
 	int error;
@@ -802,7 +808,7 @@ apple_dart_fw_map_at(struct apple_dart_fw *fw, uint64_t iova, vm_paddr_t pa,
 	for (off = 0; off < size; off += len) {
 		len = MIN(size - off, roundup2(iova + off + 1, DART_FW_CHUNK) -
 		    (iova + off));
-		if (!apple_dart_fw_free(fw, iova + off, len, &busy)) {
+		if (!apple_dart_fw_free(fw, iova + off, len, &busy, vacant)) {
 			device_printf(fw->dev, "DART sid %u: IOVA %#jx is "
 			    "taken\n", fw->sid, (uintmax_t)busy);
 			error = EBUSY;
@@ -813,6 +819,22 @@ apple_dart_fw_map_at(struct apple_dart_fw *fw, uint64_t iova, vm_paddr_t pa,
 		error = apple_dart_fw_enter(fw, iova, pa, size);
 	mtx_unlock(&fw->mtx);
 	return (error);
+}
+
+int
+apple_dart_fw_map_at(struct apple_dart_fw *fw, uint64_t iova, vm_paddr_t pa,
+    size_t size)
+{
+
+	return (apple_dart_fw_map_at_flags(fw, iova, pa, size, false));
+}
+
+int
+apple_dart_fw_map_vacant(struct apple_dart_fw *fw, uint64_t iova,
+    vm_paddr_t pa, size_t size)
+{
+
+	return (apple_dart_fw_map_at_flags(fw, iova, pa, size, true));
 }
 
 int
@@ -848,6 +870,35 @@ apple_dart_fw_lookup(struct apple_dart_fw *fw, uint64_t iova, size_t size,
 	mtx_unlock(&fw->mtx);
 	if (error == 0)
 		*pap = first | (iova & (DART_PAGE_SIZE - 1));
+	return (error);
+}
+
+int
+apple_dart_fw_unmap(struct apple_dart_fw *fw, uint64_t iova, size_t size)
+{
+	uint64_t *leaf, off;
+	int error;
+
+	size = roundup2(size, DART_PAGE_SIZE);
+	if ((iova & (DART_PAGE_SIZE - 1)) != 0 || size == 0 ||
+	    iova < fw->base || iova + size > fw->end || iova + size < iova)
+		return (EINVAL);
+	error = 0;
+	mtx_lock(&fw->mtx);
+	/* The caller's own pages, which may be in a firmware leaf (map_vacant). */
+	for (off = 0; off < size; off += DART_PAGE_SIZE) {
+		leaf = apple_dart_fw_leaf(fw, iova + off, false, NULL);
+		if (leaf == NULL) {
+			error = ENOENT;
+			continue;
+		}
+		leaf[((iova + off) >> DART_PAGE_SHIFT) & 0x7ff] = 0;
+	}
+	if (iova < fw->next)
+		fw->next = iova;
+	if (apple_dart_tlb_flush(fw->dev, fw->regs, fw->sid) != 0)
+		error = EIO;
+	mtx_unlock(&fw->mtx);
 	return (error);
 }
 

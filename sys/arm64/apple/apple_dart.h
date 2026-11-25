@@ -22,9 +22,9 @@ int	apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid,
 /*
  * Streams whose page tables firmware set up and owns (locked DARTs, the
  * AOP's): buffers go into vacant entries of the live tables, inside the
- * device's "apple,dma-range" window. A valid entry is never rewritten and
- * nothing is ever unmapped. No call after attach sleeps (callers may hold
- * a mutex); the DART must be powered.
+ * device's "apple,dma-range" window (else the DART's). A valid entry is
+ * never rewritten; only apple_dart_fw_unmap() takes entries away. No call
+ * after attach sleeps (callers may hold a mutex); the DART must be powered.
  *
  * apple_dart_fw_attach: the stream of node's "iommus" entry #index, with
  *   node's window. Prints TCR/TTBR. ENXIO only when the stream has no live
@@ -39,6 +39,10 @@ int	apple_dart_map_stream(device_t dev, phandle_t dart, u_int sid,
  *   address on several streams); EBUSY if any page of it is taken.
  * apple_dart_fw_lookup: where [iova, iova + size) is in memory, if mapped
  *   contiguously (ENOENT, EFAULT otherwise), for firmware-placed buffers.
+ * apple_dart_fw_map_vacant: map_at that may also fill vacant entries of a
+ *   firmware leaf (a coprocessor whose own memory shares the leaf, the ISP).
+ * apple_dart_fw_unmap: drop the caller's pages at [iova, iova + size) (only
+ *   what it mapped), then flush.
  */
 struct apple_dart_fw;
 int	apple_dart_fw_attach(device_t dev, phandle_t node, int index,
@@ -47,8 +51,11 @@ int	apple_dart_fw_map(struct apple_dart_fw *fw, vm_paddr_t pa,
 	    size_t size, uint64_t *iova);
 int	apple_dart_fw_map_at(struct apple_dart_fw *fw, uint64_t iova,
 	    vm_paddr_t pa, size_t size);
+int	apple_dart_fw_map_vacant(struct apple_dart_fw *fw, uint64_t iova,
+	    vm_paddr_t pa, size_t size);
 int	apple_dart_fw_lookup(struct apple_dart_fw *fw, uint64_t iova,
 	    size_t size, vm_paddr_t *pa);
+int	apple_dart_fw_unmap(struct apple_dart_fw *fw, uint64_t iova, size_t size);
 
 struct apple_dart_domain;
 int	apple_dart_domain_create(device_t dev, struct apple_dart_domain **result);
