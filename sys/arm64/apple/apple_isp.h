@@ -27,7 +27,9 @@
 #include <sys/mutex.h>
 #include <sys/queue.h>
 #include <sys/rman.h>
+#include <sys/selinfo.h>
 #include <sys/sx.h>
+#include <sys/callout.h>
 #include <sys/taskqueue.h>
 #include <sys/vmem.h>
 #include <machine/atomic.h>
@@ -142,6 +144,7 @@ struct isp_surf {
 	void *virt;		/* write-combining kernel mapping */
 	u_int refcount;
 	bool gc;
+	bool submitted;		/* a metadata buffer the firmware holds */
 	bool iova_reserved;	/* @iova comes from &apple_isp.iovas */
 };
 TAILQ_HEAD(isp_surf_list, isp_surf);
@@ -365,6 +368,36 @@ struct apple_isp {
 
 	struct isp_channel *ipc_stale;
 	bool ipc_failed;
+
+	/* Streaming (apple_isp_video.c) */
+	struct cdev *cdev;
+	bool opened;
+	bool streaming;
+	unsigned int frame_rate;	/* frames per second */
+	unsigned int sequence;
+	struct mtx buf_mtx;		/* the buffer lists and states */
+	struct isp_vbuf *vbufs;
+	unsigned int nbufs;
+	TAILQ_HEAD(, isp_vbuf) bufs_pending;	/* queued, not given yet */
+	TAILQ_HEAD(, isp_vbuf) bufs_submitted;	/* the firmware has them */
+	TAILQ_HEAD(, isp_vbuf) bufs_done;	/* filled, for DQBUF */
+	struct selinfo sel;
+	struct isp_surf *meta_surfs[ISP_MAX_BUFFERS];
+	struct isp_surf *capmeta_surfs[ISP_CAPMETA_BUFFERS];
+	struct callout wdt_callout;
+	bool wdt_running;
+};
+
+/* A capture buffer: one surface holding both NV12 planes */
+struct isp_vbuf {
+	TAILQ_ENTRY(isp_vbuf) link;
+	struct isp_surf *surf;
+	unsigned int index;
+	enum { ISP_VBUF_USER, ISP_VBUF_PENDING, ISP_VBUF_SUBMITTED,
+	    ISP_VBUF_DONE } state;
+	bool error;
+	unsigned int sequence;
+	struct timeval timestamp;
 };
 
 /* Coprocessor registers */
@@ -511,5 +544,20 @@ void ipc_bt_complete(struct apple_isp *isp);
 
 /* apple_isp_cam.c */
 int apple_isp_detect_camera(struct apple_isp *isp);
+int apple_isp_start_camera(struct apple_isp *isp);
+void apple_isp_stop_camera(struct apple_isp *isp);
+int apple_isp_start_capture(struct apple_isp *isp);
+void apple_isp_stop_capture(struct apple_isp *isp);
+void apple_isp_wdt_stop(struct apple_isp *isp);
+int isp_set_preset(struct apple_isp *isp, struct isp_format *fmt,
+    struct isp_preset *preset);
+
+/* apple_isp_video.c */
+int apple_isp_setup_video(struct apple_isp *isp);
+void apple_isp_remove_video(struct apple_isp *isp);
+
+#define	ISP_FRAME_RATE_SCALE	256
+#define	ISP_FRAME_RATE_MIN	15
+#define	ISP_FRAME_RATE_DEFAULT	30
 
 #endif /* _ARM64_APPLE_APPLE_ISP_H_ */

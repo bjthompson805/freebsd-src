@@ -957,6 +957,11 @@ apple_isp_attach(device_t dev)
 		device_printf(dev, "failed to detect camera: %d\n", err);
 		goto fail;
 	}
+	if ((err = -apple_isp_setup_video(isp)) != 0) {
+		device_printf(dev, "failed to set up the video device: %d\n",
+		    err);
+		goto fail;
+	}
 	return (0);
 
 fail:
@@ -969,6 +974,7 @@ apple_isp_detach(device_t dev)
 {
 	struct apple_isp *isp = device_get_softc(dev);
 
+	apple_isp_remove_video(isp);
 	if (isp->tq != NULL) {
 		sx_xlock(&isp->video_lock);
 		apple_isp_firmware_halt(isp);
