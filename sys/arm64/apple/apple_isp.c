@@ -539,6 +539,8 @@ apple_isp_map_fw_segments(struct apple_isp *isp)
 }
 
 #define	ISP_DART_ERROR		0x100
+#define	ISP_DART_ERROR_MASK	0x104
+#define	ISP_DART_ERROR_MASK_V2	0x4060
 #define	ISP_DART_ERROR_ADDR_LO	0x170
 #define	ISP_DART_ERROR_ADDR_HI	0x174
 #define	ISP_DART_ERROR_STREAMS	0x1c0
@@ -613,6 +615,16 @@ apple_isp_dart_report(struct apple_isp *isp, bool clear)
 	for (int i = 0; i < ISP_NUM_DARTS; i++) {
 		if (isp->dart_regs[i] == NULL)
 			continue;
+		if (clear) {
+			/* A masked fault never latches: unmask them all. */
+			device_printf(isp->dev, "DART %d: error mask %#x/%#x, "
+			    "streams %#x, unmasking\n", i,
+			    DART_RD4(isp, i, ISP_DART_ERROR_MASK),
+			    DART_RD4(isp, i, ISP_DART_ERROR_MASK_V2),
+			    DART_RD4(isp, i, ISP_DART_ENABLE_STREAMS));
+			DART_WR4(isp, i, ISP_DART_ERROR_MASK, 0);
+			DART_WR4(isp, i, ISP_DART_ERROR_MASK_V2, 0);
+		}
 		err = DART_RD4(isp, i, ISP_DART_ERROR);
 		if (err & BIT(31))
 			device_printf(isp->dev, "DART %d fault: error %#x "
