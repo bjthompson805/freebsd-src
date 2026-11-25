@@ -343,7 +343,7 @@ static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
 #define	MT_SCROLL_UNITS		60	/* touch units per wheel step */
 #define	MT_TAP_MS		250	/* longest tap */
 #define	MT_TAP_MOVE		150	/* most movement in a tap (~1.5 mm) */
-#define	MT_HOLD_MS		120	/* pointer motion held back as a tap */
+#define	MT_HOLD_MS		250	/* pointer motion held back as a tap */
 /*
  * Pointer gain, in 1/MT_GAIN_FULL: slow, fine movement gets 5/8 of the
  * full gain, rising linearly to full at MT_GAIN_SPEED touch units per
