@@ -451,6 +451,43 @@ apple_isp_t8142_power(struct apple_isp *isp)
 	return (0);
 }
 
+/*
+ * Before the first start: the firmware text and data as iBoot left them
+ * (their first words, through DART 0), and the ISP power words, to set
+ * against what macOS has there when it starts the core (the HV trace).
+ */
+static void
+apple_isp_t8142_dump(struct apple_isp *isp)
+{
+	static const u64 seg[] = { 0x0, 0xd68000 };
+	static const vm_paddr_t ps[] = {
+		0x3807002f8, 0x380700190, 0x380700198, 0x380704000, 0x380704008,
+		0x380704010, 0x380704018, 0x380704020, 0x380704030, 0x380704048,
+		0x380704050, 0x380724000, 0x380724060, 0x3807240a0, 0x3807240a8,
+	};
+	volatile u32 *w;
+	vm_paddr_t pa;
+
+	for (unsigned int i = 0; i < nitems(seg); i++) {
+		if (apple_dart_fw_lookup(isp->darts[0], seg[i], 32, &pa) != 0) {
+			device_printf(isp->dev, "fw 0x%jx: not mapped\n",
+			    (uintmax_t)seg[i]);
+			continue;
+		}
+		w = pmap_mapdev_attr(trunc_page(pa), PAGE_SIZE,
+		    VM_MEMATTR_WRITE_COMBINING);
+		device_printf(isp->dev, "fw 0x%jx @%#jx: %08x %08x %08x %08x "
+		    "%08x %08x %08x %08x\n", (uintmax_t)seg[i], (uintmax_t)pa,
+		    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+		pmap_unmapdev(__DEVOLATILE(void *, w), PAGE_SIZE);
+	}
+	for (unsigned int i = 0; i < nitems(ps); i++) {
+		w = pmap_mapdev(ps[i], sizeof(u32));
+		device_printf(isp->dev, "ps %#jx = %#x\n", (uintmax_t)ps[i], *w);
+		pmap_unmapdev(__DEVOLATILE(void *, w), sizeof(u32));
+	}
+}
+
 static int
 isp_reset_coproc_t8142(struct apple_isp *isp)
 {
@@ -459,6 +496,15 @@ isp_reset_coproc_t8142(struct apple_isp *isp)
 	err = apple_isp_t8142_power(isp);
 	if (err)
 		return (err);
+	/*
+	 * A quiesce request (ours, at the last stop) survives an ISP_SYS that
+	 * doesn't really lose power, and would keep the core off its fabric.
+	 */
+	device_printf(isp->dev, "quiesce word %#x, clearing\n",
+	    isp_coproc_read32(isp, isp->hw->coproc_quiesce));
+	isp_coproc_write32(isp, isp->hw->coproc_quiesce, 0x0);
+	device_printf(isp->dev, "quiesce word now %#x\n",
+	    isp_coproc_read32(isp, isp->hw->coproc_quiesce));
 	isp_coproc_write32(isp, ISP_COPROC_T8142_C00, 0x0);
 	isp_coproc_write32(isp, ISP_COPROC_FABRIC_0_T8140, 0x0);
 	isp_coproc_write32(isp, ISP_COPROC_FABRIC_1_T8140, 0x0);
@@ -556,6 +602,9 @@ isp_firmware_boot_stage1(struct apple_isp *isp)
 	err = isp_coproc_entry(isp);
 	if (err < 0)
 		goto shutdown;
+
+	if (!isp->fw.started)
+		apple_isp_t8142_dump(isp);
 
 	/*
 	 * macOS 27.2 (HV trace, logs/isp-macos-trace-keep.txt), before the
