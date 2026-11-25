@@ -29,14 +29,13 @@ include		"std.allwinner"
 include		"std.altera"
 include		"std.amd"
 include		"std.apple"
-options 	ARM64_16K_PAGES		# m5: Apple DART/DCP/AGX 16K granule
 include		"std.arm"
 include		"std.azure"
 include		"std.broadcom"
 include		"std.cavium"
 include		"std.ec2"
 include		"std.hyperv"
-nodevice	hyperv		# m5: vmbus assumes 4K pages (ARM64_16K_PAGES); not on a Mac
+nodevice	hyperv		# m5: not on a Mac (and vmbus assumes 4K pages, see GENERIC16K)
 include		"std.hisilicon"
 include		"std.imx"
 include		"std.marvell"

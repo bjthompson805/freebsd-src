@@ -1,0 +1,8 @@
+#
+# GENERIC16K -- the M5 GENERIC kernel with 16 KiB pages, the granule of
+# Apple's DARTs, DCP and the GPU's UAT. GENERIC (4 KiB) is the default: Wine
+# and other software assume 4 KiB pages.
+#
+include		GENERIC
+ident		GENERIC16K
+options 	ARM64_16K_PAGES
