@@ -356,11 +356,13 @@ static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
 /*
  * Pointer gain, in 1/MT_GAIN_FULL: slow, fine movement gets 5/8 of the
  * full gain, rising linearly to full at MT_GAIN_SPEED touch units per
- * frame (frames come at ~120 Hz, so ~35 mm/s). libinput slows slow
+ * frame (frames come at ~120 Hz, so ~35 mm/s) and on to MT_GAIN_MAX, 2.5x,
+ * at ~90 mm/s so a fast swipe crosses the screen. libinput slows slow
  * motion further on its own.
  */
 #define	MT_GAIN_FULL		16
 #define	MT_GAIN_MIN		10
+#define	MT_GAIN_MAX		40
 #define	MT_GAIN_SPEED		30
 
 /* Report 2: 3 buttons, X, Y, wheel, AC pan (horizontal wheel). */
@@ -512,7 +514,7 @@ mtp_mt_gain(int dx, int dy)
 {
 	int g = (abs(dx) + abs(dy)) * MT_GAIN_FULL / MT_GAIN_SPEED;
 
-	return (MAX(MT_GAIN_MIN, MIN(MT_GAIN_FULL, g)));
+	return (MAX(MT_GAIN_MIN, MIN(MT_GAIN_MAX, g)));
 }
 
 /*
