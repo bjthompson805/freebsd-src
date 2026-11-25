@@ -26,7 +26,8 @@
  * with a wheel: its 0x75 multitouch frames become reports for a descriptor
  * of our own (mtp_mouse_rdesc), so hms(4) drives it. One finger moves the
  * pointer, two scroll, a click with two fingers down is a right click, and
- * so is a quick two-finger tap.
+ * so is a quick two-finger tap. Holding a one-finger click, a second finger
+ * drags.
  *
  * Everything is polled from a callout; no DockChannel/mailbox interrupts.
  */
@@ -145,6 +146,7 @@ struct mtp_iface {
 	/* multi-touch: followed contacts (-1: none) and last position */
 	int			mt_ids[2];
 	int			mt_x, mt_y;	/* finger, or two-finger centre */
+	int			mt_px[2], mt_py[2]; /* each followed contact */
 	int			mt_rx, mt_ry;	/* sub-step remainders */
 	uint8_t			mt_button;	/* latched at press: 1 or 2 */
 	/* the current touch, from first contact until all fingers lift */
@@ -491,7 +493,7 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
     const uint8_t *p, size_t len)
 {
 	const uint8_t *rec;
-	int count, ids[2], n, x, y, dx, dy;
+	int count, ids[2], px[2], py[2], n, x, y, dx, dy, ddx, ddy;
 	uint8_t *r;
 	bool pressed, tap;
 
@@ -507,23 +509,39 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 	for (int i = 0; i < n; i++) {
 		rec = p + MT_HDR_LEN + i * MT_REC_LEN;
 		ids[i] = rec[MT_REC_ID];
-		x += (int16_t)le16dec(rec + MT_REC_X);
-		y += (int16_t)le16dec(rec + MT_REC_Y);
+		px[i] = (int16_t)le16dec(rec + MT_REC_X);
+		py[i] = (int16_t)le16dec(rec + MT_REC_Y);
+		x += px[i];
+		y += py[i];
 	}
 	if (n > 0) {
 		x /= n;
 		y /= n;
 	}
-	dx = dy = 0;
+	dx = dy = ddx = ddy = 0;
 	if (n > 0 && ids[0] == ifc->mt_ids[0] && ids[1] == ifc->mt_ids[1]) {
 		dx = x - ifc->mt_x;
 		dy = y - ifc->mt_y;		/* touch y grows upward */
+		/* Dragging: the contact that moved most (not the clicker). */
+		for (int i = 0; i < n; i++) {
+			int cx = px[i] - ifc->mt_px[i];
+			int cy = py[i] - ifc->mt_py[i];
+
+			if (abs(cx) + abs(cy) > abs(ddx) + abs(ddy)) {
+				ddx = cx;
+				ddy = cy;
+			}
+		}
 	} else
 		ifc->mt_rx = ifc->mt_ry = 0;
 	ifc->mt_ids[0] = ids[0];
 	ifc->mt_ids[1] = ids[1];
 	ifc->mt_x = x;
 	ifc->mt_y = y;
+	for (int i = 0; i < n; i++) {
+		ifc->mt_px[i] = px[i];
+		ifc->mt_py[i] = py[i];
+	}
 
 	pressed = (p[MT_HDR_BUTTONS] & 1) != 0;
 	if (!pressed)
@@ -562,6 +580,12 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 	if (n == 1) {
 		ifc->mt_rx += dx;
 		ifc->mt_ry -= dy;		/* screen y grows downward */
+		r[2] = (int8_t)mtp_mt_steps(&ifc->mt_rx, MT_POINTER_UNITS);
+		r[3] = (int8_t)mtp_mt_steps(&ifc->mt_ry, MT_POINTER_UNITS);
+	} else if (n == 2 && ifc->mt_button == 1) {
+		/* Click with one finger, drag with another. */
+		ifc->mt_rx += ddx;
+		ifc->mt_ry -= ddy;
 		r[2] = (int8_t)mtp_mt_steps(&ifc->mt_rx, MT_POINTER_UNITS);
 		r[3] = (int8_t)mtp_mt_steps(&ifc->mt_ry, MT_POINTER_UNITS);
 	} else if (n == 2 && ifc->mt_button == 0) {
