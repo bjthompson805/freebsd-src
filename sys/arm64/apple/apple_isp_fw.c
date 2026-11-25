@@ -119,11 +119,37 @@ apple_isp_cycle_sys(struct apple_isp *isp)
 			ttbr[i][s] = IDART(isp, i, ISP_DART_TTBR(s));
 		}
 	}
+	/*
+	 * As macOS 27.2 before it cuts ISP_SYS: 2 into two words past the DT's
+	 * coproc window, which read back 6 (a power-down handshake).
+	 */
+	{
+		static const bus_size_t hs[] = { 0x2c80008, 0x2c7c008 };
+		volatile u32 *w;
+
+		for (i = 0; i < (int)nitems(hs); i++) {
+			w = pmap_mapdev(rman_get_start(isp->coproc) + hs[i],
+			    sizeof(u32));
+			*w = 0x2;
+			DELAY(10);
+			device_printf(isp->dev, "ISP_SYS handshake %#jx: %#x\n",
+			    (uintmax_t)hs[i], *w);
+			pmap_unmapdev(__DEVOLATILE(void *, w), sizeof(u32));
+		}
+	}
 	err = apple_pmgr_set_domain(isp->dev, 0, false);
 	if (err == 0)
 		err = apple_pmgr_set_domain(isp->dev, 0, true);
 	if (err != 0)
 		return (-err);
+	/* macOS powers it back with AUTO_ENABLE (0x1000200f) */
+	{
+		volatile u32 *ps = pmap_mapdev(0x3807002f8ul, sizeof(u32));
+
+		*ps |= BIT(28);
+		device_printf(isp->dev, "ISP_SYS %#x\n", *ps);
+		pmap_unmapdev(__DEVOLATILE(void *, ps), sizeof(u32));
+	}
 	for (i = 0; i < ISP_NUM_DARTS; i++) {
 		device_printf(isp->dev, "DART %d after the cycle: TCR0 %#x "
 		    "TTBR0 %#x\n", i, IDART(isp, i, ISP_DART_TCR(0)),
@@ -190,6 +216,10 @@ apple_isp_power_up_domains(struct apple_isp *isp)
 		    (uintmax_t)bus_read_8(isp->coproc, ISP_COPROC_RVBAR));
 	}
 	if (apple_isp_sys_cycle) {
+		/* macOS quiesces the coprocessor before its domains go off */
+		isp_coproc_write32(isp, isp->hw->coproc_quiesce,
+		    ISP_COPROC_QUIESCED);
+		DELAY(100);
 		apple_isp_domains_off(isp);
 		ret = apple_isp_cycle_sys(isp);
 		if (ret == 0)
@@ -372,6 +402,72 @@ isp_reset_coproc_t8140(struct apple_isp *isp)
 }
 
 /*
+ * T8142, as macOS 27.2 starts it (HV trace, logs/isp-macos-trace-keep.txt):
+ * no EDPRCR request, no IRQ mask or reset acknowledge words; 0xc00 and the
+ * four fabric words are cleared, where Linux's T8140 sequence sets them to
+ * all ones. Before that, the ISP's local PMGR words get bit 31 and the
+ * sensor power states (ISPSENS0/1) go on; see apple_isp_t8142_power().
+ */
+#define	ISP_COPROC_T8142_C00		0xc00
+#define	ISP_COPROC_T8142_28A4080	0x28a4080
+
+/* ADT /arm-io/isp reg[2], and the ISPSENS0/1 power states of the PMGR */
+#define	ISP_T8142_LOCAL_PMGR		0x380724000ul
+#define	ISP_T8142_ISPSENS0		0x380700190ul
+#define	ISP_T8142_ISPSENS1		0x380700198ul
+
+static void
+isp_t8142_sens_on(struct apple_isp *isp, vm_paddr_t pa)
+{
+	volatile u32 *ps;
+	u32 v;
+	int i;
+
+	ps = pmap_mapdev(pa, sizeof(u32));
+	/* macOS: 0x4000244 -> 0x400004f, ACTUAL to 0xf, then | AUTO_ENABLE */
+	v = (*ps & ~0x30fu) | 0xf;
+	*ps = v;
+	for (i = 0; i < 10000 && ((*ps >> 4) & 0xf) != 0xf; i++)
+		DELAY(1);
+	*ps = v | BIT(28);
+	dev_dbg(isp->dev, "ISPSENS %#jx: %#x\n", (uintmax_t)pa, *ps);
+	pmap_unmapdev(__DEVOLATILE(void *, ps), sizeof(u32));
+}
+
+static int
+apple_isp_t8142_power(struct apple_isp *isp)
+{
+	static const bus_size_t local[] = { 0x0, 0x60, 0xa0, 0xa8 };
+	volatile u32 *lp;
+
+	lp = pmap_mapdev(ISP_T8142_LOCAL_PMGR, 0x4000);
+	for (unsigned int i = 0; i < nitems(local); i++)
+		lp[local[i] / 4] |= 0x80000000u;
+	dev_dbg(isp->dev, "local PMGR %#x %#x %#x %#x\n", lp[0], lp[0x60 / 4],
+	    lp[0xa0 / 4], lp[0xa8 / 4]);
+	pmap_unmapdev(__DEVOLATILE(void *, lp), 0x4000);
+	isp_t8142_sens_on(isp, ISP_T8142_ISPSENS0);
+	isp_t8142_sens_on(isp, ISP_T8142_ISPSENS1);
+	return (0);
+}
+
+static int
+isp_reset_coproc_t8142(struct apple_isp *isp)
+{
+	int err;
+
+	err = apple_isp_t8142_power(isp);
+	if (err)
+		return (err);
+	isp_coproc_write32(isp, ISP_COPROC_T8142_C00, 0x0);
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_0_T8140, 0x0);
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_1_T8140, 0x0);
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_2_T8140, 0x0);
+	isp_coproc_write32(isp, ISP_COPROC_FABRIC_3_T8140, 0x0);
+	return (0);
+}
+
+/*
  * The coprocessor starts at its reset vector, which the bootloader sets and
  * which bit 0 latches. Note it at the first start; where a power-off cleared
  * it, set it again.
@@ -453,13 +549,24 @@ isp_firmware_boot_stage1(struct apple_isp *isp)
 	if (err)
 		goto shutdown;
 
-	err = isp_reset_coproc_t8140(isp);
+	err = isp_reset_coproc_t8142(isp);
 	if (err < 0)
 		goto shutdown;
 
 	err = isp_coproc_entry(isp);
 	if (err < 0)
 		goto shutdown;
+
+	/*
+	 * macOS 27.2 (HV trace, logs/isp-macos-trace-keep.txt), before the
+	 * GPIOs. It is past the "coproc" window the DT maps: map it alone.
+	 */
+	{
+		volatile u32 *w = pmap_mapdev(rman_get_start(isp->coproc) +
+		    ISP_COPROC_T8142_28A4080, sizeof(u32));
+		*w = 0x1;
+		pmap_unmapdev(__DEVOLATILE(void *, w), sizeof(u32));
+	}
 
 	isp_gpio_write32(isp, ISP_GPIO_0, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_1, 0x0);
