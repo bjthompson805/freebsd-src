@@ -401,11 +401,40 @@ apple_ans_detach(device_t dev)
 	return (EBUSY);
 }
 
+/*
+ * After the NVMe shutdown (CC.SHN), quiesce the IOP and put it to sleep, then
+ * stop its CPU, as Linux's apple_nvme_shutdown: the SSD keeps acknowledged
+ * writes in a cache that only this writes back. Without it a reset after
+ * shutdown lost the pool's last ~37 s.
+ */
+static int
+apple_ans_shutdown(device_t dev)
+{
+	struct apple_ans_softc *sc = device_get_softc(dev);
+	int error;
+
+	nvme_shutdown(dev);
+	if (sc->rtk == NULL || apple_rtkit_crashed(sc->rtk))
+		return (0);
+	mtx_lock(&sc->mtx);
+	callout_stop(&sc->poll);
+	error = apple_rtkit_shutdown(sc->rtk);
+	mtx_unlock(&sc->mtx);
+	if (error != 0) {
+		device_printf(dev, "IOP shutdown failed: %d\n", error);
+		return (0);
+	}
+	bus_write_4(sc->asc_res, ASC_CPU_CONTROL, 0);
+	if (bootverbose)
+		device_printf(dev, "IOP asleep, CPU stopped\n");
+	return (0);
+}
+
 static device_method_t apple_ans_methods[] = {
 	DEVMETHOD(device_probe,		apple_ans_probe),
 	DEVMETHOD(device_attach,	apple_ans_attach),
 	DEVMETHOD(device_detach,	apple_ans_detach),
-	DEVMETHOD(device_shutdown,	nvme_shutdown),
+	DEVMETHOD(device_shutdown,	apple_ans_shutdown),
 	DEVMETHOD_END
 };
 

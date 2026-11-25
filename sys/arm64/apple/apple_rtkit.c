@@ -62,6 +62,8 @@
 #define	MGMT_EPMAP_DONE			(1ull << 51)
 #define	MGMT_EPMAP_MORE			1ull
 
+#define	PWR_SLEEP			0x01	/* can be restarted */
+#define	PWR_QUIESCED			0x10	/* running, no messages */
 #define	PWR_ON				0x20
 #define	PWR_INIT			0x220
 
@@ -104,6 +106,7 @@ struct apple_rtkit {
 	u_int			flags;
 
 	uint32_t		iop_power;
+	uint32_t		ap_power;
 	bool			crashed;
 	bool			syslog_on;
 	struct rtkit_buffer	crashlog, syslog, ioreport, oslog;
@@ -367,7 +370,9 @@ rtkit_handle(struct apple_rtkit *rtk, uint32_t ep, uint64_t msg)
 	case EP_MGMT:
 		if (type == MGMT_IOP_PWR_ACK)
 			rtk->iop_power = msg & 0xffff;
-		else if (type != MGMT_AP_PWR)
+		else if (type == MGMT_AP_PWR)
+			rtk->ap_power = msg & 0xffff;
+		else
 			device_printf(rtk->dev, "mgmt message %#jx\n",
 			    (uintmax_t)msg);
 		return (0);
@@ -581,4 +586,50 @@ apple_rtkit_boot(struct apple_rtkit *rtk)
 		return (0);
 	return (apple_rtkit_send(rtk, EP_MGMT, MSG_TYPE_SET(MGMT_AP_PWR) |
 	    PWR_ON));
+}
+
+/* Sends a power state request and polls (up to 1 s) for its ack in *state. */
+static int
+rtkit_set_power(struct apple_rtkit *rtk, uint32_t type, uint32_t want,
+    volatile uint32_t *state)
+{
+	uint64_t msg;
+	uint32_t ep;
+	int error, i;
+
+	if ((error = apple_rtkit_send(rtk, EP_MGMT, MSG_TYPE_SET(type) |
+	    want)) != 0)
+		return (error);
+	for (i = 0; (*state & 0xffff) != want; i++) {
+		if (rtk->crashed)
+			return (EIO);
+		if (i == 100000) {
+			device_printf(rtk->dev, "power state %#x, not %#x\n",
+			    *state, want);
+			return (ETIMEDOUT);
+		}
+		if (rtkit_recv(rtk, &ep, &msg))
+			rtkit_handle(rtk, ep, msg);
+		else
+			DELAY(10);
+	}
+	return (0);
+}
+
+/*
+ * Quiesces the IOP and puts it to sleep, as Linux's apple_rtkit_shutdown: a
+ * storage IOP writes its caches back before acknowledging. Polled, for
+ * shutdown handlers.
+ */
+int
+apple_rtkit_shutdown(struct apple_rtkit *rtk)
+{
+	int error;
+
+	error = rtkit_set_power(rtk, MGMT_AP_PWR, PWR_QUIESCED,
+	    &rtk->ap_power);
+	if (error == 0)
+		error = rtkit_set_power(rtk, MGMT_IOP_PWR, PWR_SLEEP,
+		    &rtk->iop_power);
+	return (error);
 }
