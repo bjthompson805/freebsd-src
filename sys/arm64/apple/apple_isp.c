@@ -107,6 +107,8 @@ static struct ofw_compat_data compat_data[] = {
 	{ NULL,			0 }
 };
 
+static void isp_dart_flush_all(struct apple_isp *isp);
+
 /*
  * Map [pa, pa + size) at iova on all three ISP DARTs. Where two share a
  * table, the second finds the pages mapped already, to the same place.
@@ -128,9 +130,11 @@ isp_dart_map(struct apple_isp *isp, u64 iova, vm_paddr_t pa, u64 size)
 			    i, (uintmax_t)iova, (uintmax_t)size, err);
 			while (--i >= 0)
 				apple_dart_fw_unmap(isp->darts[i], iova, size);
+			isp_dart_flush_all(isp);
 			return (-err);
 		}
 	}
+	isp_dart_flush_all(isp);
 	return (0);
 }
 
@@ -139,6 +143,7 @@ isp_dart_unmap(struct apple_isp *isp, u64 iova, u64 size)
 {
 	for (int i = 0; i < ISP_NUM_DARTS; i++)
 		apple_dart_fw_unmap(isp->darts[i], iova, size);
+	isp_dart_flush_all(isp);
 }
 
 /*
@@ -681,6 +686,53 @@ apple_isp_init_darts(struct apple_isp *isp)
 	return (0);
 }
 
+/*
+ * Flush every stream's TLB on the three DARTs. apple_dart_fw flushes only
+ * the attached stream (0), but the ISP's traffic comes in on the streams
+ * remapped onto it, which keep their own entries: an IOVA mapped again (the
+ * IPC surface of the next firmware start) would still reach the old pages.
+ * Linux's DART driver flushes every stream (0x8100 | sid; see
+ * logs/isp-linux-trace-keep.txt).
+ */
+#define	ISP_DART_TLB_CMD		0x80
+#define	ISP_DART_TLB_CMD_BUSY		BIT(31)
+#define	ISP_DART_TLB_CMD_FLUSH_SID	0x8100	/* V2 | FLUSH_SID */
+
+/*
+ * Off by default: done on every map, it kept the firmware from answering its
+ * first command, and loaded at boot it reset the Mac (2026-11-25).
+ */
+static int apple_isp_flush_all;
+TUNABLE_INT("hw.apple_isp.flush_all", &apple_isp_flush_all);
+
+static void
+isp_dart_flush_all(struct apple_isp *isp)
+{
+	int i, n;
+
+	if (!apple_isp_flush_all)
+		return;
+
+	for (i = 0; i < ISP_NUM_DARTS; i++) {
+		if (isp->dart_regs[i] == NULL)
+			continue;
+		for (u32 sid = 0; sid < 16; sid++) {
+			for (n = 0; n < 1000 && (DART_RD4(isp, i,
+			    ISP_DART_TLB_CMD) & ISP_DART_TLB_CMD_BUSY); n++)
+				DELAY(1);
+			dsb(sy);
+			DART_WR4(isp, i, ISP_DART_TLB_CMD,
+			    ISP_DART_TLB_CMD_FLUSH_SID | sid);
+			for (n = 0; n < 1000 && (DART_RD4(isp, i,
+			    ISP_DART_TLB_CMD) & ISP_DART_TLB_CMD_BUSY); n++)
+				DELAY(1);
+			if (n == 1000)
+				dev_err(isp->dev, "DART %d: TLB flush of sid %u "
+				    "timed out\n", i, sid);
+		}
+	}
+}
+
 /* Report (and with clear, acknowledge) the DARTs' latched faults. */
 void
 apple_isp_dart_report(struct apple_isp *isp, bool clear)
@@ -875,7 +927,8 @@ apple_isp_attach(device_t dev)
 	TAILQ_INIT(&isp->gc);
 	TAILQ_INIT(&isp->gc_released);
 	TASK_INIT(&isp->irq_task, 0, apple_isp_irq_task, isp);
-	isp->tq = taskqueue_create("apple_isp", M_WAITOK,
+	/* Fast: apple_isp_intr() enqueues from the interrupt filter. */
+	isp->tq = taskqueue_create_fast("apple_isp", M_WAITOK,
 	    taskqueue_thread_enqueue, &isp->tq);
 	taskqueue_start_threads(&isp->tq, 1, PI_DISK, "%s",
 	    device_get_nameunit(dev));

@@ -20,6 +20,7 @@
 #include <sys/lock.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/sysctl.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
@@ -202,6 +203,43 @@ apple_pmu_rtc_settime(device_t dev, struct timespec *ts)
 	return (EOPNOTSUPP);
 }
 
+/*
+ * The boot error count: byte 2 of the primary PMU's legacy scratch area (ADT
+ * info-leg_scrpad, 0xf800 on the M5's Abbey). Every crash or unclean reset
+ * raises it; macOS clears it once it has booted, and above some count iBoot
+ * starts recoveryOS instead (the macOS reinstall screen). m1n1's proxyclient
+ * clears it the same way (PMU.reset_panic_counter()). dev.apple_pmu_rtc.0
+ * .boot_errors reads it; writing 0 clears it, which /etc/rc.local does once
+ * a FreeBSD boot has come up.
+ */
+#define	PMU_LEG_SCRPAD		0xf800
+#define	PMU_LEG_BOOT_ERRORS	(PMU_LEG_SCRPAD + 2)
+
+static int
+apple_pmu_rtc_boot_errors_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct apple_pmu_rtc_softc *sc = arg1;
+	uint8_t count;
+	int error, val;
+
+	mtx_lock(&sc->mtx);
+	error = spmi_readl(sc, PMU_LEG_BOOT_ERRORS, &count, 1);
+	mtx_unlock(&sc->mtx);
+	if (error)
+		return (error);
+	val = count;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error || req->newptr == NULL)
+		return (error);
+	if (val != 0)
+		return (EINVAL);	/* only clearing it */
+	count = 0;
+	mtx_lock(&sc->mtx);
+	error = spmi_writel(sc, PMU_LEG_BOOT_ERRORS, &count, 1);
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
 static int
 apple_pmu_rtc_probe(device_t dev)
 {
@@ -266,6 +304,12 @@ apple_pmu_rtc_attach(device_t dev)
 				    b[2], b[3], b[4], b[5], b[6], b[7]);
 		mtx_unlock(&sc->mtx);
 	}
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "boot_errors", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    apple_pmu_rtc_boot_errors_sysctl, "I",
+	    "PMU boot error count (iBoot boots recoveryOS when it is high); "
+	    "write 0 to clear");
 	clock_register_flags(dev, 1000000 / 65536, CLOCKF_GETTIME_NO_ADJ);
 	return (0);
 }

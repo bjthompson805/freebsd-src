@@ -9,6 +9,9 @@
 #include <sys/endian.h>
 #include <sys/firmware.h>
 
+#include <dev/ofw/openfirm.h>
+#include <dev/ofw/ofw_bus_subr.h>
+
 #include <arm64/apple/apple_isp.h>
 #include <arm64/apple/apple_isp_cmd.h>
 
@@ -16,12 +19,23 @@ struct isp_setfile {
 	u32 version;
 	u32 magic;
 	const char *path;
-	size_t size;
+	size_t size;		/* uploaded */
+	size_t file_size;	/* in the file, if less; the rest is zero */
+	bool stride_fixup;	/* the xx24 lens shading records */
+	int fallback;		/* the setfile to try when this one is missing */
 };
 
+/*
+ * From macOS's appleh16camerad (aurora-installer's vendor collector). The
+ * J815's IMX958 module has its own tunings, 2226_01 and 2226_02, already in
+ * the H17 form; 2226_02 gives it the evenest picture (corners/centre 0.85,
+ * against 0.50 with the sensor's default 2224_01: aurora linux#2194).
+ */
 static const struct isp_setfile isp_setfiles[] = {
 	[ISP_IMX958_2224_01] = { 0x958, 0x22240106, "apple/isp_2224_01XX.dat",
-	    0x6ff4 },
+	    0x6ff4, 0, true, -1 },
+	[ISP_IMX958_2226_02] = { 0x958, 0x22260201, "apple/isp_2226_02XX.dat",
+	    0x7000, 0x6ff4, false, ISP_IMX958_2224_01 },
 };
 
 static int
@@ -32,7 +46,8 @@ isp_ch_get_sensor_id(struct apple_isp *isp, u32 ch)
 	switch (fmt->version) {
 	case 0x958:
 		/* Section 0x50f of 2224 names sensor 0x958; 2924's names 0x614. */
-		fmt->id = ISP_IMX958_2224_01;
+		fmt->id = ofw_bus_node_is_compatible(OF_finddevice("/"),
+		    "apple,j815") ? ISP_IMX958_2226_02 : ISP_IMX958_2224_01;
 		return (0);
 	default:
 		dev_err(isp->dev, "invalid sensor version: 0x%x\n",
@@ -386,10 +401,14 @@ isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 	struct isp_format *fmt = isp_get_format(isp, ch);
 	const struct isp_setfile *setfile = &isp_setfiles[fmt->id];
 	const struct firmware *fw;
+	size_t len;
 	u32 magic;
 	int err;
 
-	fw = firmware_get_flags(setfile->path, FIRMWARE_GET_NOWARN);
+	/* The module's own tuning, else the sensor's default */
+	while ((fw = firmware_get_flags(setfile->path,
+	    FIRMWARE_GET_NOWARN)) == NULL && setfile->fallback >= 0)
+		setfile = &isp_setfiles[setfile->fallback];
 	if (fw == NULL) {
 		static bool warned;
 
@@ -399,9 +418,10 @@ isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 		warned = true;
 		return (-ENOENT);
 	}
-	if (fw->datasize < setfile->size) {
+	len = setfile->file_size ? setfile->file_size : setfile->size;
+	if (fw->datasize < len) {
 		dev_err(isp->dev, "setfile '%s' too small (0x%zx/0x%zx)\n",
-		    setfile->path, fw->datasize, setfile->size);
+		    setfile->path, fw->datasize, len);
 		firmware_put(fw, FIRMWARE_UNLOAD);
 		return (-EINVAL);
 	}
@@ -412,10 +432,12 @@ isp_ch_load_setfile(struct apple_isp *isp, u32 ch)
 		firmware_put(fw, FIRMWARE_UNLOAD);
 		return (-EINVAL);
 	}
-	memcpy(isp->data_surf->virt, fw->data, setfile->size);
+	memcpy(isp->data_surf->virt, fw->data, len);
+	memset((char *)isp->data_surf->virt + len, 0, setfile->size - len);
 	firmware_put(fw, FIRMWARE_UNLOAD);
-	if (isp->hw->setfile_stride_fixup)
-		isp_setfile_fixup_h17(isp->data_surf->virt, setfile->size);
+	if (setfile->stride_fixup && isp->hw->setfile_stride_fixup)
+		isp_setfile_fixup_h17(isp->data_surf->virt, len);
+	dev_info(isp->dev, "ch %u: sensor tuning '%s'\n", ch, setfile->path);
 
 	err = isp_cmd_ch_set_file_load(isp, ch, isp->data_surf->iova,
 	    setfile->size);

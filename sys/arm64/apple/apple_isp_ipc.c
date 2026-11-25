@@ -146,7 +146,12 @@ isp_wait_tx(struct apple_isp *isp, struct isp_channel *chan, bool on_error,
 			mtx_unlock(&isp->wait_mtx);
 			return (0);
 		}
-		/* Also poll: a missed doorbell costs a tick, not the timeout. */
+		/*
+		 * Also poll: a missed interrupt costs a tick, not the timeout.
+		 * The firmware may be waiting on a SHAREDMALLOC request before
+		 * it answers, so run the rings too.
+		 */
+		taskqueue_enqueue(isp->tq, &isp->irq_task);
 		mtx_sleep(&isp->wait, &isp->wait_mtx, 0, "ispipc",
 		    MAX(1, hz / 100));
 	}

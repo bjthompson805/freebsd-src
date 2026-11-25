@@ -253,6 +253,7 @@ struct apple_isp_hw {
 
 enum isp_sensor_id {
 	ISP_IMX958_2224_01,
+	ISP_IMX958_2226_02,
 };
 
 struct isp_sensor_config {
