@@ -489,6 +489,7 @@ void *apple_isp_translate(struct apple_isp *isp, struct isp_surf *surf,
 void isp_wake(struct apple_isp *isp);
 int apple_isp_program_dapf(struct apple_isp *isp);
 void apple_isp_dart_report(struct apple_isp *isp, bool clear);
+void apple_isp_dart_macos_init(struct apple_isp *isp);
 
 /* apple_isp_fw.c */
 int apple_isp_alloc_firmware_surface(struct apple_isp *isp);

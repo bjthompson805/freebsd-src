@@ -559,6 +559,9 @@ apple_isp_map_fw_segments(struct apple_isp *isp)
  * (mask, value), streams 0, 4, 5, 8 and 9 enabled (4/5 and 8/9 are the ADT's
  * exclave-sid pairs), and the protection words of dart-isp reg[6] and [7].
  */
+static int apple_isp_exclave_remap;
+TUNABLE_INT("hw.apple_isp.exclave_remap", &apple_isp_exclave_remap);
+
 static const struct {
 	u32 off, mask, val;
 } isp_dart_tunables[ISP_NUM_DARTS][6] = {
@@ -584,7 +587,7 @@ isp_or32(vm_paddr_t pa, u32 set)
 	pmap_unmapdev(__DEVOLATILE(void *, w), sizeof(u32));
 }
 
-static void
+void
 apple_isp_dart_macos_init(struct apple_isp *isp)
 {
 	for (int i = 0; i < ISP_NUM_DARTS; i++) {
@@ -597,6 +600,22 @@ apple_isp_dart_macos_init(struct apple_isp *isp)
 		}
 		DART_WR4(isp, i, ISP_DART_ERROR_MASK_V2, 0);
 		DART_WR4(isp, i, ISP_DART_ENABLE_STREAMS, 0x331);
+		/*
+		 * The exclave-sid streams (4/5, 8/9): XNU never programs them,
+		 * the exclave side does. Show them, and with
+		 * hw.apple_isp.exclave_remap fold them onto stream 0, so their
+		 * traffic is translated (and faults show) instead of passing.
+		 */
+		for (int s = 4; s <= 9; s++) {
+			if (s == 6 || s == 7)
+				continue;
+			device_printf(isp->dev, "DART %d sid %d: TCR %#x TTBR "
+			    "%#x\n", i, s, DART_RD4(isp, i, ISP_DART_TCR(s)),
+			    DART_RD4(isp, i, 0x1400 + 4 * s));
+			if (apple_isp_exclave_remap)
+				DART_WR4(isp, i, ISP_DART_TCR(s),
+				    ISP_DART_TCR_REMAP_ENABLE);
+		}
 		device_printf(isp->dev, "DART %d: macOS init, 0x20c %#x, TCR0 "
 		    "%#x, streams %#x\n", i, DART_RD4(isp, i, 0x20c),
 		    DART_RD4(isp, i, ISP_DART_TCR(0)),

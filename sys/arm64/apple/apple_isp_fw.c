@@ -105,6 +105,27 @@ TUNABLE_INT("hw.apple_isp.sys_cycle", &apple_isp_sys_cycle);
 #define	IDART(isp, i, r)	\
 	(*(volatile u32 *)((char *)(isp)->dart_regs[i] + (r)))
 
+/* ADT /arm-io/isp reg[2], and the ISPSENS0/1 power states of the PMGR */
+#define	ISP_T8142_LOCAL_PMGR		0x380724000ul
+#define	ISP_T8142_ISPSENS0		0x380700190ul
+#define	ISP_T8142_ISPSENS1		0x380700198ul
+
+/* As macOS turns a sensor power state off: 0x1400024f -> 0x4000340. */
+static void
+isp_t8142_sens_off(struct apple_isp *isp, vm_paddr_t pa)
+{
+	volatile u32 *ps;
+	int i;
+
+	ps = pmap_mapdev(pa, sizeof(u32));
+	*ps = (*ps & ~(BIT(28) | 0xf)) | 0x300;
+	for (i = 0; i < 10000 && ((*ps >> 4) & 0xf) != 0; i++)
+		DELAY(1);
+	device_printf(isp->dev, "ISPSENS %#jx off: %#x\n", (uintmax_t)pa,
+	    *ps);
+	pmap_unmapdev(__DEVOLATILE(void *, ps), sizeof(u32));
+}
+
 static int
 apple_isp_cycle_sys(struct apple_isp *isp)
 {
@@ -119,6 +140,13 @@ apple_isp_cycle_sys(struct apple_isp *isp)
 			ttbr[i][s] = IDART(isp, i, ISP_DART_TTBR(s));
 		}
 	}
+	/*
+	 * The sensor power states are ISP_SYS's children: while they are on,
+	 * ISP_SYS ignores an off request. macOS turns them off first
+	 * (0x1400024f -> 0x4000340).
+	 */
+	isp_t8142_sens_off(isp, ISP_T8142_ISPSENS1);
+	isp_t8142_sens_off(isp, ISP_T8142_ISPSENS0);
 	/*
 	 * As macOS 27.2 before it cuts ISP_SYS: 2 into two words past the DT's
 	 * coproc window, which read back 6 (a power-down handshake).
@@ -137,9 +165,28 @@ apple_isp_cycle_sys(struct apple_isp *isp)
 			pmap_unmapdev(__DEVOLATILE(void *, w), sizeof(u32));
 		}
 	}
+	/*
+	 * Bit 5 of dart-isp reg[6] +0x3fec holds ISP_SYS on: macOS clears it
+	 * right before the off (0x80000420 -> 0x80000400) and sets it again
+	 * after the on. The DART init sets it (apple_isp_dart_macos_init()).
+	 */
+	{
+		volatile u32 *hold = pmap_mapdev(0x380717fecul, sizeof(u32));
+
+		*hold &= ~BIT(5);
+		device_printf(isp->dev, "ISP_SYS hold cleared: %#x\n", *hold);
+		pmap_unmapdev(__DEVOLATILE(void *, hold), sizeof(u32));
+	}
 	err = apple_pmgr_set_domain(isp->dev, 0, false);
-	if (err == 0)
+	if (err == 0) {
+		/* Only the PMGR word: the block's own registers are dark now. */
+		volatile u32 *ps = pmap_mapdev(0x3807002f8ul, sizeof(u32));
+
+		pause("ispoff", MAX(1, hz / 100));
+		device_printf(isp->dev, "ISP_SYS off: %#x\n", *ps);
+		pmap_unmapdev(__DEVOLATILE(void *, ps), sizeof(u32));
 		err = apple_pmgr_set_domain(isp->dev, 0, true);
+	}
 	if (err != 0)
 		return (-err);
 	/* macOS powers it back with AUTO_ENABLE (0x1000200f) */
@@ -161,6 +208,8 @@ apple_isp_cycle_sys(struct apple_isp *isp)
 		}
 		IDART(isp, i, ISP_DART_ENABLE_STREAMS) = en[i];
 	}
+	/* Tunables and protection words, lost with the power */
+	apple_isp_dart_macos_init(isp);
 	/* The heap, segments and windows are in our tables: nothing to flush. */
 	return (0);
 }
@@ -411,10 +460,6 @@ isp_reset_coproc_t8140(struct apple_isp *isp)
 #define	ISP_COPROC_T8142_C00		0xc00
 #define	ISP_COPROC_T8142_28A4080	0x28a4080
 
-/* ADT /arm-io/isp reg[2], and the ISPSENS0/1 power states of the PMGR */
-#define	ISP_T8142_LOCAL_PMGR		0x380724000ul
-#define	ISP_T8142_ISPSENS0		0x380700190ul
-#define	ISP_T8142_ISPSENS1		0x380700198ul
 
 static void
 isp_t8142_sens_on(struct apple_isp *isp, vm_paddr_t pa)
