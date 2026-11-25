@@ -2090,6 +2090,36 @@ agx_stage6(struct apple_agx_softc *sc, struct agx_compute_queue *queue)
  * item, its work slot and the pipe-2 doorbell. The firmware consumes the
  * item: the graph's consumer reaches AGX_Q_INSTALL_END.
  */
+/*
+ * Each compute queue's private-memory pool: the page directory (one entry
+ * per 4 KiB page), the free list at AGX_Q_POOL_TABLES - 0x4000 (one entry per
+ * 2 MiB block, 0x40 apart, bit 61 set) and the blocks after the tables, as
+ * fw/m5/pool.rs encode_directory/encode_freelist (non-render blocks). The
+ * fixture's pool had 8 blocks; a compute dispatch with scratch has the
+ * firmware reserve up to ~20 MiB of it (pressure 437..512 pages x 10 cores)
+ * and faulted at address 0 in 16 MiB. 20 blocks keep each pool below the
+ * second queue's objects (AGX_Q_SECOND_OFFSET, 48 MiB at most).
+ */
+#define	AGX_POOL_BLOCK_BYTES	0x200000
+#define	AGX_POOL_BLOCKS		20
+#define	AGX_POOL_PAGES		(AGX_POOL_BLOCKS * (AGX_POOL_BLOCK_BYTES / 0x1000))
+CTASSERT(AGX_Q_POOL_TABLES + AGX_POOL_BLOCKS * AGX_POOL_BLOCK_BYTES <=
+    AGX_Q_SECOND_OFFSET - (AGX_Q_POOL_LOW_VA - AGX_Q_KICK_LOW_VA));
+CTASSERT(AGX_POOL_PAGES * 8 <= AGX_Q_POOL_TABLES - 0x4000);
+
+static void
+agx_pool_tables(uint8_t *pool, uint64_t va)
+{
+	uint64_t data = va + AGX_Q_POOL_TABLES;
+	u_int i;
+
+	for (i = 0; i < AGX_POOL_PAGES; i++)
+		((uint64_t *)pool)[i] = data + (uint64_t)i * 0x1000;
+	for (i = 0; i < AGX_POOL_BLOCKS; i++)
+		*(uint64_t *)(pool + AGX_Q_POOL_TABLES - 0x4000 + i * 0x40) =
+		    (data + (uint64_t)i * AGX_POOL_BLOCK_BYTES) | 1ull << 61;
+}
+
 static int
 agx_stage5(struct apple_agx_softc *sc, phandle_t node,
     struct agx_compute_queue *queue)
@@ -2103,7 +2133,8 @@ agx_stage5(struct apple_agx_softc *sc, phandle_t node,
 	int pp;
 
 	/* ComputePool::new and InitData::install_compute_pool (J813 row). */
-	if ((error = agx_queue_object(sc, "pool", &queue->pool, AGX_Q_POOL_SIZE,
+	if ((error = agx_queue_object(sc, "pool", &queue->pool,
+	    AGX_Q_POOL_TABLES + AGX_POOL_BLOCKS * AGX_POOL_BLOCK_BYTES,
 	    sc->uat.lower_root, AGX_QUEUE_VA(queue, POOL_LOW), AGX_PROT_GPU_SHARED_RW)) != 0 ||
 	    (error = agx_queue_object(sc, "pool control", &queue->pool_control,
 	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_QUEUE_VA(queue, POOL_CONTROL),
@@ -2112,20 +2143,21 @@ agx_stage5(struct apple_agx_softc *sc, phandle_t node,
 	    AGX_UAT_PGSZ, sc->uat.upper_root, AGX_QUEUE_VA(queue, POOL_STATE),
 	    AGX_PROT_GPU_FW_SHARED_RW)) != 0)
 		return (error);
-	if (queue->offset == 0)
-		agx_put_words(queue->pool, agx_q_pool_tables, nitems(agx_q_pool_tables));
-	else
-		agx_put_words(queue->pool, agx_q2_pool_tables, nitems(agx_q2_pool_tables));
+	agx_pool_tables(queue->pool, AGX_QUEUE_VA(queue, POOL_LOW));
 	if (queue->offset == 0)
 		agx_put_words(queue->pool_control, agx_q_pool_control, nitems(agx_q_pool_control));
 	else
 		agx_put_words(queue->pool_control, agx_q2_pool_control, nitems(agx_q2_pool_control));
+	/* The fixture's page counts (4096 pages, 16 MiB) become the pool's. */
+	*(volatile uint32_t *)(queue->pool_control + 0x24) = AGX_POOL_PAGES;
+	*(volatile uint32_t *)(queue->pool_control + 0x2c) = AGX_POOL_PAGES;
 	dsb(sy);
 	if ((pp = agx_graph_find("page_pool")) < 0)
 		return (EINVAL);
 	row = (volatile uint64_t *)(sc->graph_va[pp] + queue->pool_row);
 	for (i = 0; i < nitems(agx_q_pool_row); i++)
 		row[i] = queue->offset == 0 ? agx_q_pool_row[i] : agx_q2_pool_row[i];
+	row[2] = (row[2] & ~0xffffffffull) | AGX_POOL_PAGES;
 	dsb(sy);
 
 	if ((error = agx_queue_object(sc, "scheduler", &queue->sched,
