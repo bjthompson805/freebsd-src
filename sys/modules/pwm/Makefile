@@ -7,6 +7,7 @@ SUBDIR = \
 .if ${MACHINE_ARCH} == "armv7" || ${MACHINE_ARCH} == "aarch64"
 .if !empty(OPT_FDT)
 SUBDIR += pwm_backlight
+SUBDIR += pwm_leds
 .endif
 .endif
 
