@@ -26,8 +26,8 @@
  * with a wheel: its 0x75 multitouch frames become reports for a descriptor
  * of our own (mtp_mouse_rdesc), so hms(4) drives it. One finger moves the
  * pointer, two scroll, a click with two fingers down is a right click, and
- * so is a quick two-finger tap. Holding a one-finger click, a second finger
- * drags.
+ * so is a quick two-finger tap (a one-finger tap is a left click). Holding a
+ * one-finger click, a second finger drags.
  *
  * Everything is polled from a callout; no DockChannel/mailbox interrupts.
  */
@@ -336,6 +336,14 @@ static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
 #define	MT_SCROLL_UNITS		60	/* touch units per wheel step */
 #define	MT_TAP_MS		250	/* longest two-finger tap */
 #define	MT_TAP_MOVE		150	/* most movement in a tap (~1.5 mm) */
+/*
+ * Pointer gain, in 1/MT_GAIN_FULL: slow, fine movement gets a quarter of
+ * the full gain, rising linearly to full at MT_GAIN_SPEED touch units per
+ * frame (frames come at ~120 Hz, so ~50 mm/s).
+ */
+#define	MT_GAIN_FULL		16
+#define	MT_GAIN_MIN		4
+#define	MT_GAIN_SPEED		40
 
 /* Report 2: 3 buttons, X, Y, wheel, AC pan (horizontal wheel). */
 static const uint8_t mtp_mouse_rdesc[] = {
@@ -481,6 +489,14 @@ mtp_mt_steps(int *acc, int units)
 	return (v);
 }
 
+static int
+mtp_mt_gain(int dx, int dy)
+{
+	int g = (abs(dx) + abs(dy)) * MT_GAIN_FULL / MT_GAIN_SPEED;
+
+	return (MAX(MT_GAIN_MIN, MIN(MT_GAIN_FULL, g)));
+}
+
 /*
  * Turn a multitouch frame into a mouse report. One contact moves the
  * pointer; with two or more, the centre of the first two scrolls. Whenever
@@ -495,7 +511,8 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 	const uint8_t *rec;
 	int count, ids[2], px[2], py[2], n, x, y, dx, dy, ddx, ddy;
 	uint8_t *r;
-	bool pressed, tap;
+	int g, tap;			/* tap: fingers in it, or 0 */
+	bool pressed;
 
 	if (len < MT_HDR_LEN || p[0] != MT_REPORT_ID)
 		return;
@@ -559,11 +576,12 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 	ifc->mt_touch_clicked |= pressed;
 	if (count > 0) {
 		ifc->mt_touch_fingers = MAX(ifc->mt_touch_fingers, count);
-		tap = false;
+		tap = 0;
 	} else {
-		tap = ifc->mt_touch_fingers == 2 && !ifc->mt_touch_clicked &&
+		tap = ifc->mt_touch_fingers <= 2 && !ifc->mt_touch_clicked &&
 		    ifc->mt_touch_moved < MT_TAP_MOVE &&
-		    ticks - ifc->mt_touch_ticks < MT_TAP_MS * hz / 1000;
+		    ticks - ifc->mt_touch_ticks < MT_TAP_MS * hz / 1000 ?
+		    ifc->mt_touch_fingers : 0;
 		ifc->mt_touch_fingers = 0;
 	}
 
@@ -574,20 +592,32 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 	r[0] = MT_MOUSE_REPORT_ID;
 	r[1] = ifc->mt_button == 2 ? 0x2 : ifc->mt_button;
 	if (tap) {
-		r[1] = 0x2;		/* released by mtp_deliver */
+		/* One finger: left, two: right; released by mtp_deliver. */
+		r[1] = tap == 2 ? 0x2 : 0x1;
 		ifc->mt_tap_release = true;
 	}
 	if (n == 1) {
-		ifc->mt_rx += dx;
-		ifc->mt_ry -= dy;		/* screen y grows downward */
-		r[2] = (int8_t)mtp_mt_steps(&ifc->mt_rx, MT_POINTER_UNITS);
-		r[3] = (int8_t)mtp_mt_steps(&ifc->mt_ry, MT_POINTER_UNITS);
+		g = mtp_mt_gain(dx, dy);
+		ifc->mt_rx += dx * g;
+		ifc->mt_ry -= dy * g;		/* screen y grows downward */
+		/* While this could still be a tap, hold the motion back. */
+		if (ifc->mt_touch_fingers == 1 && !ifc->mt_touch_clicked &&
+		    ifc->mt_touch_moved < MT_TAP_MOVE &&
+		    ticks - ifc->mt_touch_ticks < MT_TAP_MS * hz / 1000)
+			return;
+		r[2] = (int8_t)mtp_mt_steps(&ifc->mt_rx,
+		    MT_POINTER_UNITS * MT_GAIN_FULL);
+		r[3] = (int8_t)mtp_mt_steps(&ifc->mt_ry,
+		    MT_POINTER_UNITS * MT_GAIN_FULL);
 	} else if (n == 2 && ifc->mt_button == 1) {
 		/* Click with one finger, drag with another. */
-		ifc->mt_rx += ddx;
-		ifc->mt_ry -= ddy;
-		r[2] = (int8_t)mtp_mt_steps(&ifc->mt_rx, MT_POINTER_UNITS);
-		r[3] = (int8_t)mtp_mt_steps(&ifc->mt_ry, MT_POINTER_UNITS);
+		g = mtp_mt_gain(ddx, ddy);
+		ifc->mt_rx += ddx * g;
+		ifc->mt_ry -= ddy * g;
+		r[2] = (int8_t)mtp_mt_steps(&ifc->mt_rx,
+		    MT_POINTER_UNITS * MT_GAIN_FULL);
+		r[3] = (int8_t)mtp_mt_steps(&ifc->mt_ry,
+		    MT_POINTER_UNITS * MT_GAIN_FULL);
 	} else if (n == 2 && ifc->mt_button == 0) {
 		/* Wheel +1 scrolls up, pan +1 right; natural inverts both. */
 		ifc->mt_ry += mtp_natural_scroll ? -dy : dy;
