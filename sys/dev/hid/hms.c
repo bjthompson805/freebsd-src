@@ -101,18 +101,6 @@ static const struct hidmap_item hms_map_wheel_rev[] = {
 	HMS_MAP_REL_REV(HUG_WHEEL,	REL_WHEEL),
 };
 
-/*
- * High-resolution wheels in 1/120 steps, as Linux's REL_WHEEL_HI_RES. HID
- * gets there with a Resolution Multiplier feature; a driver that makes up
- * its own descriptor (apple_mtp) can report these vendor usages instead,
- * next to the ordinary wheels.
- */
-#define	HMS_VENDOR_PAGE		0xff00
-static const struct hidmap_item hms_map_wheel_hi_res[] = {
-	{ HIDMAP_REL(HMS_VENDOR_PAGE, 0x0b,	REL_WHEEL_HI_RES) },
-	{ HIDMAP_REL(HMS_VENDOR_PAGE, 0x0c,	REL_HWHEEL_HI_RES) },
-};
-
 static const struct hidmap_item hms_map_kensington_slimblade[] = {
 	HMS_MAP_BUT_MS(1,	BTN_RIGHT),
 	HMS_MAP_BUT_MS(2,	BTN_MIDDLE),
@@ -283,7 +271,6 @@ hms_attach(device_t dev)
 		HIDMAP_ADD_MAP(&sc->hm, hms_map_wheel_rev, cap_wheel);
 	else
 		HIDMAP_ADD_MAP(&sc->hm, hms_map_wheel, cap_wheel);
-	HIDMAP_ADD_MAP(&sc->hm, hms_map_wheel_hi_res, NULL);
 
 	if (hid_test_quirk(hw, HQ_MS_VENDOR_BTN))
 		HIDMAP_ADD_MAP(&sc->hm, hms_map_kensington_slimblade, NULL);

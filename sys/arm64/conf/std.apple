@@ -9,3 +9,5 @@ options 	FDT
 
 device	bge
 device	hms			# HID mouse (USB mice via usbhid)
+device	hmt			# HID touchpad (the internal one, via apple_mtp)
+device	hconf			# HID touchpad configuration (hmt needs it)
