@@ -648,8 +648,11 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 		    MT_POINTER_UNITS * MT_GAIN_FULL);
 		r[3] = (int8_t)mtp_mt_steps(&ifc->mt_ry,
 		    MT_POINTER_UNITS * MT_GAIN_FULL);
-	} else if (n == 2 && ifc->mt_button == 1) {
-		/* Click with one finger, drag with another. */
+	} else if (n == 2 && ifc->mt_button != 0) {
+		/*
+		 * Click with one finger and drag with another, or click with
+		 * two (right button) and drag them together.
+		 */
 		g = mtp_mt_gain(ddx, ddy);
 		ifc->mt_rx += ddx * g;
 		ifc->mt_ry -= ddy * g;
