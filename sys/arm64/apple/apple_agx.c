@@ -291,6 +291,9 @@ struct agx_client_root {
 
 #define	AGX_QUEUE_VA(queue, name)	(AGX_Q_ ## name ## _VA + (queue)->offset)
 
+/* Compute kicks in flight on a queue, as the render pair's slots. */
+#define	AGX_COMPUTE_IN_FLIGHT	4
+
 struct agx_compute_queue {
 	uint64_t		offset;
 	u_int			qid;
@@ -325,9 +328,20 @@ struct agx_compute_queue {
 	uint64_t		stamp_events;
 	bool			busy;
 	bool			failed;
-	/* A kick published and not yet retired (apple_agx_compute_kick). */
-	bool			pending;
-	uint64_t		pending_events;	/* stamp_events before it */
+	/*
+	 * Kicks published and not yet retired (apple_agx_compute_kick),
+	 * oldest first. Retiring an older one, agx_retire skips the consumer
+	 * cursor check (later kicks' items follow its end).
+	 */
+	struct agx_compute_pending {
+		uint32_t	stamp;
+		uint32_t	items_end;
+		uint64_t	node_va;
+		uint64_t	events;		/* stamp_events before it */
+	}			pend[AGX_COMPUTE_IN_FLIGHT];
+	u_int			pend_head;
+	u_int			npend;
+	bool			retire_skip_cursor;
 };
 
 /*
@@ -1521,11 +1535,17 @@ agx_kick(struct apple_agx_softc *sc, struct agx_compute_queue *queue,
 		return (error);
 	dsb(sy);
 
-	/* One read of the cursors serves the publication. */
+	/*
+	 * One read of the cursors serves the publication. With kicks in
+	 * flight the firmware may still be consuming their items, which end
+	 * at our last producer.
+	 */
 	consumer = cursors[0];
 	producer = cursors[(AGX_Q_PRODUCER - AGX_Q_CURSORS) / 4];
 	if (cursors[0x60 / 4] != AGX_Q_ITEM_ENTRIES ||
-	    producer >= AGX_Q_ITEM_ENTRIES || consumer != producer) {
+	    producer >= AGX_Q_ITEM_ENTRIES ||
+	    (queue->npend == 0 ? consumer != producer :
+	    producer != queue->items_end)) {
 		device_printf(sc->dev, "kick %u: cursors %u/%u\n", ordinal,
 		    consumer, producer);
 		return (EIO);
@@ -1669,7 +1689,8 @@ agx_retire(struct apple_agx_softc *sc, struct agx_compute_queue *queue,
 		dsb(sy);
 		if ((!interrupt || queue->stamp_events != prior_stamp_events) &&
 		    agx_stamp_covers(*stamp, queue->stamp) &&
-		    cursors[0] == queue->items_end &&
+		    (queue->retire_skip_cursor ||
+		    cursors[0] == queue->items_end) &&
 		    node[AGX_Q_NODE_COMPLETED / 4] >= 1)
 			break;
 
@@ -1945,25 +1966,42 @@ apple_agx_queue_destroy(device_t dev, u_int slot)
 }
 
 /*
- * With the queue claimed (busy) and the lock held: retire its pending
- * kick, if any. agx_retire sleeps with the lock dropped; busy keeps other
- * kicks off the queue meanwhile.
+ * With the queue claimed (busy) and the lock held: retire its oldest
+ * pending kicks until at most keep remain. agx_retire sleeps with the lock
+ * dropped; busy keeps other kicks off the queue meanwhile. It reads the
+ * queue's stamp, items end and work node, which name the newest kick: an
+ * older one's stand in while it retires.
  */
 static int
 agx_compute_retire_pending(struct apple_agx_softc *sc,
-    struct agx_compute_queue *queue)
+    struct agx_compute_queue *queue, u_int keep)
 {
+	struct agx_compute_pending *e;
+	uint32_t stamp = queue->stamp, items_end = queue->items_end;
+	uint64_t node_va = queue->node_va;
 	u_int ms;
-	int error;
+	int error = 0;
 
-	if (!queue->pending)
-		return (0);
-	error = agx_retire(sc, queue, &ms, sc->roles[0].irq_tag != NULL,
-	    queue->pending_events);
-	queue->pending = false;
-	sc->compute_in_flight--;
+	while (queue->npend > keep && error == 0) {
+		e = &queue->pend[queue->pend_head];
+		queue->stamp = e->stamp;
+		queue->items_end = e->items_end;
+		queue->node_va = e->node_va;
+		queue->retire_skip_cursor = queue->npend > 1;
+		error = agx_retire(sc, queue, &ms,
+		    sc->roles[0].irq_tag != NULL, e->events);
+		queue->pend_head = (queue->pend_head + 1) %
+		    AGX_COMPUTE_IN_FLIGHT;
+		queue->npend--;
+		sc->compute_in_flight--;
+	}
+	queue->stamp = stamp;
+	queue->items_end = items_end;
+	queue->node_va = node_va;
+	queue->retire_skip_cursor = false;
 	if (error != 0) {
 		queue->failed = true;
+		queue->npend = 0;
 		device_printf(sc->dev, "compute queue %u: kick %u: %d\n",
 		    queue->qid, queue->ordinal - 1, error);
 	}
@@ -2003,7 +2041,7 @@ apple_agx_compute_wait(device_t dev, u_int slot)
 	queue = &sc->queues[slot];
 	mtx_lock(&sc->mtx);
 	if ((error = agx_compute_claim(sc, queue)) == 0) {
-		error = agx_compute_retire_pending(sc, queue);
+		error = agx_compute_retire_pending(sc, queue, 0);
 		agx_compute_release(queue);
 	}
 	mtx_unlock(&sc->mtx);
@@ -2056,14 +2094,16 @@ apple_agx_compute_kick(device_t dev, u_int slot, u_int context,
 		return (ENOENT);
 	}
 	/*
-	 * Another thread's kick or retirement finishes first; then the
-	 * previous kick (the queue publishes one at a time) retires.
+	 * Another thread's kick or retirement finishes first. A full queue
+	 * retires its oldest kick; another context's kicks all retire, as
+	 * the render pair drains between contexts.
 	 */
 	if ((error = agx_compute_claim(sc, queue)) != 0) {
 		mtx_unlock(&sc->mtx);
 		return (error);
 	}
-	if ((error = agx_compute_retire_pending(sc, queue)) != 0)
+	if ((error = agx_compute_retire_pending(sc, queue,
+	    context != queue->context ? 0 : AGX_COMPUTE_IN_FLIGHT - 1)) != 0)
 		goto out;
 	root = agx_client_root(sc, context);
 	if (root == NULL || !root->live) {
@@ -2074,8 +2114,14 @@ apple_agx_compute_kick(device_t dev, u_int slot, u_int context,
 	error = agx_kick(sc, queue, context, root->generation, cdm_va, cdm_end,
 	    policy, control, deps, ndeps);
 	if (error == 0) {
-		queue->pending = true;
-		queue->pending_events = events;
+		struct agx_compute_pending *e = &queue->pend[(queue->pend_head +
+		    queue->npend) % AGX_COMPUTE_IN_FLIGHT];
+
+		e->stamp = queue->stamp;
+		e->items_end = queue->items_end;
+		e->node_va = queue->node_va;
+		e->events = events;
+		queue->npend++;
 		if (dep != NULL)
 			*dep = agx_kick_dependency(queue->qid, queue->ordinal);
 		if (++sc->compute_in_flight > sc->compute_peak_in_flight)
