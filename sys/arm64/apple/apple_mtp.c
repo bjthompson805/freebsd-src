@@ -335,17 +335,17 @@ static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
 #define	MT_REC_PRESSURE		26	/* 16-bit, ~40 resting, ~300 clicked */
 
 /*
- * Touch area in record units (0.01 mm), from Linux's hid-magicmouse J314
- * (14" MacBook Pro). The firmware reports its own in feature report
- * MT_DIM_REPORT_ID, which the trackpad task logs, but hmt(4) reads the
- * descriptor when hidbus attaches, before the firmware is loaded.
+ * Touch area in record units (0.01 mm): what the J815's firmware reports
+ * in feature report MT_DIM_REPORT_ID. The trackpad task logs that report
+ * to check against these, because hmt(4) reads the descriptor when hidbus
+ * attaches, before the firmware is loaded.
  */
-#define	MT_TP_MIN_X		(-5900)
-#define	MT_TP_MAX_X		6500
-#define	MT_TP_MIN_Y		(-200)
-#define	MT_TP_MAX_Y		7400
-#define	MT_TP_WIDTH		13000
-#define	MT_TP_HEIGHT		8100
+#define	MT_TP_MIN_X		(-6789)
+#define	MT_TP_MAX_X		7298
+#define	MT_TP_MIN_Y		(-180)
+#define	MT_TP_MAX_Y		8145
+#define	MT_TP_WIDTH		14267
+#define	MT_TP_HEIGHT		8509
 #define	MT_DIM_REPORT_ID	0xd9
 
 /*
