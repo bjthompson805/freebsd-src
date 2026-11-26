@@ -365,7 +365,14 @@ static const char *mtp_hid_ifaces[] = { "keyboard", "multi-touch" };
 #define	MT_GAIN_MIN		10
 #define	MT_GAIN_SPEED		30
 
-/* Report 2: 3 buttons, X, Y, wheel, AC pan (horizontal wheel). */
+#define	MT_HI_RES		120	/* hi-res wheel units per step */
+
+/*
+ * Report 2: 3 buttons, X, Y, wheel, AC pan (horizontal wheel), then both
+ * wheels again in 1/MT_HI_RES steps (hms(4)'s vendor usages for
+ * REL_WHEEL_HI_RES and REL_HWHEEL_HI_RES), which libinput scrolls by
+ * smoothly instead of a step at a time.
+ */
 static const uint8_t mtp_mouse_rdesc[] = {
 	0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, MT_MOUSE_REPORT_ID,
 	0x09, 0x01, 0xa1, 0x00,
@@ -377,9 +384,12 @@ static const uint8_t mtp_mouse_rdesc[] = {
 	0x81, 0x06,					/* X, Y, wheel */
 	0x05, 0x0c, 0x0a, 0x38, 0x02, 0x95, 0x01,
 	0x81, 0x06,					/* AC pan */
+	0x06, 0x00, 0xff, 0x09, 0x0b, 0x09, 0x0c,
+	0x16, 0x00, 0x80, 0x26, 0xff, 0x7f, 0x75, 0x10, 0x95, 0x02,
+	0x81, 0x06,					/* hi-res wheels */
 	0xc0, 0xc0,
 };
-#define	MT_MOUSE_REPORT_LEN	6
+#define	MT_MOUSE_REPORT_LEN	10
 
 static int mtp_natural_scroll = 1;
 SYSCTL_NODE(_hw, OID_AUTO, apple_mtp, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
@@ -662,10 +672,18 @@ mtp_mt_frame(struct apple_mtp_softc *sc, struct mtp_iface *ifc,
 		    MT_POINTER_UNITS * MT_GAIN_FULL);
 	} else if (n == 2 && ifc->mt_button == 0) {
 		/* Wheel +1 scrolls up, pan +1 right; natural inverts both. */
-		ifc->mt_ry += mtp_natural_scroll ? -dy : dy;
-		ifc->mt_rx += mtp_natural_scroll ? -dx : dx;
+		int sy = mtp_natural_scroll ? -dy : dy;
+		int sx = mtp_natural_scroll ? -dx : dx;
+
+		ifc->mt_ry += sy;
+		ifc->mt_rx += sx;
 		r[4] = (int8_t)mtp_mt_steps(&ifc->mt_ry, MT_SCROLL_UNITS);
 		r[5] = (int8_t)mtp_mt_steps(&ifc->mt_rx, MT_SCROLL_UNITS);
+		/* MT_SCROLL_UNITS divides MT_HI_RES: no remainder to keep. */
+		le16enc(r + 6, (uint16_t)MAX(-32767, MIN(32767,
+		    sy * (MT_HI_RES / MT_SCROLL_UNITS))));
+		le16enc(r + 8, (uint16_t)MAX(-32767, MIN(32767,
+		    sx * (MT_HI_RES / MT_SCROLL_UNITS))));
 	}
 	sc->rep.ifc = ifc;
 	sc->rep.len = MT_MOUSE_REPORT_LEN;
