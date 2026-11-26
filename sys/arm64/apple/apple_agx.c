@@ -325,6 +325,9 @@ struct agx_compute_queue {
 	uint64_t		stamp_events;
 	bool			busy;
 	bool			failed;
+	/* A kick published and not yet retired (apple_agx_compute_kick). */
+	bool			pending;
+	uint64_t		pending_events;	/* stamp_events before it */
 };
 
 /*
@@ -1407,12 +1410,15 @@ static const struct agx_board agx_j813_board = {
  * descriptor items, the kick entry, the announcement, the work slot and
  * the doorbell. The previous kick has retired. cdm_va..cdm_end is the
  * job's CDM stream, terminator included. policy and control are its
- * agx_m5_compute_plan, or 0 for the fixed profile.
+ * agx_m5_compute_plan, or 0 for the fixed profile. The kick also waits for
+ * the ndeps kicks in deps (agx_kick_dependency words, completion: type 1,
+ * as Aurora's G18 kick entries).
  */
 static int
 agx_kick(struct apple_agx_softc *sc, struct agx_compute_queue *queue,
     u_int context, uint8_t generation,
-    uint64_t cdm_va, uint64_t cdm_end, uint64_t policy, uint64_t control)
+    uint64_t cdm_va, uint64_t cdm_end, uint64_t policy, uint64_t control,
+    const uint64_t *deps, u_int ndeps)
 {
 	const struct agx_board *board = &agx_j813_board;
 	volatile uint32_t *cursors = (volatile uint32_t *)(queue->graph +
@@ -1423,12 +1429,15 @@ agx_kick(struct apple_agx_softc *sc, struct agx_compute_queue *queue,
 	struct agx_kick_tuple tuple;
 	uint8_t config[AGX_QUEUE_CONFIG_SIZE], announce[AGX_KICK_ANNOUNCE_SIZE];
 	uint8_t slot[AGX_WORK_SLOT_SIZE], parent_class;
-	uint8_t node[0xc8];
+	uint8_t node[0xc8], types[APPLE_AGX_MAX_DEPS + 1];
 	uint64_t va, ts, desc_off, desc_high, desc_low, node_va, counter_off;
 	uint32_t consumer, producer, ordinal, record, word, end;
 	bool first;
+	u_int i;
 	int error;
 
+	if (ndeps > APPLE_AGX_MAX_DEPS)
+		return (EINVAL);
 	ordinal = queue->ordinal;
 	first = ordinal == 0;
 	ts = ordinal + 1;			/* KickTimestamp::FIRST.. */
@@ -1568,7 +1577,12 @@ agx_kick(struct apple_agx_softc *sc, struct agx_compute_queue *queue,
 	ka.qid = queue->qid;
 	ka.timestamp = ts;
 	ka.parent = queue->parent;
-	ka.dependency_types = &parent_class;
+	for (i = 0; i < ndeps; i++)
+		types[i] = 1;
+	types[ndeps] = parent_class;
+	ka.barriers = ndeps != 0 ? deps : NULL;
+	ka.nbarriers = ndeps;
+	ka.dependency_types = types;
 	ka.descriptor_va = desc_high;
 	ka.queue_va = AGX_QUEUE_VA(queue, QGRAPH);
 	ka.qos_slot = queue->qos;
@@ -1930,22 +1944,104 @@ apple_agx_queue_destroy(device_t dev, u_int slot)
 	mtx_unlock(&sc->mtx);
 }
 
+/*
+ * With the queue claimed (busy) and the lock held: retire its pending
+ * kick, if any. agx_retire sleeps with the lock dropped; busy keeps other
+ * kicks off the queue meanwhile.
+ */
+static int
+agx_compute_retire_pending(struct apple_agx_softc *sc,
+    struct agx_compute_queue *queue)
+{
+	u_int ms;
+	int error;
+
+	if (!queue->pending)
+		return (0);
+	error = agx_retire(sc, queue, &ms, sc->roles[0].irq_tag != NULL,
+	    queue->pending_events);
+	queue->pending = false;
+	sc->compute_in_flight--;
+	if (error != 0) {
+		queue->failed = true;
+		device_printf(sc->dev, "compute queue %u: kick %u: %d\n",
+		    queue->qid, queue->ordinal - 1, error);
+	}
+	return (error);
+}
+
+/* Claim the queue: wait out another thread's kick or retirement. */
+static int
+agx_compute_claim(struct apple_agx_softc *sc, struct agx_compute_queue *queue)
+{
+
+	while (queue->busy && !queue->failed)
+		mtx_sleep(&queue->busy, &sc->mtx, 0, "agxcq", 0);
+	if (queue->failed)
+		return (EIO);
+	queue->busy = true;
+	return (0);
+}
+
+static void
+agx_compute_release(struct agx_compute_queue *queue)
+{
+
+	queue->busy = false;
+	wakeup(&queue->busy);
+}
+
+int
+apple_agx_compute_wait(device_t dev, u_int slot)
+{
+	struct apple_agx_softc *sc = device_get_softc(dev);
+	struct agx_compute_queue *queue;
+	int error;
+
+	if (slot >= nitems(sc->queues))
+		return (ENOENT);
+	queue = &sc->queues[slot];
+	mtx_lock(&sc->mtx);
+	if ((error = agx_compute_claim(sc, queue)) == 0) {
+		error = agx_compute_retire_pending(sc, queue);
+		agx_compute_release(queue);
+	}
+	mtx_unlock(&sc->mtx);
+	return (error);
+}
+
 int
 apple_agx_submit_compute(device_t dev, u_int slot, u_int context,
     uint64_t cdm_va, uint64_t cdm_end,
     const struct agx_render_program *programs, u_int nprograms,
     u_int timeout_ms)
 {
+	int error;
+
+	(void)timeout_ms;	/* agx_retire waits 2 s */
+	error = apple_agx_compute_kick(dev, slot, context, cdm_va, cdm_end,
+	    programs, nprograms, NULL, 0, NULL);
+	if (error == 0)
+		error = apple_agx_compute_wait(dev, slot);
+	return (error);
+}
+
+int
+apple_agx_compute_kick(device_t dev, u_int slot, u_int context,
+    uint64_t cdm_va, uint64_t cdm_end,
+    const struct agx_render_program *programs, u_int nprograms,
+    const uint64_t *deps, u_int ndeps, uint64_t *dep)
+{
 	struct apple_agx_softc *sc = device_get_softc(dev);
 	struct agx_compute_queue *queue;
 	struct agx_client_root *root;
 	uint64_t events, policy = 0, control = 0;
-	u_int ms;
 	int error;
 
-	(void)timeout_ms;	/* agx_retire waits 2 s */
 	if (slot >= nitems(sc->queues))
 		return (ENOENT);
+	if (ndeps > APPLE_AGX_MAX_DEPS)
+		return (EINVAL);
 	/* render_resources.rs plan_compute: every core of every cluster. */
 	if (nprograms != 0 && (error = agx_m5_compute_plan(sc->id.core_masks,
 	    sc->id.num_clusters, sc->id.num_cores * sc->id.num_clusters,
@@ -1959,33 +2055,35 @@ apple_agx_submit_compute(device_t dev, u_int slot, u_int context,
 		mtx_unlock(&sc->mtx);
 		return (ENOENT);
 	}
-	/* Another DRM queue's kick on this firmware queue retires first. */
-	while (queue->busy && !queue->failed)
-		mtx_sleep(&queue->busy, &sc->mtx, 0, "agxcq", 0);
-	if (queue->failed) {
+	/*
+	 * Another thread's kick or retirement finishes first; then the
+	 * previous kick (the queue publishes one at a time) retires.
+	 */
+	if ((error = agx_compute_claim(sc, queue)) != 0) {
 		mtx_unlock(&sc->mtx);
-		return (EIO);
+		return (error);
 	}
+	if ((error = agx_compute_retire_pending(sc, queue)) != 0)
+		goto out;
 	root = agx_client_root(sc, context);
 	if (root == NULL || !root->live) {
-		mtx_unlock(&sc->mtx);
-		return (ENOENT);
+		error = ENOENT;
+		goto out;
 	}
-	queue->busy = true;
 	events = queue->stamp_events;
 	error = agx_kick(sc, queue, context, root->generation, cdm_va, cdm_end,
-	    policy, control);
+	    policy, control, deps, ndeps);
 	if (error == 0) {
-		sc->compute_in_flight++;
-		if (sc->compute_peak_in_flight < sc->compute_in_flight)
+		queue->pending = true;
+		queue->pending_events = events;
+		if (dep != NULL)
+			*dep = agx_kick_dependency(queue->qid, queue->ordinal);
+		if (++sc->compute_in_flight > sc->compute_peak_in_flight)
 			sc->compute_peak_in_flight = sc->compute_in_flight;
-		error = agx_retire(sc, queue, &ms, sc->roles[0].irq_tag != NULL,
-		    events);
-		sc->compute_in_flight--;
-	}
-	queue->failed = error != 0;
-	queue->busy = false;
-	wakeup(&queue->busy);
+	} else
+		queue->failed = true;
+out:
+	agx_compute_release(queue);
 	mtx_unlock(&sc->mtx);
 	if (error != 0)
 		device_printf(sc->dev, "submit: compute at %#lx: %d\n", cdm_va,
@@ -2061,7 +2159,7 @@ agx_stage6(struct apple_agx_softc *sc, struct agx_compute_queue *queue)
 		memset(sc->job_out, 0xa5, AGX_JOB_THREADS * 4);
 		dsb(sy);
 		if ((error = agx_kick(sc, queue, AGX_Q_CONTEXT, 1, AGX_JOB_CDM_VA,
-		    AGX_JOB_CDM_VA + sizeof(agx_job_cdm), 0, 0)) != 0 ||
+		    AGX_JOB_CDM_VA + sizeof(agx_job_cdm), 0, 0, NULL, 0)) != 0 ||
 		    (error = agx_retire(sc, queue, &ms, false, 0)) != 0) {
 			device_printf(sc->dev, "kick %u failed: %d\n", n,
 			    error);
@@ -2663,10 +2761,14 @@ agx_items_room(uint32_t producer, uint32_t consumer)
 static int
 agx_render_kick(struct agx_render *r, u_int index, u_int context,
     uint8_t generation, const struct agx_render_pass *pass,
-    const struct agx_stage_plan stages[2], uint8_t mesh_class)
+    const struct agx_stage_plan stages[2], uint8_t mesh_class,
+    const uint64_t *deps, u_int ndeps)
 {
 	struct apple_agx_softc *sc = r->sc;
 	const struct agx_render_pair_install *in = r->in;
+	uint64_t ta_barriers[1 + APPLE_AGX_MAX_DEPS];
+	uint8_t ta_types[2 + APPLE_AGX_MAX_DEPS];
+	u_int nb;
 	struct agx_render_slot *slot = &r->slots[index];
 	const struct agx_board *board = &agx_j813_board;
 	static const size_t cursors_off[2] = { AGX_RENDER_TA_CURSORS,
@@ -2875,10 +2977,22 @@ agx_render_kick(struct agx_render *r, u_int index, u_int context,
 	 * also waits for the last fragment kick (queue/render.rs
 	 * J813_LAST_FRAGMENT, class 2), then its parent (class 1).
 	 */
-	barriers[0] = agx_kick_dependency(in->qids[1], ts - 1);
+	/*
+	 * The tiling kick's barriers: the last fragment kick, then the
+	 * caller's kicks on other queues (completion, type 1), then the
+	 * parent.
+	 */
+	nb = 0;
+	if (ordinal != 0) {
+		ta_barriers[nb] = agx_kick_dependency(in->qids[1], ts - 1);
+		ta_types[nb++] = 2;
+	}
+	for (i = 0; i < ndeps; i++) {
+		ta_barriers[nb] = deps[i];
+		ta_types[nb++] = 1;
+	}
+	ta_types[nb] = 1;
 	barriers[1] = agx_kick_dependency(in->qids[0], ts);
-	types[0][0] = ordinal != 0 ? 2 : 1;
-	types[0][1] = 1;
 	types[1][0] = 1;
 	types[1][1] = 3;
 	for (s = 1; s >= 0; s--) {
@@ -2886,11 +3000,15 @@ agx_render_kick(struct agx_render *r, u_int index, u_int context,
 		ka.qid = in->qids[s];
 		ka.timestamp = ts;
 		ka.parent = ts - 1;
-		ka.barriers = &barriers[s];
-		ka.nbarriers = s == 1 || ordinal != 0;
-		if (ka.nbarriers == 0)
-			ka.barriers = NULL;
-		ka.dependency_types = types[s];
+		if (s == 1) {
+			ka.barriers = &barriers[1];
+			ka.nbarriers = 1;
+			ka.dependency_types = types[1];
+		} else {
+			ka.barriers = nb != 0 ? ta_barriers : NULL;
+			ka.nbarriers = nb;
+			ka.dependency_types = ta_types;
+		}
 		ka.descriptor_va = desc_va + s * AGX_M5_RENDER_FRAGMENT_OFFSET;
 		ka.queue_va = graph_va + in->qids[s] * AGX_RENDER_QUEUE_STRIDE;
 		ka.qos_slot = in->qos;
@@ -3070,6 +3188,18 @@ apple_agx_submit_render_async(device_t dev, u_int context,
     const struct agx_render_program *programs, u_int nprograms,
     void (*done)(void *, int), void *arg)
 {
+
+	return (apple_agx_submit_render_deps(dev, context, pass, programs,
+	    nprograms, NULL, 0, NULL, done, arg));
+}
+
+int
+apple_agx_submit_render_deps(device_t dev, u_int context,
+    const struct agx_render_pass *pass,
+    const struct agx_render_program *programs, u_int nprograms,
+    const uint64_t *deps, u_int ndeps, uint64_t *dep,
+    void (*done)(void *, int), void *arg)
+{
 	struct apple_agx_softc *sc = device_get_softc(dev);
 	struct agx_render *r;
 	struct agx_render_done finished[AGX_RENDER_SLOTS];
@@ -3081,6 +3211,8 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 	uint8_t mesh_class = 0;
 	int error;
 
+	if (ndeps > APPLE_AGX_MAX_DEPS)
+		return (EINVAL);
 	p.usc_base = AGX_CLIENT_SHADER;
 	/*
 	 * render_resources.rs mesh_class: 1 for a hardware mesh (with its
@@ -3134,8 +3266,10 @@ apple_agx_submit_render_async(device_t dev, u_int context,
 		goto out;
 	index = (r->oldest + r->in_flight) % AGX_RENDER_SLOTS;
 	slot = &r->slots[index];
+	if (dep != NULL)
+		*dep = agx_kick_dependency(r->in->qids[1], r->ts);
 	error = agx_render_kick(r, index, context, root->generation, &p,
-	    stages, mesh_class);
+	    stages, mesh_class, deps, ndeps);
 	if (error == 0 && mesh_class == 2) {
 		sc->renders[0].mesh_storage = root->mesh_storage;
 		r->task_context = context;

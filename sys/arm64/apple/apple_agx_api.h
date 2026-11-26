@@ -77,4 +77,33 @@ int	apple_agx_submit_render_async(device_t dev, u_int context,
 	    const struct agx_render_program *programs, u_int nprograms,
 	    void (*done)(void *, int), void *arg);
 
+/*
+ * Firmware dependencies between kicks: a word names one kick of one
+ * firmware queue (its completion), so work on another queue can wait for
+ * it on the GPU instead of the host. At most APPLE_AGX_MAX_DEPS a kick.
+ */
+#define	APPLE_AGX_MAX_DEPS	8
+
+/*
+ * As apple_agx_submit_render_async; the pass's tiling also waits for the
+ * kicks in deps, and *dep (if not NULL) names the pass's completion.
+ */
+int	apple_agx_submit_render_deps(device_t dev, u_int context,
+	    const struct agx_render_pass *pass,
+	    const struct agx_render_program *programs, u_int nprograms,
+	    const uint64_t *deps, u_int ndeps, uint64_t *dep,
+	    void (*done)(void *, int), void *arg);
+
+/*
+ * Publish one compute command after the kicks in deps, without waiting
+ * for it; *dep (if not NULL) names its completion. The queue keeps one
+ * command in flight: the next kick, or apple_agx_compute_wait, retires
+ * it. apple_agx_submit_compute is the kick and the wait.
+ */
+int	apple_agx_compute_kick(device_t dev, u_int slot, u_int context,
+	    uint64_t cdm_va, uint64_t cdm_end,
+	    const struct agx_render_program *programs, u_int nprograms,
+	    const uint64_t *deps, u_int ndeps, uint64_t *dep);
+int	apple_agx_compute_wait(device_t dev, u_int slot);
+
 #endif /* _ARM64_APPLE_APPLE_AGX_API_H_ */
